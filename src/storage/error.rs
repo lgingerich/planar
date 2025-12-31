@@ -2,6 +2,7 @@ use thiserror::Error;
 
 use arrow::error::ArrowError;
 use lance::Error as LanceError;
+use parquet::errors::ParquetError;
 use vortex::error::VortexError;
 
 #[derive(Debug, Error)]
@@ -13,7 +14,7 @@ pub enum StorageError {
     Arrow(#[from] ArrowError),
     
     #[error("Parquet error: {0}")]
-    Parquet(String),
+    Parquet(#[from] ParquetError),
     
     #[error("Lance error: {0}")]
     Lance(#[from] LanceError),
