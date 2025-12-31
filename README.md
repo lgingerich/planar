@@ -27,12 +27,11 @@ TABLE ||--o{ SCHEMA : has_versions
     TABLE ||--o| TABLE_STATS : aggregates
     
     SCHEMA ||--o{ COLUMN : defines
-    SCHEMA }o--|| TRANSACTION : valid_from
-    SCHEMA }o--o| TRANSACTION : valid_to
+    TRANSACTION ||--o{ SCHEMA : valid_from
+    TRANSACTION o|--o{ SCHEMA : valid_to
     
-    TRANSACTION }o--o| TRANSACTION : parent
     TRANSACTION ||--o{ FILE : added_in
-    TRANSACTION ||--o{ FILE : removed_in
+    TRANSACTION o|--o{ FILE : removed_in
     
     FILE ||--o{ FILE_COLUMN_STATS : has_stats
     
