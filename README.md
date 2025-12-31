@@ -2,24 +2,25 @@
 
 An open table format with a lightweight database-catalog architecture that uses transaction-based deltas instead of snapshots. Designed to eliminate metadata scaling bottlenecks, reduce maintenance burden, and excel at streaming/CDC workloads with efficient incremental updates.
 
-# Data Model (In-Work)
+## Data Model (In-Work)
 
-## Architecture Summary
+### Architecture Summary
 
-**TABLE** is the root with pointers to current state (`current_schema_uuid`, `current_transaction_id`).
+- **TABLE** is the root with pointers to current state (`current_schema_uuid`, `current_transaction_id`).
 
-**TRANSACTION** is a monotonically increasing sequence forming an immutable version chain. Represents deltas (what changed), not complete snapshots.
+- **TRANSACTION** is a monotonically increasing sequence forming an immutable version chain. Represents deltas (what changed), not complete snapshots.
 
-**SCHEMA** has transaction-bounded validity ranges (`valid_from/to_transaction_id`). Schema evolution is independent from data changes.
+- **SCHEMA** has transaction-bounded validity ranges (`valid_from/to_transaction_id`). Schema evolution is independent from data changes.
 
-**FILE** represents physical data files. Tracks lifecycle (`added_in`/`removed_in_transaction_id`), format-specific metadata, partition values, and row counts.
+- **FILE** represents physical data files. Tracks lifecycle (`added_in`/`removed_in_transaction_id`), format-specific metadata, partition values, and row counts.
 
-**SNAPSHOTS don't exist.** Any point-in-time view is computed on-demand by filtering files/schema by transaction ID.
+- **SNAPSHOTS don't exist.** Any point-in-time view is computed on-demand by filtering files/schema by transaction ID.
 
 
-## Entity Relationship Diagram
+### Entity Relationship Diagram
 
-```erDiagram
+```mermaid
+erDiagram
 TABLE ||--o{ SCHEMA : has_versions
     TABLE ||--o{ FILE : contains
     TABLE ||--o{ TRANSACTION : has_history
@@ -47,7 +48,7 @@ TABLE ||--o{ SCHEMA : has_versions
     }
 
     TABLE_STATS {
-        uuid table_uuid PK_FK
+        uuid table_uuid PK
         bigint transaction_id FK
         bigint record_count
         bigint file_size_bytes
@@ -93,7 +94,7 @@ TABLE ||--o{ SCHEMA : has_versions
     }
     
     FILE_COLUMN_STATS {
-        uuid file_uuid PK_FK
+        uuid file_uuid PK
         string column_name PK
         bigint null_count
         bigint nan_count
