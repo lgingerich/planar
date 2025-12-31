@@ -1,0 +1,11 @@
+[package]
+name = "planar"
+version = "0.1.0"
+edition = "2024"
+authors = ["Landon Gingerich <landon.ging@gmail.com>"]
+description = "Transaction-based open table format"
+readme = "README.md"
+repository = "https://github.com/lgingerich/planar"
+
+[dependencies]
+
