@@ -2,6 +2,24 @@
 
 An open table format with a lightweight database-catalog architecture that uses transaction-based deltas instead of snapshots. Designed to eliminate metadata scaling bottlenecks, reduce maintenance burden, and excel at streaming/CDC workloads with efficient incremental updates.
 
+## Design Goals & Principles
+ 
+- Streaming as a first-class citizen
+    - IDEA: Keep latest writes in-memory until a minimum data size is met, then write to data file. Essentially replicating a memtable or WAL-buffer to prevent the small file problem.
+- Native support for next-gen file formats such as Vortex and Lance
+
+## Usage
+
+### Quick Start
+
+Run the table lifecycle example to see Planar in action:
+
+```bash
+cargo run --example table_lifecycle
+```
+
+This example demonstrates creating tables, adding files, time travel queries, transaction deltas, and more. See `examples/table_lifecycle.rs` for the full code.
+
 ## Data Model (In-Work)
 
 ### Architecture Summary

@@ -10,10 +10,15 @@ repository = "https://github.com/lgingerich/planar"
 [dependencies]
 arrow = "57.1.0"
 arrow-array = "57.1.0"
+async-trait = "0.1.89"
+chrono = { version = "0.4", features = ["serde"] }
 lance = "1.0.1"
 parquet = "57.1.0"
-sqlx = "0.8.6"
+serde_json = "1.0"
+sqlx = { version = "0.8.6", features = ["chrono", "migrate", "runtime-tokio-rustls", "sqlite", "postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 thiserror = "2.0.17"
+uuid = { version = "1.10", features = ["serde"] }
 vortex = "0.56.0"
 
 [profile.release]
@@ -35,6 +40,9 @@ opt-level = 0
 lto = false
 panic = "unwind"
 strip = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("sqlite", "postgres"))'] }
 
 [lints.clippy]
 type_complexity = "allow"

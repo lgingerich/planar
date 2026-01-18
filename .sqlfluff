@@ -1,0 +1,20 @@
+[sqlfluff]
+# Use ANSI SQL as baseline for database-agnostic checking
+dialect = ansi
+# Exclude rules that are too strict or not applicable
+exclude_rules = L003, L016, L010, L014
+
+[sqlfluff:rules]
+# Prefer explicit JOIN syntax over comma joins for clarity
+L042 = True
+# Require trailing commas in lists
+L019 = False
+
+[sqlfluff:rules:capitalisation.keywords]
+# Use consistent capitalization for keywords
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.identifiers]
+# Use consistent capitalization for identifiers  
+capitalisation_policy = lower
+
