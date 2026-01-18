@@ -2,28 +2,15 @@ use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use sqlx::{Database, Pool, Row};
-use thiserror::Error;
 
 pub mod database;
+pub mod error;
 pub mod schema;
 
-pub type TxnId = i64;
-pub type CatalogResult<T> = Result<T, CatalogError>;
-pub type CatalogRef = Arc<dyn Catalog>;
+pub use error::{CatalogError, Result};
 
-#[derive(Debug, Error)]
-pub enum CatalogError {
-    #[error("table not found: {0}")]
-    NotFound(String),
-    #[error("conflict on table: {0}")]
-    Conflict(String),
-    #[error("invalid argument: {0}")]
-    InvalidArgument(String),
-    #[error("feature not yet implemented: {0}")]
-    NotYetImplemented(String),
-    #[error("storage error: {0}")]
-    Storage(#[from] sqlx::Error),
-}
+pub type TxnId = i64;
+pub type CatalogRef = Arc<dyn Catalog>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableIdent {
@@ -221,7 +208,7 @@ impl MutationBuilder {
         self
     }
 
-    pub async fn commit(self) -> CatalogResult<CommitResult> {
+    pub async fn commit(self) -> Result<CommitResult> {
         self.catalog
             .commit(&self.ident, self.base_transaction_id, self.mutation)
             .await
@@ -243,24 +230,24 @@ impl TableHandle {
         &self.ident
     }
 
-    pub async fn read(&self) -> CatalogResult<TableView> {
+    pub async fn read(&self) -> Result<TableView> {
         self.catalog.read_table(&self.ident, None).await
     }
 
-    pub async fn read_at(&self, transaction_id: TxnId) -> CatalogResult<TableView> {
+    pub async fn read_at(&self, transaction_id: TxnId) -> Result<TableView> {
         self.catalog
             .read_table(&self.ident, Some(transaction_id))
             .await
     }
 
-    pub async fn diff(&self, from_transaction_id: TxnId, to_transaction_id: TxnId) -> CatalogResult<TableDelta> {
+    pub async fn diff(&self, from_transaction_id: TxnId, to_transaction_id: TxnId) -> Result<TableDelta> {
         self.catalog
             .diff_table(&self.ident, from_transaction_id, to_transaction_id)
             .await
     }
 
     /// Get a mutation builder. If `base_transaction_id` is `None`, uses the current transaction ID.
-    pub async fn write(&self, base_transaction_id: Option<TxnId>) -> CatalogResult<MutationBuilder> {
+    pub async fn write(&self, base_transaction_id: Option<TxnId>) -> Result<MutationBuilder> {
         let txn_id = match base_transaction_id {
             Some(id) => id,
             None => {
@@ -272,7 +259,7 @@ impl TableHandle {
     }
 
     /// Append a single file using the current transaction ID.
-    pub async fn append_file(&self, file: FileSpec) -> CatalogResult<CommitResult> {
+    pub async fn append_file(&self, file: FileSpec) -> Result<CommitResult> {
         self.write(None)
             .await?
             .append_file(file)
@@ -281,7 +268,7 @@ impl TableHandle {
     }
 
     /// Append multiple files using the current transaction ID.
-    pub async fn append_files(&self, files: Vec<FileSpec>) -> CatalogResult<CommitResult> {
+    pub async fn append_files(&self, files: Vec<FileSpec>) -> Result<CommitResult> {
         self.write(None)
             .await?
             .append_files(files)
@@ -290,7 +277,7 @@ impl TableHandle {
     }
 
     /// Delete files using the current transaction ID.
-    pub async fn delete_files(&self, file_uuids: Vec<uuid::Uuid>) -> CatalogResult<CommitResult> {
+    pub async fn delete_files(&self, file_uuids: Vec<uuid::Uuid>) -> Result<CommitResult> {
         self.write(None)
             .await?
             .delete_files(file_uuids)
@@ -299,7 +286,7 @@ impl TableHandle {
     }
 
     /// Update schema using the current transaction ID.
-    pub async fn update_schema(&self, schema: SchemaSpec) -> CatalogResult<CommitResult> {
+    pub async fn update_schema(&self, schema: SchemaSpec) -> Result<CommitResult> {
         self.write(None)
             .await?
             .update_schema(schema)
@@ -308,7 +295,7 @@ impl TableHandle {
     }
 
     /// Set properties using the current transaction ID.
-    pub async fn set_properties(&self, properties: serde_json::Value) -> CatalogResult<CommitResult> {
+    pub async fn set_properties(&self, properties: serde_json::Value) -> Result<CommitResult> {
         self.write(None)
             .await?
             .set_properties(properties)
@@ -325,30 +312,30 @@ pub trait Catalog: Send + Sync {
         location: String,
         schema: SchemaSpec,
         properties: Option<serde_json::Value>,
-    ) -> CatalogResult<TableHandle>;
+    ) -> Result<TableHandle>;
 
-    async fn load_table(self: Arc<Self>, ident: TableIdent) -> CatalogResult<Option<TableHandle>>;
+    async fn load_table(self: Arc<Self>, ident: TableIdent) -> Result<Option<TableHandle>>;
 
-    async fn list_tables(&self, namespace: Option<&str>) -> CatalogResult<Vec<TableIdent>>;
+    async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>>;
 
-    async fn drop_table(&self, ident: &TableIdent) -> CatalogResult<()>;
+    async fn drop_table(&self, ident: &TableIdent) -> Result<()>;
 
     async fn read_table(&self, ident: &TableIdent, at_transaction_id: Option<TxnId>)
-        -> CatalogResult<TableView>;
+        -> Result<TableView>;
 
     async fn diff_table(
         &self,
         ident: &TableIdent,
         from_transaction_id: TxnId,
         to_transaction_id: TxnId,
-    ) -> CatalogResult<TableDelta>;
+    ) -> Result<TableDelta>;
 
     async fn commit(
         &self,
         ident: &TableIdent,
         base_transaction_id: TxnId,
         mutation: Mutation,
-    ) -> CatalogResult<CommitResult>;
+    ) -> Result<CommitResult>;
 }
 
 /// SQL-backed catalog for managing table metadata across databases.
@@ -368,7 +355,7 @@ where
         Self { pool }
     }
 
-    pub async fn initialize_schema(&self) -> Result<(), sqlx::Error> {
+    pub async fn initialize_schema(&self) -> std::result::Result<(), sqlx::Error> {
         let migrator = sqlx::migrate!("db/migrations");
         migrator.run(&self.pool).await?;
         Ok(())
@@ -380,7 +367,7 @@ where
 }
 
 impl SqlCatalog<sqlx::Sqlite> {
-    pub async fn configure_database(&self) -> Result<(), sqlx::Error> {
+    pub async fn configure_database(&self) -> std::result::Result<(), sqlx::Error> {
         database::sqlite::configure_pool(&self.pool).await
     }
 
@@ -388,7 +375,7 @@ impl SqlCatalog<sqlx::Sqlite> {
     /// This is a convenience method that handles pool creation, configuration, and schema initialization.
     pub async fn from_connection_string(
         connection_string: &str,
-    ) -> Result<Arc<Self>, sqlx::Error> {
+    ) -> std::result::Result<Arc<Self>, sqlx::Error> {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect(connection_string)
             .await?;
@@ -400,13 +387,13 @@ impl SqlCatalog<sqlx::Sqlite> {
 
     /// Create an in-memory SQLite catalog.
     /// This is a convenience method for testing and examples.
-    pub async fn in_memory() -> Result<Arc<Self>, sqlx::Error> {
+    pub async fn in_memory() -> std::result::Result<Arc<Self>, sqlx::Error> {
         Self::from_connection_string("sqlite::memory:").await
     }
 }
 
 impl SqlCatalog<sqlx::Postgres> {
-    pub async fn configure_database(&self) -> Result<(), sqlx::Error> {
+    pub async fn configure_database(&self) -> std::result::Result<(), sqlx::Error> {
         database::postgres::configure_pool(&self.pool).await
     }
 
@@ -414,7 +401,7 @@ impl SqlCatalog<sqlx::Postgres> {
     /// This is a convenience method that handles pool creation, configuration, and schema initialization.
     pub async fn from_connection_string(
         connection_string: &str,
-    ) -> Result<Arc<Self>, sqlx::Error> {
+    ) -> std::result::Result<Arc<Self>, sqlx::Error> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect(connection_string)
             .await?;
@@ -433,7 +420,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         location: String,
         schema: SchemaSpec,
         properties: Option<serde_json::Value>,
-    ) -> CatalogResult<TableHandle> {
+    ) -> Result<TableHandle> {
         if schema.columns.is_empty() {
             return Err(CatalogError::InvalidArgument(
                 "schema must include at least one column".to_string(),
@@ -535,7 +522,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         Ok(TableHandle::new(catalog, ident))
     }
 
-    async fn load_table(self: Arc<Self>, ident: TableIdent) -> CatalogResult<Option<TableHandle>> {
+    async fn load_table(self: Arc<Self>, ident: TableIdent) -> Result<Option<TableHandle>> {
         let exists = sqlx::query_scalar::<sqlx::Sqlite, i64>(
             "SELECT 1 FROM tables WHERE namespace = ?1 AND table_name = ?2 LIMIT 1",
         )
@@ -553,7 +540,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         Ok(Some(TableHandle::new(catalog, ident)))
     }
 
-    async fn list_tables(&self, namespace: Option<&str>) -> CatalogResult<Vec<TableIdent>> {
+    async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>> {
         let rows = if let Some(namespace) = namespace {
             sqlx::query::<sqlx::Sqlite>("SELECT namespace, table_name FROM tables WHERE namespace = ?1")
                 .bind(namespace)
@@ -575,7 +562,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         Ok(tables)
     }
 
-    async fn drop_table(&self, ident: &TableIdent) -> CatalogResult<()> {
+    async fn drop_table(&self, ident: &TableIdent) -> Result<()> {
         let affected = sqlx::query::<sqlx::Sqlite>("DELETE FROM tables WHERE namespace = ?1 AND table_name = ?2")
             .bind(ident.namespace.as_str())
             .bind(ident.name.as_str())
@@ -597,7 +584,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         &self,
         ident: &TableIdent,
         at_transaction_id: Option<TxnId>,
-    ) -> CatalogResult<TableView> {
+    ) -> Result<TableView> {
         let table_row = sqlx::query::<sqlx::Sqlite>(
             "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties
              FROM tables WHERE namespace = ?1 AND table_name = ?2",
@@ -754,7 +741,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         ident: &TableIdent,
         from_transaction_id: TxnId,
         to_transaction_id: TxnId,
-    ) -> CatalogResult<TableDelta> {
+    ) -> Result<TableDelta> {
         let from_view = self.read_table(ident, Some(from_transaction_id)).await?;
         let to_view = self.read_table(ident, Some(to_transaction_id)).await?;
 
@@ -804,7 +791,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         ident: &TableIdent,
         base_transaction_id: TxnId,
         mutation: Mutation,
-    ) -> CatalogResult<CommitResult> {
+    ) -> Result<CommitResult> {
         if mutation.operations.is_empty() {
             return Err(CatalogError::InvalidArgument(
                 "mutation has no operations".to_string(),
@@ -1008,7 +995,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         location: String,
         schema: SchemaSpec,
         properties: Option<serde_json::Value>,
-    ) -> CatalogResult<TableHandle> {
+    ) -> Result<TableHandle> {
         if schema.columns.is_empty() {
             return Err(CatalogError::InvalidArgument(
                 "schema must include at least one column".to_string(),
@@ -1110,7 +1097,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         Ok(TableHandle::new(catalog, ident))
     }
 
-    async fn load_table(self: Arc<Self>, ident: TableIdent) -> CatalogResult<Option<TableHandle>> {
+    async fn load_table(self: Arc<Self>, ident: TableIdent) -> Result<Option<TableHandle>> {
         let exists = sqlx::query_scalar::<sqlx::Postgres, i64>(
             "SELECT 1 FROM tables WHERE namespace = $1 AND table_name = $2 LIMIT 1",
         )
@@ -1128,7 +1115,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         Ok(Some(TableHandle::new(catalog, ident)))
     }
 
-    async fn list_tables(&self, namespace: Option<&str>) -> CatalogResult<Vec<TableIdent>> {
+    async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>> {
         let rows = if let Some(namespace) = namespace {
             sqlx::query::<sqlx::Postgres>("SELECT namespace, table_name FROM tables WHERE namespace = $1")
                 .bind(namespace)
@@ -1150,7 +1137,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         Ok(tables)
     }
 
-    async fn drop_table(&self, ident: &TableIdent) -> CatalogResult<()> {
+    async fn drop_table(&self, ident: &TableIdent) -> Result<()> {
         let affected = sqlx::query::<sqlx::Postgres>("DELETE FROM tables WHERE namespace = $1 AND table_name = $2")
             .bind(ident.namespace.as_str())
             .bind(ident.name.as_str())
@@ -1172,7 +1159,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         &self,
         ident: &TableIdent,
         at_transaction_id: Option<TxnId>,
-    ) -> CatalogResult<TableView> {
+    ) -> Result<TableView> {
         let table_row = sqlx::query::<sqlx::Postgres>(
             "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties
              FROM tables WHERE namespace = $1 AND table_name = $2",
@@ -1329,7 +1316,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         ident: &TableIdent,
         from_transaction_id: TxnId,
         to_transaction_id: TxnId,
-    ) -> CatalogResult<TableDelta> {
+    ) -> Result<TableDelta> {
         let from_view = self.read_table(ident, Some(from_transaction_id)).await?;
         let to_view = self.read_table(ident, Some(to_transaction_id)).await?;
 
@@ -1379,7 +1366,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         ident: &TableIdent,
         base_transaction_id: TxnId,
         mutation: Mutation,
-    ) -> CatalogResult<CommitResult> {
+    ) -> Result<CommitResult> {
         if mutation.operations.is_empty() {
             return Err(CatalogError::InvalidArgument(
                 "mutation has no operations".to_string(),
@@ -1575,7 +1562,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
     }
 }
 
-fn uuid_from_row<R>(row: &R, column: &str) -> CatalogResult<uuid::Uuid>
+fn uuid_from_row<R>(row: &R, column: &str) -> Result<uuid::Uuid>
 where
     R: Row,
     for<'r> Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
@@ -1588,7 +1575,7 @@ where
         .map_err(|error| CatalogError::InvalidArgument(format!("invalid uuid: {error}")))
 }
 
-fn uuid_from_row_optional<R>(row: &R, column: &str) -> CatalogResult<Option<uuid::Uuid>>
+fn uuid_from_row_optional<R>(row: &R, column: &str) -> Result<Option<uuid::Uuid>>
 where
     R: Row,
     for<'r> Option<Vec<u8>>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
@@ -1605,7 +1592,7 @@ where
     }
 }
 
-fn parse_json(value: Option<String>) -> CatalogResult<serde_json::Value> {
+fn parse_json(value: Option<String>) -> Result<serde_json::Value> {
     match value {
         Some(text) => serde_json::from_str(&text)
             .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}"))),
@@ -1613,7 +1600,7 @@ fn parse_json(value: Option<String>) -> CatalogResult<serde_json::Value> {
     }
 }
 
-fn parse_json_optional(value: Option<String>) -> CatalogResult<Option<serde_json::Value>> {
+fn parse_json_optional(value: Option<String>) -> Result<Option<serde_json::Value>> {
     match value {
         Some(text) => serde_json::from_str(&text)
             .map(Some)
@@ -1622,18 +1609,18 @@ fn parse_json_optional(value: Option<String>) -> CatalogResult<Option<serde_json
     }
 }
 
-fn serialize_json(value: &serde_json::Value) -> CatalogResult<String> {
+fn serialize_json(value: &serde_json::Value) -> Result<String> {
     serde_json::to_string(value)
         .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}")))
 }
 
-fn serialize_json_optional(value: Option<&serde_json::Value>) -> CatalogResult<Option<String>> {
+fn serialize_json_optional(value: Option<&serde_json::Value>) -> Result<Option<String>> {
     value.map(serialize_json).transpose()
 }
 
 async fn next_transaction_id<'a, DB>(
     tx: &mut sqlx::Transaction<'a, DB>,
-) -> CatalogResult<TxnId>
+) -> Result<TxnId>
 where
     DB: Database,
     for<'r> i64: sqlx::Decode<'r, DB> + sqlx::Type<DB>,
