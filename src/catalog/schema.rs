@@ -16,7 +16,7 @@ pub struct Table {
     /// Current schema UUID
     pub current_schema_uuid: Option<Uuid>,
     /// Current transaction ID
-    pub current_transaction_id: Option<i64>,
+    pub current_transaction_id: Option<Uuid>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Table properties
@@ -27,13 +27,13 @@ pub struct Table {
 #[derive(Clone, Debug, FromRow)]
 pub struct Transaction {
     /// Transaction identifier
-    pub transaction_id: i64,
+    pub transaction_id: Uuid,
     /// Table UUID
     pub table_uuid: Uuid,
     /// Transaction timestamp
     pub transaction_timestamp: DateTime<Utc>,
     /// Parent transaction ID if this is a child transaction
-    pub parent_transaction_id: Option<i64>,
+    pub parent_transaction_id: Option<Uuid>,
 }
 
 /// Schema version with columns
@@ -46,9 +46,9 @@ pub struct Schema {
     /// Schema version number
     pub schema_version: i32,
     /// Transaction ID where this schema becomes valid
-    pub valid_from_transaction_id: i64,
+    pub valid_from_transaction_id: Uuid,
     /// Transaction ID where this schema becomes invalid (if superseded)
-    pub valid_to_transaction_id: Option<i64>,
+    pub valid_to_transaction_id: Option<Uuid>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Column definitions
@@ -88,9 +88,9 @@ pub struct File {
     /// File size in bytes
     pub file_size_bytes: i64,
     /// Transaction ID where this file was added
-    pub added_in_transaction_id: i64,
+    pub added_in_transaction_id: Uuid,
     /// Transaction ID where this file was removed (if deleted)
-    pub removed_in_transaction_id: Option<i64>,
+    pub removed_in_transaction_id: Option<Uuid>,
     /// Partition values if partitioned
     pub partition_values: Option<serde_json::Value>,
 }
@@ -101,7 +101,7 @@ pub struct TableStats {
     /// Table UUID
     pub table_uuid: Uuid,
     /// Transaction ID these stats are for
-    pub transaction_id: i64,
+    pub transaction_id: Uuid,
     /// Total record count
     pub record_count: i64,
     /// Total file size in bytes

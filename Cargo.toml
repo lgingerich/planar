@@ -19,6 +19,7 @@ sqlx = { version = "0.8.6", features = ["chrono", "migrate", "runtime-tokio-rust
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 thiserror = "2.0.17"
 uuid = { version = "1.10", features = ["serde"] }
+uuid7 = "1.4.0"
 vortex = "0.56.0"
 
 [profile.release]

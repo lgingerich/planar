@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS tables (
     namespace TEXT NOT NULL,
     location TEXT NOT NULL,
     current_schema_uuid BLOB,
-    current_transaction_id BIGINT,
+    current_transaction_id BLOB,
     created_at TIMESTAMP NOT NULL,
     properties TEXT,
     UNIQUE(namespace, table_name)
@@ -17,16 +17,19 @@ CREATE TABLE IF NOT EXISTS tables (
 -- transactions
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS transactions (
-    transaction_id BIGINT PRIMARY KEY,
+    transaction_id BLOB PRIMARY KEY,
     table_uuid BLOB NOT NULL,
     transaction_timestamp TIMESTAMP NOT NULL,
-    parent_transaction_id BIGINT,
+    parent_transaction_id BLOB,
     FOREIGN KEY(table_uuid) REFERENCES tables(table_uuid),
     FOREIGN KEY(parent_transaction_id) REFERENCES transactions(transaction_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_transactions_table 
     ON transactions(table_uuid);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_timestamp 
+    ON transactions(transaction_timestamp);
 
 -- ============================================================================
 -- schemas
@@ -35,8 +38,8 @@ CREATE TABLE IF NOT EXISTS schemas (
     schema_uuid BLOB PRIMARY KEY,
     table_uuid BLOB NOT NULL,
     schema_version INTEGER NOT NULL,
-    valid_from_transaction_id BIGINT NOT NULL,
-    valid_to_transaction_id BIGINT,
+    valid_from_transaction_id BLOB NOT NULL,
+    valid_to_transaction_id BLOB,
     created_at TIMESTAMP NOT NULL,
     FOREIGN KEY(table_uuid) REFERENCES tables(table_uuid),
     FOREIGN KEY(valid_from_transaction_id) REFERENCES transactions(transaction_id),
@@ -76,8 +79,8 @@ CREATE TABLE IF NOT EXISTS files (
     file_path TEXT NOT NULL,
     record_count BIGINT NOT NULL,
     file_size_bytes BIGINT NOT NULL,
-    added_in_transaction_id BIGINT NOT NULL,
-    removed_in_transaction_id BIGINT,
+    added_in_transaction_id BLOB NOT NULL,
+    removed_in_transaction_id BLOB,
     partition_values TEXT,
     FOREIGN KEY(table_uuid) REFERENCES tables(table_uuid),
     FOREIGN KEY(added_in_transaction_id) REFERENCES transactions(transaction_id),
@@ -95,7 +98,7 @@ CREATE INDEX IF NOT EXISTS idx_files_active
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS table_stats (
     table_uuid BLOB PRIMARY KEY,
-    transaction_id BIGINT NOT NULL,
+    transaction_id BLOB NOT NULL,
     record_count BIGINT NOT NULL,
     file_size_bytes BIGINT NOT NULL,
     file_count INTEGER NOT NULL,

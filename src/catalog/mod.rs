@@ -15,7 +15,7 @@ pub mod schema;
 pub use error::{CatalogError, Result};
 
 /// Transaction identifier
-pub type TxnId = i64;
+pub type TxnId = uuid::Uuid;
 
 /// Table identifier consisting of namespace and name
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -550,12 +550,12 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .execute(tx.as_mut())
         .await?;
 
-        let transaction_id = next_transaction_id(&mut tx).await?;
+        let transaction_id = next_transaction_id();
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp)
              VALUES (?1, ?2, ?3)",
         )
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .bind(created_at)
         .execute(tx.as_mut())
@@ -569,7 +569,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .bind(schema_uuid.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .bind(1_i32)
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(created_at)
         .execute(tx.as_mut())
         .await?;
@@ -598,7 +598,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
              WHERE table_uuid = ?3",
         )
         .bind(schema_uuid.as_bytes().as_slice())
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
@@ -693,15 +693,15 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let _current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
-        let current_transaction_id: Option<TxnId> =
-            table_row.try_get("current_transaction_id")?;
+        let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let properties = parse_json(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
         })?;
         let effective_transaction_id = at_transaction_id.unwrap_or(current_transaction_id);
-        if effective_transaction_id > current_transaction_id {
+        // UUIDv7 is time-ordered, compare using u128 representation
+        if effective_transaction_id.as_u128() > current_transaction_id.as_u128() {
             return Err(CatalogError::InvalidArgument(
                 "requested transaction is newer than current".to_string(),
             ));
@@ -716,7 +716,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
              LIMIT 1",
         )
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id)
+        .bind(effective_transaction_id.as_bytes().as_slice())
         .fetch_optional(&self.pool)
         .await?;
 
@@ -754,8 +754,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             schema_uuid,
             table_uuid: uuid_from_row(&schema_row, "table_uuid")?,
             schema_version: schema_row.try_get("schema_version")?,
-            valid_from_transaction_id: schema_row.try_get("valid_from_transaction_id")?,
-            valid_to_transaction_id: schema_row.try_get("valid_to_transaction_id")?,
+            valid_from_transaction_id: uuid_from_row(&schema_row, "valid_from_transaction_id")?,
+            valid_to_transaction_id: uuid_from_row_optional(&schema_row, "valid_to_transaction_id")?,
             created_at: schema_row.try_get("created_at")?,
             columns,
         };
@@ -769,7 +769,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                AND (removed_in_transaction_id IS NULL OR removed_in_transaction_id > ?2)",
         )
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id)
+        .bind(effective_transaction_id.as_bytes().as_slice())
         .fetch_all(&self.pool)
         .await?;
 
@@ -783,8 +783,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                 file_path: row.try_get("file_path")?,
                 record_count: row.try_get("record_count")?,
                 file_size_bytes: row.try_get("file_size_bytes")?,
-                added_in_transaction_id: row.try_get("added_in_transaction_id")?,
-                removed_in_transaction_id: row.try_get("removed_in_transaction_id")?,
+                added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
+                removed_in_transaction_id: uuid_from_row_optional(&row, "removed_in_transaction_id")?,
                 partition_values: parse_json_optional(partition_values)?,
             };
             files.push(file);
@@ -795,14 +795,14 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
              FROM table_stats WHERE table_uuid = ?1 AND transaction_id = ?2",
         )
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id)
+        .bind(effective_transaction_id.as_bytes().as_slice())
         .fetch_optional(&self.pool)
         .await?;
 
         let stats = if let Some(row) = stats_row {
             Some(schema::TableStats {
                 table_uuid: uuid_from_row(&row, "table_uuid")?,
-                transaction_id: row.try_get("transaction_id")?,
+                transaction_id: uuid_from_row(&row, "transaction_id")?,
                 record_count: row.try_get("record_count")?,
                 file_size_bytes: row.try_get("file_size_bytes")?,
                 file_count: row.try_get("file_count")?,
@@ -908,8 +908,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
-        let current_transaction_id: Option<TxnId> =
-            table_row.try_get("current_transaction_id")?;
+        let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let mut properties_value = parse_json(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
@@ -923,17 +922,17 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             )));
         }
 
-        let transaction_id = next_transaction_id(&mut tx).await?;
+        let transaction_id = next_transaction_id();
         let transaction_timestamp = chrono::Utc::now();
 
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
              VALUES (?1, ?2, ?3, ?4)",
         )
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .bind(transaction_timestamp)
-        .bind(current_transaction_id)
+        .bind(current_transaction_id.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
 
@@ -957,7 +956,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                         .bind(file.file_path.as_str())
                         .bind(file.record_count)
                         .bind(file.file_size_bytes)
-                        .bind(transaction_id)
+                        .bind(transaction_id.as_bytes().as_slice())
                         .bind(partition_text.as_deref())
                         .execute(tx.as_mut())
                         .await?;
@@ -969,7 +968,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             "UPDATE files SET removed_in_transaction_id = ?1
                              WHERE file_uuid = ?2 AND table_uuid = ?3 AND removed_in_transaction_id IS NULL",
                         )
-                        .bind(transaction_id)
+                        .bind(transaction_id.as_bytes().as_slice())
                         .bind(file_uuid.as_bytes().as_slice())
                         .bind(table_uuid.as_bytes().as_slice())
                         .execute(tx.as_mut())
@@ -1000,7 +999,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     .bind(schema_uuid.as_bytes().as_slice())
                     .bind(table_uuid.as_bytes().as_slice())
                     .bind(schema_version)
-                    .bind(transaction_id)
+                    .bind(transaction_id.as_bytes().as_slice())
                     .bind(transaction_timestamp)
                     .execute(tx.as_mut())
                     .await?;
@@ -1008,7 +1007,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     sqlx::query::<sqlx::Sqlite>(
                         "UPDATE schemas SET valid_to_transaction_id = ?1 WHERE schema_uuid = ?2",
                     )
-                    .bind(transaction_id)
+                    .bind(transaction_id.as_bytes().as_slice())
                     .bind(current_schema_uuid.as_bytes().as_slice())
                     .execute(tx.as_mut())
                     .await?;
@@ -1058,7 +1057,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
              SET current_transaction_id = ?1, current_schema_uuid = ?2, properties = ?3
              WHERE table_uuid = ?4",
         )
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(schema_uuid_to_set.map(|uuid| uuid.as_bytes().to_vec()))
         .bind(properties_text.as_str())
         .bind(table_uuid.as_bytes().as_slice())
@@ -1125,12 +1124,12 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .execute(tx.as_mut())
         .await?;
 
-        let transaction_id = next_transaction_id(&mut tx).await?;
+        let transaction_id = next_transaction_id();
         sqlx::query::<sqlx::Postgres>(
             "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp)
              VALUES ($1, $2, $3)",
         )
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .bind(created_at)
         .execute(tx.as_mut())
@@ -1144,7 +1143,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .bind(schema_uuid.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .bind(1_i32)
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(created_at)
         .execute(tx.as_mut())
         .await?;
@@ -1173,7 +1172,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
              WHERE table_uuid = $3",
         )
         .bind(schema_uuid.as_bytes().as_slice())
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
@@ -1268,15 +1267,15 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let _current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
-        let current_transaction_id: Option<TxnId> =
-            table_row.try_get("current_transaction_id")?;
+        let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let properties = parse_json(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
         })?;
         let effective_transaction_id = at_transaction_id.unwrap_or(current_transaction_id);
-        if effective_transaction_id > current_transaction_id {
+        // UUIDv7 is time-ordered, compare using u128 representation
+        if effective_transaction_id.as_u128() > current_transaction_id.as_u128() {
             return Err(CatalogError::InvalidArgument(
                 "requested transaction is newer than current".to_string(),
             ));
@@ -1291,7 +1290,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
              LIMIT 1",
         )
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id)
+        .bind(effective_transaction_id.as_bytes().as_slice())
         .fetch_optional(&self.pool)
         .await?;
 
@@ -1329,8 +1328,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             schema_uuid,
             table_uuid: uuid_from_row(&schema_row, "table_uuid")?,
             schema_version: schema_row.try_get("schema_version")?,
-            valid_from_transaction_id: schema_row.try_get("valid_from_transaction_id")?,
-            valid_to_transaction_id: schema_row.try_get("valid_to_transaction_id")?,
+            valid_from_transaction_id: uuid_from_row(&schema_row, "valid_from_transaction_id")?,
+            valid_to_transaction_id: uuid_from_row_optional(&schema_row, "valid_to_transaction_id")?,
             created_at: schema_row.try_get("created_at")?,
             columns,
         };
@@ -1344,7 +1343,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                AND (removed_in_transaction_id IS NULL OR removed_in_transaction_id > $2)",
         )
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id)
+        .bind(effective_transaction_id.as_bytes().as_slice())
         .fetch_all(&self.pool)
         .await?;
 
@@ -1358,8 +1357,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                 file_path: row.try_get("file_path")?,
                 record_count: row.try_get("record_count")?,
                 file_size_bytes: row.try_get("file_size_bytes")?,
-                added_in_transaction_id: row.try_get("added_in_transaction_id")?,
-                removed_in_transaction_id: row.try_get("removed_in_transaction_id")?,
+                added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
+                removed_in_transaction_id: uuid_from_row_optional(&row, "removed_in_transaction_id")?,
                 partition_values: parse_json_optional(partition_values)?,
             };
             files.push(file);
@@ -1370,14 +1369,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
              FROM table_stats WHERE table_uuid = $1 AND transaction_id = $2",
         )
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id)
+        .bind(effective_transaction_id.as_bytes().as_slice())
         .fetch_optional(&self.pool)
         .await?;
 
         let stats = if let Some(row) = stats_row {
             Some(schema::TableStats {
                 table_uuid: uuid_from_row(&row, "table_uuid")?,
-                transaction_id: row.try_get("transaction_id")?,
+                transaction_id: uuid_from_row(&row, "transaction_id")?,
                 record_count: row.try_get("record_count")?,
                 file_size_bytes: row.try_get("file_size_bytes")?,
                 file_count: row.try_get("file_count")?,
@@ -1483,8 +1482,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
-        let current_transaction_id: Option<TxnId> =
-            table_row.try_get("current_transaction_id")?;
+        let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let mut properties_value = parse_json(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
@@ -1498,17 +1496,17 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             )));
         }
 
-        let transaction_id = next_transaction_id(&mut tx).await?;
+        let transaction_id = next_transaction_id();
         let transaction_timestamp = chrono::Utc::now();
 
         sqlx::query::<sqlx::Postgres>(
             "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
              VALUES ($1, $2, $3, $4)",
         )
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .bind(transaction_timestamp)
-        .bind(current_transaction_id)
+        .bind(current_transaction_id.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
 
@@ -1532,7 +1530,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                         .bind(file.file_path.as_str())
                         .bind(file.record_count)
                         .bind(file.file_size_bytes)
-                        .bind(transaction_id)
+                        .bind(transaction_id.as_bytes().as_slice())
                         .bind(partition_text.as_deref())
                         .execute(tx.as_mut())
                         .await?;
@@ -1544,7 +1542,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             "UPDATE files SET removed_in_transaction_id = $1
                              WHERE file_uuid = $2 AND table_uuid = $3 AND removed_in_transaction_id IS NULL",
                         )
-                        .bind(transaction_id)
+                        .bind(transaction_id.as_bytes().as_slice())
                         .bind(file_uuid.as_bytes().as_slice())
                         .bind(table_uuid.as_bytes().as_slice())
                         .execute(tx.as_mut())
@@ -1575,7 +1573,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     .bind(schema_uuid.as_bytes().as_slice())
                     .bind(table_uuid.as_bytes().as_slice())
                     .bind(schema_version)
-                    .bind(transaction_id)
+                    .bind(transaction_id.as_bytes().as_slice())
                     .bind(transaction_timestamp)
                     .execute(tx.as_mut())
                     .await?;
@@ -1583,7 +1581,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     sqlx::query::<sqlx::Postgres>(
                         "UPDATE schemas SET valid_to_transaction_id = $1 WHERE schema_uuid = $2",
                     )
-                    .bind(transaction_id)
+                    .bind(transaction_id.as_bytes().as_slice())
                     .bind(current_schema_uuid.as_bytes().as_slice())
                     .execute(tx.as_mut())
                     .await?;
@@ -1633,7 +1631,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
              SET current_transaction_id = $1, current_schema_uuid = $2, properties = $3
              WHERE table_uuid = $4",
         )
-        .bind(transaction_id)
+        .bind(transaction_id.as_bytes().as_slice())
         .bind(schema_uuid_to_set.map(|uuid| uuid.as_bytes().to_vec()))
         .bind(properties_text.as_str())
         .bind(table_uuid.as_bytes().as_slice())
@@ -1711,21 +1709,11 @@ fn serialize_json_optional(value: Option<&serde_json::Value>) -> Result<Option<S
     value.map(serialize_json).transpose()
 }
 
-/// Get the next transaction ID from the database
-async fn next_transaction_id<'a, DB>(
-    tx: &mut sqlx::Transaction<'a, DB>,
-) -> Result<TxnId>
-where
-    DB: Database,
-    for<'r> i64: sqlx::Decode<'r, DB> + sqlx::Type<DB>,
-    for<'q> <DB as Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
-    for<'r> usize: sqlx::ColumnIndex<<DB as Database>::Row>,
-    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-{
-    let next_id: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(transaction_id), 0) + 1 FROM transactions",
-    )
-    .fetch_one(tx.as_mut())
-    .await?;
-    Ok(next_id)
+/// Generate a new transaction ID using UUIDv7
+/// 
+/// UUIDv7 is time-ordered and can be generated without database coordination,
+/// enabling distributed transaction ID generation.
+fn next_transaction_id() -> TxnId {
+    let uuid7_value = uuid7::uuid7();
+    uuid::Uuid::from_bytes(*uuid7_value.as_bytes())
 }
