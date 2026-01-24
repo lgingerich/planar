@@ -7,6 +7,7 @@ use crate::storage::{Reader, Writer, Result, StorageError};
 pub struct LanceReader;
 
 impl LanceReader {
+    /// Create a new Lance reader
     pub fn new() -> Self {
         Self
     }
@@ -23,6 +24,7 @@ impl Reader for LanceReader {
 pub struct LanceWriter;
 
 impl LanceWriter {
+    /// Create a new Lance writer
     pub fn new() -> Self {
         Self
     }

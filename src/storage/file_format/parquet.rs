@@ -4,12 +4,13 @@ use crate::storage::{Reader, Writer, Result, StorageError};
 
 /// Parquet reader implementation
 /// 
-/// Struct-based implementation of the Reader trait.
-/// This is a concrete type that can be used directly or through the trait.
+/// Struct-based implementation of the Reader trait
+/// This is a concrete type that can be used directly or through the trait
 #[derive(Debug, Default)]
 pub struct ParquetReader;
 
 impl ParquetReader {
+    /// Create a new Parquet reader
     pub fn new() -> Self {
         Self
     }
@@ -26,6 +27,7 @@ impl Reader for ParquetReader {
 pub struct ParquetWriter;
 
 impl ParquetWriter {
+    /// Create a new Parquet writer
     pub fn new() -> Self {
         Self
     }

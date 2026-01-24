@@ -7,6 +7,7 @@ use crate::storage::{Reader, Writer, Result, StorageError};
 pub struct VortexReader;
 
 impl VortexReader {
+    /// Create a new Vortex reader
     pub fn new() -> Self {
         Self
     }
@@ -23,6 +24,7 @@ impl Reader for VortexReader {
 pub struct VortexWriter;
 
 impl VortexWriter {
+    /// Create a new Vortex writer
     pub fn new() -> Self {
         Self
     }

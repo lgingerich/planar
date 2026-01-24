@@ -43,6 +43,7 @@ strip = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("sqlite", "postgres"))'] }
+missing_docs = "warn"
 
 [lints.clippy]
 type_complexity = "allow"

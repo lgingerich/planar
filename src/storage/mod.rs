@@ -1,7 +1,12 @@
+//! Storage module for file format operations
+
+/// Error types for storage operations
 pub mod error;
+/// File format implementations
 pub mod file_format;
 
 use std::path::Path;
+use std::str::FromStr;
 use arrow_array::RecordBatch;
 
 pub use error::{Result, StorageError};
@@ -12,24 +17,31 @@ use file_format::vortex::{VortexReader, VortexWriter};
 
 /// Trait for reading file formats into Arrow RecordBatches
 pub trait Reader: Send + Sync {
+    /// Read a file and return an Arrow RecordBatch
     fn read(&self, path: &Path) -> Result<RecordBatch>;
 }
 
 /// Trait for writing Arrow RecordBatches to file formats
 pub trait Writer: Send + Sync {
+    /// Write a RecordBatch to a file
     fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()>;
 }
 
-/// File format enum
+/// Supported file formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
+    /// Parquet format.
     Parquet,
+    /// Lance format.
     Lance,
+    /// Vortex format.
     Vortex,
 }
 
-impl Format {
-    pub fn from_str(s: &str) -> Result<Self> {
+impl FromStr for Format {
+    type Err = StorageError;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "parquet" => Ok(Format::Parquet),
             "lance" => Ok(Format::Lance),
@@ -40,7 +52,10 @@ impl Format {
             ))),
         }
     }
-    
+}
+
+impl Format {
+    /// Get format as string.
     pub fn as_str(&self) -> &'static str {
         match self {
             Format::Parquet => "parquet",
@@ -53,12 +68,16 @@ impl Format {
 /// Reader enum for type-safe dispatch
 #[derive(Debug)]
 pub enum ReaderEnum {
+    /// Parquet reader
     Parquet(ParquetReader),
+    /// Lance reader
     Lance(LanceReader),
+    /// Vortex reader
     Vortex(VortexReader),
 }
 
 impl ReaderEnum {
+    /// Create a reader for the given format
     pub fn new(format: Format) -> Self {
         match format {
             Format::Parquet => ReaderEnum::Parquet(ParquetReader::new()),
@@ -66,8 +85,12 @@ impl ReaderEnum {
             Format::Vortex => ReaderEnum::Vortex(VortexReader::new()),
         }
     }
-    
-    pub fn from_str(format_str: &str) -> Result<Self> {
+}
+
+impl FromStr for ReaderEnum {
+    type Err = StorageError;
+
+    fn from_str(format_str: &str) -> Result<Self> {
         let format = Format::from_str(format_str)?;
         Ok(Self::new(format))
     }
@@ -86,12 +109,16 @@ impl Reader for ReaderEnum {
 /// Writer enum for type-safe dispatch
 #[derive(Debug)]
 pub enum WriterEnum {
+    /// Parquet writer.
     Parquet(ParquetWriter),
+    /// Lance writer.
     Lance(LanceWriter),
+    /// Vortex writer.
     Vortex(VortexWriter),
 }
 
 impl WriterEnum {
+    /// Create a writer for the given format
     pub fn new(format: Format) -> Self {
         match format {
             Format::Parquet => WriterEnum::Parquet(ParquetWriter::new()),
@@ -99,8 +126,12 @@ impl WriterEnum {
             Format::Vortex => WriterEnum::Vortex(VortexWriter::new()),
         }
     }
-    
-    pub fn from_str(format_str: &str) -> Result<Self> {
+}
+
+impl FromStr for WriterEnum {
+    type Err = StorageError;
+
+    fn from_str(format_str: &str) -> Result<Self> {
         let format = Format::from_str(format_str)?;
         Ok(Self::new(format))
     }

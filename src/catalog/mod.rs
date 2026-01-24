@@ -1,24 +1,33 @@
+//! Catalog module for managing table metadata and transactions
+
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use sqlx::{Database, Pool, Row};
 
+/// Database-specific configuration
 pub mod database;
+/// Catalog error types
 pub mod error;
+/// Schema definitions
 pub mod schema;
 
 pub use error::{CatalogError, Result};
 
+/// Transaction identifier
 pub type TxnId = i64;
-pub type CatalogRef = Arc<dyn Catalog>;
 
+/// Table identifier consisting of namespace and name
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableIdent {
+    /// Table namespace
     pub namespace: String,
+    /// Table name
     pub name: String,
 }
 
 impl TableIdent {
+    /// Create a new table identifier
     pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
@@ -27,41 +36,64 @@ impl TableIdent {
     }
 }
 
+/// Snapshot of a table at a specific transaction
 #[derive(Debug, Clone)]
 pub struct TableView {
+    /// Table identifier
     pub ident: TableIdent,
+    /// Unique table UUID
     pub table_uuid: uuid::Uuid,
+    /// Transaction ID this view represents
     pub transaction_id: TxnId,
+    /// Table schema
     pub schema: schema::Schema,
+    /// Files in this table version
     pub files: Vec<schema::File>,
+    /// Table properties
     pub properties: serde_json::Value,
+    /// Optional table statistics
     pub stats: Option<schema::TableStats>,
 }
 
+/// Difference between two table versions
 #[derive(Debug, Clone)]
 pub struct TableDelta {
+    /// Starting transaction ID
     pub from_transaction_id: TxnId,
+    /// Ending transaction ID
     pub to_transaction_id: TxnId,
+    /// Files added in this range
     pub added_files: Vec<schema::File>,
+    /// Files removed in this range
     pub removed_files: Vec<schema::File>,
+    /// New schema if changed
     pub new_schema: Option<schema::Schema>,
+    /// New properties if changed
     pub new_properties: Option<serde_json::Value>,
 }
 
+/// Result of committing a mutation
 #[derive(Debug, Clone)]
 pub struct CommitResult {
+    /// Transaction ID of the commit
     pub transaction_id: TxnId,
+    /// Optional updated table view
     pub table_view: Option<TableView>,
 }
 
+/// Column specification for schema creation
 #[derive(Debug, Clone)]
 pub struct ColumnSpec {
+    /// Column name
     pub name: String,
+    /// Column type string
     pub column_type: String,
+    /// Whether the column allows null values
     pub is_nullable: bool,
 }
 
 impl ColumnSpec {
+    /// Create a new column specification (non-nullable by default)
     pub fn new(name: impl Into<String>, column_type: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -70,27 +102,33 @@ impl ColumnSpec {
         }
     }
 
+    /// Mark the column as nullable.
     pub fn nullable(mut self) -> Self {
         self.is_nullable = true;
         self
     }
 }
 
+/// Schema specification for table creation
 #[derive(Debug, Clone)]
 pub struct SchemaSpec {
+    /// Column specifications
     pub columns: Vec<ColumnSpec>,
 }
 
 impl SchemaSpec {
+    /// Create an empty schema specification
     pub fn new() -> Self {
         Self { columns: Vec::new() }
     }
 
+    /// Add a column to the schema
     pub fn with_column(mut self, column: ColumnSpec) -> Self {
         self.columns.push(column);
         self
     }
 
+    /// Add multiple columns to the schema
     pub fn with_columns(mut self, columns: Vec<ColumnSpec>) -> Self {
         self.columns.extend(columns);
         self
@@ -103,17 +141,25 @@ impl Default for SchemaSpec {
     }
 }
 
+/// File specification for mutations
 #[derive(Debug, Clone)]
 pub struct FileSpec {
+    /// Optional file UUID (generated if not provided)
     pub file_uuid: Option<uuid::Uuid>,
+    /// File format (e.g., "parquet", "lance", "vortex")
     pub file_format: String,
+    /// File path
     pub file_path: String,
+    /// Number of records in the file
     pub record_count: i64,
+    /// File size in bytes
     pub file_size_bytes: i64,
+    /// Optional partition values
     pub partition_values: Option<serde_json::Value>,
 }
 
 impl FileSpec {
+    /// Create a new file specification
     pub fn new(
         file_format: impl Into<String>,
         file_path: impl Into<String>,
@@ -130,40 +176,56 @@ impl FileSpec {
         }
     }
 
+    /// Set the file UUID
     pub fn with_uuid(mut self, uuid: uuid::Uuid) -> Self {
         self.file_uuid = Some(uuid);
         self
     }
 
+    /// Set partition values
     pub fn with_partition_values(mut self, values: serde_json::Value) -> Self {
         self.partition_values = Some(values);
         self
     }
 }
 
+/// Mutation operation type
 #[derive(Debug, Clone)]
 pub enum MutationOp {
+    /// Append files to the table
     AppendFiles(Vec<FileSpec>),
+    /// Delete files by UUID
     DeleteFiles(Vec<uuid::Uuid>),
+    /// Update the table schema
     UpdateSchema(SchemaSpec),
+    /// Set table properties (replaces existing)
     SetProperties(serde_json::Value),
+    /// Remove properties by key
     RemoveProperties(Vec<String>),
 }
 
+/// Collection of mutation operations to apply atomically
 #[derive(Debug, Clone, Default)]
 pub struct Mutation {
+    /// Operations to apply
     pub operations: Vec<MutationOp>,
 }
 
+/// Builder for constructing table mutations
 pub struct MutationBuilder {
-    catalog: CatalogRef,
+    /// Catalog instance for committing mutations
+    catalog: Arc<dyn Catalog>,
+    /// Table identifier
     ident: TableIdent,
+    /// Base transaction ID for optimistic concurrency control
     base_transaction_id: TxnId,
+    /// Mutation operations to apply
     mutation: Mutation,
 }
 
 impl MutationBuilder {
-    fn new(catalog: CatalogRef, ident: TableIdent, base_transaction_id: TxnId) -> Self {
+    /// Create a new mutation builder
+    fn new(catalog: Arc<dyn Catalog>, ident: TableIdent, base_transaction_id: TxnId) -> Self {
         Self {
             catalog,
             ident,
@@ -172,16 +234,19 @@ impl MutationBuilder {
         }
     }
 
+    /// Append multiple files to the table
     pub fn append_files(mut self, files: Vec<FileSpec>) -> Self {
         self.mutation.operations.push(MutationOp::AppendFiles(files));
         self
     }
 
+    /// Append a single file to the table
     pub fn append_file(mut self, file: FileSpec) -> Self {
         self.mutation.operations.push(MutationOp::AppendFiles(vec![file]));
         self
     }
 
+    /// Delete files by UUID
     pub fn delete_files(mut self, file_uuids: Vec<uuid::Uuid>) -> Self {
         self.mutation
             .operations
@@ -189,11 +254,13 @@ impl MutationBuilder {
         self
     }
 
+    /// Update the table schema
     pub fn update_schema(mut self, schema: SchemaSpec) -> Self {
         self.mutation.operations.push(MutationOp::UpdateSchema(schema));
         self
     }
 
+    /// Set table properties (replaces existing)
     pub fn set_properties(mut self, properties: serde_json::Value) -> Self {
         self.mutation
             .operations
@@ -201,6 +268,7 @@ impl MutationBuilder {
         self
     }
 
+    /// Remove properties by key
     pub fn remove_properties(mut self, keys: Vec<String>) -> Self {
         self.mutation
             .operations
@@ -208,6 +276,7 @@ impl MutationBuilder {
         self
     }
 
+    /// Commit the mutation to the catalog
     pub async fn commit(self) -> Result<CommitResult> {
         self.catalog
             .commit(&self.ident, self.base_transaction_id, self.mutation)
@@ -215,31 +284,39 @@ impl MutationBuilder {
     }
 }
 
+/// Handle for interacting with a table
 #[derive(Clone)]
 pub struct TableHandle {
-    catalog: CatalogRef,
+    /// Catalog instance for table operations
+    catalog: Arc<dyn Catalog>,
+    /// Table identifier
     ident: TableIdent,
 }
 
 impl TableHandle {
-    pub fn new(catalog: CatalogRef, ident: TableIdent) -> Self {
+    /// Create a new table handle
+    pub fn new(catalog: Arc<dyn Catalog>, ident: TableIdent) -> Self {
         Self { catalog, ident }
     }
 
+    /// Get the table identifier
     pub fn ident(&self) -> &TableIdent {
         &self.ident
     }
 
+    /// Read the current table view
     pub async fn read(&self) -> Result<TableView> {
         self.catalog.read_table(&self.ident, None).await
     }
 
+    /// Read the table view at a specific transaction
     pub async fn read_at(&self, transaction_id: TxnId) -> Result<TableView> {
         self.catalog
             .read_table(&self.ident, Some(transaction_id))
             .await
     }
 
+    /// Compute the difference between two transaction versions
     pub async fn diff(&self, from_transaction_id: TxnId, to_transaction_id: TxnId) -> Result<TableDelta> {
         self.catalog
             .diff_table(&self.ident, from_transaction_id, to_transaction_id)
@@ -258,7 +335,7 @@ impl TableHandle {
         Ok(MutationBuilder::new(self.catalog.clone(), self.ident.clone(), txn_id))
     }
 
-    /// Append a single file using the current transaction ID.
+    /// Append a single file using the current transaction ID
     pub async fn append_file(&self, file: FileSpec) -> Result<CommitResult> {
         self.write(None)
             .await?
@@ -267,7 +344,7 @@ impl TableHandle {
             .await
     }
 
-    /// Append multiple files using the current transaction ID.
+    /// Append multiple files using the current transaction ID
     pub async fn append_files(&self, files: Vec<FileSpec>) -> Result<CommitResult> {
         self.write(None)
             .await?
@@ -276,7 +353,7 @@ impl TableHandle {
             .await
     }
 
-    /// Delete files using the current transaction ID.
+    /// Delete files using the current transaction ID
     pub async fn delete_files(&self, file_uuids: Vec<uuid::Uuid>) -> Result<CommitResult> {
         self.write(None)
             .await?
@@ -285,7 +362,7 @@ impl TableHandle {
             .await
     }
 
-    /// Update schema using the current transaction ID.
+    /// Update schema using the current transaction ID
     pub async fn update_schema(&self, schema: SchemaSpec) -> Result<CommitResult> {
         self.write(None)
             .await?
@@ -294,7 +371,7 @@ impl TableHandle {
             .await
     }
 
-    /// Set properties using the current transaction ID.
+    /// Set properties using the current transaction ID
     pub async fn set_properties(&self, properties: serde_json::Value) -> Result<CommitResult> {
         self.write(None)
             .await?
@@ -304,8 +381,10 @@ impl TableHandle {
     }
 }
 
+/// Catalog trait for managing table metadata
 #[async_trait]
 pub trait Catalog: Send + Sync {
+    /// Create a new table
     async fn create_table(
         self: Arc<Self>,
         ident: TableIdent,
@@ -314,15 +393,20 @@ pub trait Catalog: Send + Sync {
         properties: Option<serde_json::Value>,
     ) -> Result<TableHandle>;
 
+    /// Load a table handle if it exists
     async fn load_table(self: Arc<Self>, ident: TableIdent) -> Result<Option<TableHandle>>;
 
+    /// List tables, optionally filtered by namespace
     async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>>;
 
+    /// Drop a table
     async fn drop_table(&self, ident: &TableIdent) -> Result<()>;
 
+    /// Read a table view at a specific transaction (or current if None)
     async fn read_table(&self, ident: &TableIdent, at_transaction_id: Option<TxnId>)
         -> Result<TableView>;
 
+    /// Compute the difference between two transaction versions
     async fn diff_table(
         &self,
         ident: &TableIdent,
@@ -330,6 +414,7 @@ pub trait Catalog: Send + Sync {
         to_transaction_id: TxnId,
     ) -> Result<TableDelta>;
 
+    /// Commit a mutation to a table
     async fn commit(
         &self,
         ident: &TableIdent,
@@ -338,11 +423,12 @@ pub trait Catalog: Send + Sync {
     ) -> Result<CommitResult>;
 }
 
-/// SQL-backed catalog for managing table metadata across databases.
+/// SQL-backed catalog implementation for managing table metadata
 pub struct SqlCatalog<DB>
 where
     DB: Database,
 {
+    /// Database connection pool
     pool: Pool<DB>,
 }
 
@@ -351,22 +437,22 @@ where
     DB: Database,
     <DB as Database>::Connection: sqlx::migrate::Migrate,
 {
+    /// Create a new SQL catalog with a connection pool
     pub fn new(pool: Pool<DB>) -> Self {
         Self { pool }
     }
 
+    /// Initialize the database schema by running migrations
     pub async fn initialize_schema(&self) -> std::result::Result<(), sqlx::Error> {
         let migrator = sqlx::migrate!("db/migrations");
         migrator.run(&self.pool).await?;
         Ok(())
     }
 
-    pub(crate) fn pool(&self) -> &Pool<DB> {
-        &self.pool
-    }
 }
 
 impl SqlCatalog<sqlx::Sqlite> {
+    /// Configure SQLite-specific database settings
     pub async fn configure_database(&self) -> std::result::Result<(), sqlx::Error> {
         database::sqlite::configure_pool(&self.pool).await
     }
@@ -385,20 +471,21 @@ impl SqlCatalog<sqlx::Sqlite> {
         Ok(catalog)
     }
 
-    /// Create an in-memory SQLite catalog.
-    /// This is a convenience method for testing and examples.
+    /// Create an in-memory SQLite catalog
+    /// This is a convenience method for testing and examples
     pub async fn in_memory() -> std::result::Result<Arc<Self>, sqlx::Error> {
         Self::from_connection_string("sqlite::memory:").await
     }
 }
 
 impl SqlCatalog<sqlx::Postgres> {
+    /// Configure PostgreSQL-specific database settings
     pub async fn configure_database(&self) -> std::result::Result<(), sqlx::Error> {
         database::postgres::configure_pool(&self.pool).await
     }
 
-    /// Create and initialize a PostgreSQL catalog from a connection string.
-    /// This is a convenience method that handles pool creation, configuration, and schema initialization.
+    /// Create and initialize a PostgreSQL catalog from a connection string
+    /// This is a convenience method that handles pool creation, configuration, and schema initialization
     pub async fn from_connection_string(
         connection_string: &str,
     ) -> std::result::Result<Arc<Self>, sqlx::Error> {
@@ -518,7 +605,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         tx.commit().await?;
 
-        let catalog: CatalogRef = self.clone();
+        let catalog: Arc<dyn Catalog> = self.clone();
         Ok(TableHandle::new(catalog, ident))
     }
 
@@ -536,7 +623,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             return Ok(None);
         }
 
-        let catalog: CatalogRef = self.clone();
+        let catalog: Arc<dyn Catalog> = self.clone();
         Ok(Some(TableHandle::new(catalog, ident)))
     }
 
@@ -771,7 +858,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         };
 
         let new_properties = if from_view.properties != to_view.properties {
-            Some(to_view.properties.clone())
+            Some(to_view.properties)
         } else {
             None
         };
@@ -1093,7 +1180,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         tx.commit().await?;
 
-        let catalog: CatalogRef = self.clone();
+        let catalog: Arc<dyn Catalog> = self.clone();
         Ok(TableHandle::new(catalog, ident))
     }
 
@@ -1111,7 +1198,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             return Ok(None);
         }
 
-        let catalog: CatalogRef = self.clone();
+        let catalog: Arc<dyn Catalog> = self.clone();
         Ok(Some(TableHandle::new(catalog, ident)))
     }
 
@@ -1346,7 +1433,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         };
 
         let new_properties = if from_view.properties != to_view.properties {
-            Some(to_view.properties.clone())
+            Some(to_view.properties)
         } else {
             None
         };
@@ -1562,6 +1649,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
     }
 }
 
+/// Extract UUID from a database row
 fn uuid_from_row<R>(row: &R, column: &str) -> Result<uuid::Uuid>
 where
     R: Row,
@@ -1570,11 +1658,12 @@ where
 {
     let bytes: Vec<u8> = row
         .try_get(column)
-        .map_err(|error| CatalogError::Storage(error))?;
+        .map_err(CatalogError::Storage)?;
     uuid::Uuid::from_slice(&bytes)
         .map_err(|error| CatalogError::InvalidArgument(format!("invalid uuid: {error}")))
 }
 
+/// Extract optional UUID from a database row
 fn uuid_from_row_optional<R>(row: &R, column: &str) -> Result<Option<uuid::Uuid>>
 where
     R: Row,
@@ -1583,7 +1672,7 @@ where
 {
     let bytes: Option<Vec<u8>> = row
         .try_get(column)
-        .map_err(|error| CatalogError::Storage(error))?;
+        .map_err(CatalogError::Storage)?;
     match bytes {
         Some(bytes) => uuid::Uuid::from_slice(&bytes)
             .map(Some)
@@ -1592,6 +1681,7 @@ where
     }
 }
 
+/// Parse JSON from optional string (defaults to empty object)
 fn parse_json(value: Option<String>) -> Result<serde_json::Value> {
     match value {
         Some(text) => serde_json::from_str(&text)
@@ -1600,6 +1690,7 @@ fn parse_json(value: Option<String>) -> Result<serde_json::Value> {
     }
 }
 
+/// Parse optional JSON from optional string
 fn parse_json_optional(value: Option<String>) -> Result<Option<serde_json::Value>> {
     match value {
         Some(text) => serde_json::from_str(&text)
@@ -1609,15 +1700,18 @@ fn parse_json_optional(value: Option<String>) -> Result<Option<serde_json::Value
     }
 }
 
+/// Serialize JSON value to string
 fn serialize_json(value: &serde_json::Value) -> Result<String> {
     serde_json::to_string(value)
         .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}")))
 }
 
+/// Serialize optional JSON value to optional string
 fn serialize_json_optional(value: Option<&serde_json::Value>) -> Result<Option<String>> {
     value.map(serialize_json).transpose()
 }
 
+/// Get the next transaction ID from the database
 async fn next_transaction_id<'a, DB>(
     tx: &mut sqlx::Transaction<'a, DB>,
 ) -> Result<TxnId>
