@@ -6,24 +6,13 @@ An open table format with a database-backed catalog architecture. Designed for s
 
 - **DB-backed control plane, file-native data plane**: Metadata lives in a transactional database for strong consistency and simple coordination. Data lives in immutable files in object storage for scale and cost efficiency.
 - **Streaming as a first-class citizen**: Optional in-memory buffering prevents the small file problem for high-frequency writes.
-- **Engine-agnostic**: Any reader or writer that can query the metadata database and read files can participate.
 - **Format-flexible**: Support for Parquet, Lance, Vortex, and other columnar formats.
-
-## Quick Start
-
-Run the table lifecycle example:
-
-```bash
-cargo run --example table_lifecycle
-```
-
-This demonstrates creating tables, adding files, time travel queries, and transaction deltas. See `examples/table_lifecycle.rs` for the full code.
 
 ## Architecture
 
 Planar splits into two planes:
 
-- **Control Plane**: A relational database (SQLite or PostgreSQL) stores catalog metadata, transactions, schemas, and file references.
+- **Control Plane**: A relational database (SQLite, PostgreSQL, MySQL) stores catalog metadata, transactions, schemas, and file references.
 - **Data Plane**: Immutable data files in object storage or local filesystem.
 
 ```
@@ -136,46 +125,29 @@ erDiagram
 
 ## Roadmap
 
-### Current Focus
+Features are listed in priority order. Each item links to detailed architecture documentation.
 
-**Core functionality**:
-- Commit protocol with conflict detection
-- Time travel queries
-- Schema evolution
-- File format support (Parquet, Lance, Vortex)
+### Tier 1: Foundation
+- **Data types**: Canonical type system with Arrow-based types, format conversions, and schema evolution rules. See [data_types.md](docs/architecture/data_types.md)
+- **File formats**: Complete Parquet, Lance, and Vortex implementations with statistics extraction and predicate pushdown. See [file_formats.md](docs/architecture/file_formats.md)
 
-**In progress**:
-- Row-level deletes (deletion vectors)
-- Orphan file GC
-- Transaction retention policies
+### Tier 2: Core Storage
+- **Deletion vectors**: Row-level deletes using Roaring bitmaps to avoid rewriting entire files. See [deletion_vectors.md](docs/architecture/deletion_vectors.md)
+- **Partitioning**: Metadata-driven partition pruning with hidden partitioning transforms (year, month, bucket). See [partitioning.md](docs/architecture/partitioning.md)
+- **Compaction**: Background file rewriting to merge small files, materialize deletions, and optimize layouts. See [compaction.md](docs/architecture/compaction.md)
 
-### Near-Term
+### Tier 3: Query & Integration
+- **Query planning**: Statistics-driven optimization with file pruning, column projection, and format-aware pushdown. See [query_planning.md](docs/architecture/query_planning.md)
+- **External access**: Direct database access or REST API for Spark, Trino, DuckDB, and other engines. See [external_access.md](docs/architecture/external_access.md)
 
-**Streaming support**: Optional buffer server for accumulating small writes before flushing to files. See [docs/architecture/streaming_buffer.md](docs/architecture/streaming_buffer.md).
+### Tier 4: Streaming & Real-time
+- **CDC**: Change data capture APIs for incremental processing and data replication. See [cdc.md](docs/architecture/cdc.md)
+- **Streaming buffer**: Optional in-memory write buffer to prevent small file problem (requires additional infrastructure). See [streaming_buffer.md](docs/architecture/streaming_buffer.md)
 
-**CDC support**: Change data capture APIs for incremental processing.
+### Tier 5: Advanced Features
+- **Multi-table transactions**: Atomic commits across multiple tables using two-phase commit (opt-in complexity). See [multi_table_txn.md](docs/architecture/multi_table_txn.md)
+- **Security**: Authentication, authorization, encryption, and audit logging for production deployments. See [security.md](docs/architecture/security.md)
 
-**External engine access**: Enable Spark, Trino, DuckDB, and other engines to read Planar tables. See [docs/architecture/external_access.md](docs/architecture/external_access.md).
-
-**Table maintenance**: Unified maintenance daemon for GC, compaction, and statistics (similar to Postgres autovacuum).
-
-### Future Considerations
-
-These are problems worth solving eventually, but not currently planned:
-
-**Manifest indirection**: For tables with millions of files, store file metadata in manifest files rather than directly in the database. Improves scalability but adds complexity.
-
-**Multi-table transactions**: Atomic commits across multiple tables. Requires two-phase commit protocol.
-
-**File-based transaction log**: Alternative to DB-backed catalog for cloud-native deployments where a database is undesirable.
-
-## Design Documents
-
-Detailed architecture documentation lives in `docs/architecture/`:
-
-- [db_control_plane.md](docs/architecture/db_control_plane.md) - Core metadata architecture, commit protocol, conflict handling, maintenance
-- [streaming_buffer.md](docs/architecture/streaming_buffer.md) - Optional write buffering for streaming workloads
-- [external_access.md](docs/architecture/external_access.md) - API design for external engine integration
 
 ## License
 
