@@ -5,6 +5,9 @@
 /// created with all tables, indexes, and constraints.
 
 #[cfg(feature = "sqlite")]
+mod schema_evolution_tests;
+
+#[cfg(feature = "sqlite")]
 mod sqlite_tests;
 
 #[cfg(feature = "postgres")]

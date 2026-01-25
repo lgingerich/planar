@@ -151,6 +151,7 @@ Features are listed in priority order. Each item links to detailed architecture 
 
 ## Open Questions
 - Is the DataType <> Arrow IPC design optimal?
+- Our catalog `Column` type diverges from Arrow `Field`. Should we better align these?
 
 ## License
 

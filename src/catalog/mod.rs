@@ -16,7 +16,7 @@ pub mod error;
 /// Schema definitions
 pub mod schema;
 
-pub use data_type::{decode_data_type, encode_data_type};
+pub use data_type::{can_evolve_to, decode_data_type, encode_data_type};
 pub use error::{CatalogError, Result};
 
 /// Transaction identifier
@@ -998,6 +998,49 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     .fetch_one(tx.as_mut())
                     .await?;
 
+                    // Fetch current schema columns for validation
+                    let current_column_rows = sqlx::query::<sqlx::Sqlite>(
+                        "SELECT column_name, column_type, is_nullable FROM columns WHERE schema_uuid = ?1",
+                    )
+                    .bind(current_schema_uuid.as_bytes().as_slice())
+                    .fetch_all(tx.as_mut())
+                    .await?;
+
+                    // Build map of current column names to (DataType, nullability)
+                    let mut current_columns = std::collections::HashMap::new();
+                    for row in current_column_rows {
+                        let column_name: String = row.try_get("column_name")?;
+                        let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
+                        let column_type = decode_data_type(&column_type_bytes)?;
+                        let is_nullable: bool = row.try_get("is_nullable")?;
+                        current_columns.insert(column_name, (column_type, is_nullable));
+                    }
+
+                    // Validate schema evolution for each column in new schema
+                    for new_column in &schema_spec.columns {
+                        if let Some((old_type, old_nullable)) = current_columns.get(&new_column.name) {
+                            // Column exists - validate evolution
+                            
+                            // Check type evolution
+                            if !can_evolve_to(old_type, &new_column.column_type) {
+                                return Err(CatalogError::InvalidArgument(format!(
+                                    "invalid schema evolution for column '{}': cannot evolve {:?} to {:?}",
+                                    new_column.name, old_type, new_column.column_type
+                                )));
+                            }
+
+                            // Check nullability evolution
+                            // Making nullable -> non-nullable is unsafe (existing nulls would violate constraint)
+                            if *old_nullable && !new_column.is_nullable {
+                                return Err(CatalogError::InvalidArgument(format!(
+                                    "invalid schema evolution for column '{}': cannot change from nullable to non-nullable (existing nulls would violate constraint)",
+                                    new_column.name
+                                )));
+                            }
+                        }
+                        // New columns are always allowed (they default to null for existing data)
+                    }
+
                     let schema_uuid = uuid::Uuid::new_v4();
                     let schema_version = current_schema_version + 1;
 
@@ -1576,6 +1619,49 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     .bind(current_schema_uuid.as_bytes().as_slice())
                     .fetch_one(tx.as_mut())
                     .await?;
+
+                    // Fetch current schema columns for validation
+                    let current_column_rows = sqlx::query::<sqlx::Postgres>(
+                        "SELECT column_name, column_type, is_nullable FROM columns WHERE schema_uuid = $1",
+                    )
+                    .bind(current_schema_uuid.as_bytes().as_slice())
+                    .fetch_all(tx.as_mut())
+                    .await?;
+
+                    // Build map of current column names to (DataType, nullability)
+                    let mut current_columns = std::collections::HashMap::new();
+                    for row in current_column_rows {
+                        let column_name: String = row.try_get("column_name")?;
+                        let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
+                        let column_type = decode_data_type(&column_type_bytes)?;
+                        let is_nullable: bool = row.try_get("is_nullable")?;
+                        current_columns.insert(column_name, (column_type, is_nullable));
+                    }
+
+                    // Validate schema evolution for each column in new schema
+                    for new_column in &schema_spec.columns {
+                        if let Some((old_type, old_nullable)) = current_columns.get(&new_column.name) {
+                            // Column exists - validate evolution
+                            
+                            // Check type evolution
+                            if !can_evolve_to(old_type, &new_column.column_type) {
+                                return Err(CatalogError::InvalidArgument(format!(
+                                    "invalid schema evolution for column '{}': cannot evolve {:?} to {:?}",
+                                    new_column.name, old_type, new_column.column_type
+                                )));
+                            }
+
+                            // Check nullability evolution
+                            // Making nullable -> non-nullable is unsafe (existing nulls would violate constraint)
+                            if *old_nullable && !new_column.is_nullable {
+                                return Err(CatalogError::InvalidArgument(format!(
+                                    "invalid schema evolution for column '{}': cannot change from nullable to non-nullable (existing nulls would violate constraint)",
+                                    new_column.name
+                                )));
+                            }
+                        }
+                        // New columns are always allowed (they default to null for existing data)
+                    }
 
                     let schema_uuid = uuid::Uuid::new_v4();
                     let schema_version = current_schema_version + 1;
