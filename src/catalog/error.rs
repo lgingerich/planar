@@ -18,6 +18,9 @@ pub enum CatalogError {
     /// Storage/database error
     #[error("storage error: {0}")]
     Storage(#[from] sqlx::Error),
+    /// Arrow error
+    #[error("arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
 }
 
 /// Result type for catalog operations

@@ -8,8 +8,9 @@ readme = "README.md"
 repository = "https://github.com/lgingerich/planar"
 
 [dependencies]
-arrow = "57.1.0"
-arrow-array = "57.1.0"
+arrow = "57.2.0"
+arrow-array = "57.2.0"
+arrow-ipc = "57.2.0"
 async-trait = "0.1.89"
 chrono = { version = "0.4", features = ["serde"] }
 lance = "1.0.1"

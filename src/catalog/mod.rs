@@ -2,16 +2,21 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use sqlx::{Database, Pool, Row};
 
 /// Database-specific configuration
 pub mod database;
+
+/// Data type definitions
+pub mod data_type;
 /// Catalog error types
 pub mod error;
 /// Schema definitions
 pub mod schema;
 
+pub use data_type::{decode_data_type, encode_data_type};
 pub use error::{CatalogError, Result};
 
 /// Transaction identifier
@@ -87,17 +92,17 @@ pub struct ColumnSpec {
     /// Column name
     pub name: String,
     /// Column type string
-    pub column_type: String,
+    pub column_type: DataType,
     /// Whether the column allows null values
     pub is_nullable: bool,
 }
 
 impl ColumnSpec {
     /// Create a new column specification (non-nullable by default)
-    pub fn new(name: impl Into<String>, column_type: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, column_type: DataType) -> Self {
         Self {
             name: name.into(),
-            column_type: column_type.into(),
+            column_type,
             is_nullable: false,
         }
     }
@@ -577,6 +582,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         for (index, column) in schema.columns.iter().enumerate() {
             let column_uuid = uuid::Uuid::new_v4();
             let ordinal_position = (index + 1) as i32;
+            let encoded_type = encode_data_type(&column.column_type)?;
 
             sqlx::query::<sqlx::Sqlite>(
                 "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
@@ -585,7 +591,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             .bind(column_uuid.as_bytes().as_slice())
             .bind(schema_uuid.as_bytes().as_slice())
             .bind(column.name.as_str())
-            .bind(column.column_type.as_str())
+            .bind(&encoded_type)
             .bind(ordinal_position)
             .bind(column.is_nullable)
             .execute(tx.as_mut())
@@ -739,11 +745,14 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         let mut columns = Vec::with_capacity(column_rows.len());
         for row in column_rows {
+            let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
+            let column_type = decode_data_type(&column_type_bytes)?;
+            
             let column = schema::Column {
                 column_uuid: uuid_from_row(&row, "column_uuid")?,
                 schema_uuid: uuid_from_row(&row, "schema_uuid")?,
                 column_name: row.try_get("column_name")?,
-                column_type: row.try_get("column_type")?,
+                column_type,
                 ordinal_position: row.try_get("ordinal_position")?,
                 is_nullable: row.try_get("is_nullable")?,
             };
@@ -1015,6 +1024,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     for (index, column) in schema_spec.columns.iter().enumerate() {
                         let column_uuid = uuid::Uuid::new_v4();
                         let ordinal_position = (index + 1) as i32;
+                        let encoded_type = encode_data_type(&column.column_type)?;
 
                         sqlx::query::<sqlx::Sqlite>(
                             "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
@@ -1023,7 +1033,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                         .bind(column_uuid.as_bytes().as_slice())
                         .bind(schema_uuid.as_bytes().as_slice())
                         .bind(column.name.as_str())
-                        .bind(column.column_type.as_str())
+                        .bind(&encoded_type)
                         .bind(ordinal_position)
                         .bind(column.is_nullable)
                         .execute(tx.as_mut())
@@ -1151,6 +1161,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         for (index, column) in schema.columns.iter().enumerate() {
             let column_uuid = uuid::Uuid::new_v4();
             let ordinal_position = (index + 1) as i32;
+            let encoded_type = encode_data_type(&column.column_type)?;
 
             sqlx::query::<sqlx::Postgres>(
                 "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
@@ -1159,7 +1170,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             .bind(column_uuid.as_bytes().as_slice())
             .bind(schema_uuid.as_bytes().as_slice())
             .bind(column.name.as_str())
-            .bind(column.column_type.as_str())
+            .bind(&encoded_type)
             .bind(ordinal_position)
             .bind(column.is_nullable)
             .execute(tx.as_mut())
@@ -1313,11 +1324,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         let mut columns = Vec::with_capacity(column_rows.len());
         for row in column_rows {
+            let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
+            let column_type = decode_data_type(&column_type_bytes)?;
+            
             let column = schema::Column {
                 column_uuid: uuid_from_row(&row, "column_uuid")?,
                 schema_uuid: uuid_from_row(&row, "schema_uuid")?,
                 column_name: row.try_get("column_name")?,
-                column_type: row.try_get("column_type")?,
+                column_type,
                 ordinal_position: row.try_get("ordinal_position")?,
                 is_nullable: row.try_get("is_nullable")?,
             };
@@ -1589,6 +1603,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     for (index, column) in schema_spec.columns.iter().enumerate() {
                         let column_uuid = uuid::Uuid::new_v4();
                         let ordinal_position = (index + 1) as i32;
+                        let encoded_type = encode_data_type(&column.column_type)?;
 
                         sqlx::query::<sqlx::Postgres>(
                             "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
@@ -1597,7 +1612,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                         .bind(column_uuid.as_bytes().as_slice())
                         .bind(schema_uuid.as_bytes().as_slice())
                         .bind(column.name.as_str())
-                        .bind(column.column_type.as_str())
+                        .bind(&encoded_type)
                         .bind(ordinal_position)
                         .bind(column.is_nullable)
                         .execute(tx.as_mut())

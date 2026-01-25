@@ -34,6 +34,8 @@ CREATE INDEX IF NOT EXISTS idx_transactions_timestamp
 -- ============================================================================
 -- schemas
 -- ============================================================================
+-- NOTE: May want to add a column for the Arrow IPC schema bytes
+
 CREATE TABLE IF NOT EXISTS schemas (
     schema_uuid BLOB PRIMARY KEY,
     table_uuid BLOB NOT NULL,
@@ -59,7 +61,7 @@ CREATE TABLE IF NOT EXISTS columns (
     column_uuid BLOB PRIMARY KEY,
     schema_uuid BLOB NOT NULL,
     column_name TEXT NOT NULL,
-    column_type TEXT NOT NULL,
+    column_type BLOB NOT NULL,
     ordinal_position INTEGER NOT NULL,
     is_nullable BOOLEAN NOT NULL,
     FOREIGN KEY(schema_uuid) REFERENCES schemas(schema_uuid),

@@ -18,294 +18,189 @@ Planar needs a robust type system for several reasons:
 
 5. **Type validation**: Catching type errors at table creation time rather than at query time improves developer experience.
 
+## Design Decision: Use Arrow DataType Directly
+
+**Planar uses `arrow::datatypes::DataType` directly and stores it using Arrow IPC format.** This decision is based on:
+
+1. **Arrow is canonical**: Battle-tested, stable type system widely adopted across the data ecosystem.
+
+2. **Stable serialization**: Arrow IPC format is the official serialization mechanism with backward compatibility guarantees.
+
+3. **Ecosystem compatibility**: Seamless integration with DataFusion, Parquet, Lance, and other Arrow-based libraries.
+
+4. **Reduced maintenance**: No custom type definitions, parsers, or conversion code needed.
+
+5. **Format conversions exist**: `arrow-parquet`, Lance, and Vortex all use Arrow types natively.
+
 ## Design Principles
 
-1. **Arrow as canonical representation**: Use Apache Arrow's type system as Planar's canonical type representation. Arrow is already used internally for `RecordBatch` operations, and it has well-defined mappings to Parquet, which simplifies implementation.
+1. **Use Arrow directly**: Planar's type system is Arrow's type system. Store types using Arrow IPC format.
 
-2. **Format-agnostic**: Planar types should not be tied to any single file format. Conversions to format-specific types (Parquet, Lance, Vortex) are explicit and bidirectional.
+2. **Official serialization**: Use Arrow IPC Schema format for stable, versioned type storage with backward compatibility guarantees.
 
-3. **Schema evolution rules**: Define which type changes are safe (backward-compatible) vs breaking. These rules enforce data integrity.
+3. **Build operations on types**: Focus on schema evolution validation, statistics encoding, and external engine mappings rather than reinventing type definitions.
 
-4. **Serialization stability**: The string representation of types must be stable across versions. Once a type is written to the database, its string form cannot change.
+4. **Schema evolution rules**: Define which type changes are safe (backward-compatible) vs breaking to enforce data integrity.
 
-## Canonical Type System
+## What Planar Implements
 
-Planar's type system is based on Arrow DataType with additional semantics:
+Planar does not create a custom type system. Instead, it uses Arrow types and builds the following on top:
 
-### Primitive Types
+**Schema Evolution Validation** (`src/catalog/data_type.rs`)
+- `can_evolve_to()` - Validates safe type changes (int32 → int64, etc.)
+- Enforces nullability rules
+- Prevents data-loss operations
 
-```rust
-pub enum PrimitiveType {
-    /// Boolean (1 bit, 0 = false, 1 = true)
-    Boolean,
-    
-    /// Signed 8-bit integer
-    Int8,
-    /// Signed 16-bit integer
-    Int16,
-    /// Signed 32-bit integer
-    Int32,
-    /// Signed 64-bit integer
-    Int64,
-    
-    /// Unsigned 8-bit integer
-    UInt8,
-    /// Unsigned 16-bit integer
-    UInt16,
-    /// Unsigned 32-bit integer
-    UInt32,
-    /// Unsigned 64-bit integer
-    UInt64,
-    
-    /// 32-bit floating point (IEEE 754)
-    Float32,
-    /// 64-bit floating point (IEEE 754)
-    Float64,
-}
-```
+**Statistics Encoding** (`src/catalog/data_type.rs`)
+- `encode_scalar()` / `decode_scalar()` - Binary encoding for min/max values
+- Uses Arrow's `ScalarValue` for in-memory representation
+- Supports predicate pushdown and query optimization
 
-### Decimal Types
+**Type Storage** (`src/catalog/data_type.rs`)
+- Stores types as binary using Arrow IPC Schema format
+- Official stable serialization format with backward compatibility guarantees
+- Provides helper functions for encoding/decoding individual DataTypes
+
+**Format Integration** (`src/storage/file_format/*`)
+- Leverages `arrow-parquet` for Parquet type conversions
+- Validates Lance-compatible types
+- Future: Vortex and external engine integrations
+
+## Arrow Type System
+
+Planar uses [`arrow::datatypes::DataType`](https://docs.rs/arrow/57.2.0/arrow/datatypes/enum.DataType.html) as its canonical type representation. Arrow provides a comprehensive type system including primitives (Int*, UInt*, Float*, Boolean), decimals, strings, temporal types (Date, Time, Timestamp, Duration), and complex nested types (List, Struct, Map, Union).
+
+See the [Arrow DataType documentation](https://docs.rs/arrow/57.2.0/arrow/datatypes/enum.DataType.html) for the complete type reference.
+
+### Usage Example
 
 ```rust
-pub struct DecimalType {
-    /// Precision: total number of digits (1-38)
-    pub precision: u8,
-    /// Scale: number of digits after decimal point (0-precision)
-    pub scale: i8,
-    /// Bit width: 128 or 256
-    pub bit_width: DecimalBitWidth,
-}
+use arrow::datatypes::{DataType, TimeUnit};
+use planar::catalog::{ColumnSpec, SchemaSpec, TableIdent};
 
-pub enum DecimalBitWidth {
-    /// 128-bit decimal (max precision 38)
-    Decimal128,
-    /// 256-bit decimal (max precision 76)
-    Decimal256,
-}
+// Create a table schema with Arrow types
+let schema = SchemaSpec::new()
+    .with_column(ColumnSpec {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        is_nullable: false,
+    })
+    .with_column(ColumnSpec {
+        name: "created_at".to_string(),
+        data_type: DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        is_nullable: false,
+    });
+
+// Create table
+let table = catalog
+    .create_table(
+        TableIdent::new("public", "users"),
+        "s3://bucket/users/".to_string(),
+        schema,
+        None,
+    )
+    .await?;
 ```
 
-### String and Binary Types
+## Type Serialization
+
+Planar uses **Arrow IPC Schema format** for storing types in the database. This is Arrow's official stable serialization format with backward compatibility guarantees.
+
+### Why IPC Format?
+
+- **Official stability**: Designed specifically for serialization, versioned and backward-compatible
+- **Comprehensive**: Handles all Arrow types including complex nested structures
+- **Battle-tested**: Used across the Arrow ecosystem for data exchange
+- **Future-proof**: New Arrow types work automatically
+
+### Implementation
+
+Type serialization helpers in `src/catalog/data_type.rs`:
 
 ```rust
-pub enum StringType {
-    /// UTF-8 encoded string (variable length, 32-bit offsets)
-    String,
-    /// UTF-8 encoded string (variable length, 64-bit offsets for >2GB strings)
-    LargeString,
-    /// UTF-8 encoded string (fixed length)
-    FixedSizeString(i32),
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow_ipc::writer::IpcWriteOptions;
+
+/// Encode a DataType to bytes using Arrow IPC format
+pub fn encode_data_type(data_type: &DataType, field_name: &str) -> Result<Vec<u8>> {
+    // Wrap the DataType in a Field and Schema for IPC encoding
+    let field = Field::new(field_name, data_type.clone(), true);
+    let schema = Schema::new(vec![field]);
+    
+    // Encode schema to IPC format
+    let encoded = arrow_ipc::writer::schema_to_fb(&schema, &IpcWriteOptions::default());
+    Ok(encoded.to_vec())
 }
 
-pub enum BinaryType {
-    /// Variable-length binary (32-bit offsets)
-    Binary,
-    /// Variable-length binary (64-bit offsets for >2GB data)
-    LargeBinary,
-    /// Fixed-length binary
-    FixedSizeBinary(i32),
+/// Decode a DataType from IPC bytes
+pub fn decode_data_type(bytes: &[u8]) -> Result<DataType> {
+    let schema = arrow_ipc::convert::fb_to_schema(bytes)?;
+    
+    // Extract the first field's type
+    schema.field(0)
+        .map(|f| f.data_type().clone())
+        .ok_or_else(|| CatalogError::InvalidArgument("Empty schema".into()))
 }
 ```
 
-### Temporal Types
+### Database Storage
 
+Column types are stored as binary blobs in the `columns` table:
+
+**Schema:**
+```sql
+CREATE TABLE columns (
+    column_uuid BLOB NOT NULL PRIMARY KEY,
+    schema_uuid BLOB NOT NULL,
+    column_name TEXT NOT NULL,
+    column_type BLOB NOT NULL,  -- IPC-encoded DataType
+    ordinal_position INTEGER NOT NULL,
+    is_nullable BOOLEAN NOT NULL,
+    FOREIGN KEY (schema_uuid) REFERENCES schemas(schema_uuid)
+);
+```
+
+**Usage:**
 ```rust
-pub enum TemporalType {
-    /// Date stored as days since UNIX epoch (32-bit)
-    Date32,
-    /// Date stored as milliseconds since UNIX epoch (64-bit)
-    Date64,
-    
-    /// Time of day (no date component)
-    Time32(TimeUnit),
-    /// Time of day (no date component, 64-bit)
-    Time64(TimeUnit),
-    
-    /// Timestamp with optional timezone
-    Timestamp(TimeUnit, Option<Arc<str>>),
-    
-    /// Duration (time delta)
-    Duration(TimeUnit),
-    
-    /// Calendar interval (year-month)
-    IntervalYearMonth,
-    /// Calendar interval (day-time)
-    IntervalDayTime,
-    /// Calendar interval (month-day-nano)
-    IntervalMonthDayNano,
-}
+use planar::catalog::data_type::{encode_data_type, decode_data_type};
 
-pub enum TimeUnit {
-    /// Seconds
-    Second,
-    /// Milliseconds
-    Millisecond,
-    /// Microseconds
-    Microsecond,
-    /// Nanoseconds
-    Nanosecond,
-}
+// When creating a column
+let data_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+let encoded = encode_data_type(&data_type, "created_at")?;
+
+sqlx::query("INSERT INTO columns (column_type, ...) VALUES (?1, ...)")
+    .bind(&encoded)
+    .execute(&pool)
+    .await?;
+
+// When reading a column
+let encoded: Vec<u8> = row.get("column_type");
+let data_type = decode_data_type(&encoded)?;
 ```
 
-### Complex Types
+## Format Integration
 
-```rust
-pub enum ComplexType {
-    /// List of values (variable length, 32-bit offsets)
-    List(Box<Field>),
-    /// List of values (variable length, 64-bit offsets)
-    LargeList(Box<Field>),
-    /// List of values (fixed length)
-    FixedSizeList(Box<Field>, i32),
-    
-    /// Struct with named fields
-    Struct(Vec<Field>),
-    
-    /// Map of key-value pairs
-    Map(Box<Field>, Box<Field>, bool), // key, value, keys_sorted
-    
-    /// Union (tagged or dense)
-    Union(Vec<Field>, UnionMode),
-}
+Since Planar uses Arrow types natively, format conversions leverage existing libraries.
 
-pub enum UnionMode {
-    /// Sparse union (uses type_id only)
-    Sparse,
-    /// Dense union (uses type_id and offset)
-    Dense,
-}
-```
+### Parquet
 
-### Field Definition
+The `arrow-parquet` crate handles all type conversions automatically. No custom conversion logic needed.
 
-```rust
-pub struct Field {
-    /// Field name
-    pub name: Arc<str>,
-    /// Field data type
-    pub data_type: DataType,
-    /// Whether the field can contain null values
-    pub nullable: bool,
-    /// Optional metadata (key-value pairs)
-    pub metadata: Option<HashMap<String, String>>,
-}
-```
+### Lance
 
-### Top-Level DataType Enum
+Lance uses Arrow types natively but has restrictions:
+- No `Large*` types (LargeList, LargeUtf8, LargeBinary)
+- Limited nested type support
 
-```rust
-pub enum DataType {
-    Primitive(PrimitiveType),
-    Decimal(DecimalType),
-    String(StringType),
-    Binary(BinaryType),
-    Temporal(TemporalType),
-    Complex(ComplexType),
-}
-```
+Planar will validate schema compatibility when writing Lance files.
 
-## String Representation
+### Vortex
 
-Types are serialized to strings for database storage. The format must be stable and human-readable.
+Vortex uses Arrow types with compression. Integration will use Vortex's Arrow-compatible API.
 
-### Format Specification
+### External Engines (Future)
 
-```
-<type> ::= <primitive> | <decimal> | <string> | <binary> | <temporal> | <complex>
-
-<primitive> ::= "boolean" | "int8" | "int16" | "int32" | "int64"
-              | "uint8" | "uint16" | "uint32" | "uint64"
-              | "float32" | "float64"
-
-<decimal> ::= "decimal128(" <precision> "," <scale> ")"
-            | "decimal256(" <precision> "," <scale> ")"
-
-<string> ::= "string" | "large_string" | "fixed_string(" <size> ")"
-
-<binary> ::= "binary" | "large_binary" | "fixed_binary(" <size> ")"
-
-<temporal> ::= "date32" | "date64"
-             | "time32(" <unit> ")" | "time64(" <unit> ")"
-             | "timestamp(" <unit> ")"
-             | "timestamp(" <unit> "," <timezone> ")"
-             | "duration(" <unit> ")"
-             | "interval_year_month" | "interval_day_time" | "interval_month_day_nano"
-
-<unit> ::= "s" | "ms" | "us" | "ns"
-
-<complex> ::= "list(" <field> ")"
-            | "large_list(" <field> ")"
-            | "fixed_list(" <field> "," <size> ")"
-            | "struct(" <field> ["," <field>]* ")"
-            | "map(" <key_field> "," <value_field> ")"
-            | "map_sorted(" <key_field> "," <value_field> ")"
-            | "union_sparse(" <field> ["," <field>]* ")"
-            | "union_dense(" <field> ["," <field>]* ")"
-
-<field> ::= <name> ":" <type> ["?"] ["{" <metadata> "}"]
-
-<metadata> ::= <key> "=" <value> ["," <key> "=" <value>]*
-```
-
-### Examples
-
-```
-int32
-decimal128(10,2)
-string
-timestamp(ms,UTC)
-list(item:int64)
-struct(id:int32,name:string?,created_at:timestamp(us))
-```
-
-### Backward Compatibility
-
-Once a type string is written to the database, its format cannot change. If the internal representation changes, the parser must still understand old formats.
-
-## Type Conversions
-
-### Arrow ↔ Planar
-
-Planar types are a subset of Arrow types. Conversion is straightforward:
-
-```rust
-impl From<arrow::datatypes::DataType> for planar::DataType {
-    fn from(arrow_type: arrow::datatypes::DataType) -> Self {
-        // Map Arrow types to Planar types
-    }
-}
-
-impl TryFrom<planar::DataType> for arrow::datatypes::DataType {
-    type Error = TypeError;
-    
-    fn try_from(planar_type: planar::DataType) -> Result<Self, Self::Error> {
-        // Map Planar types to Arrow types
-    }
-}
-```
-
-### Parquet ↔ Planar
-
-Parquet has its own type system with physical and logical types. The conversion must preserve semantics:
-
-| Planar Type | Parquet Physical | Parquet Logical |
-|-------------|------------------|-----------------|
-| `int32` | `INT32` | `INT(32, signed)` |
-| `int64` | `INT64` | `INT(64, signed)` |
-| `decimal128(p,s)` | `FIXED_LEN_BYTE_ARRAY(16)` | `DECIMAL(p,s)` |
-| `string` | `BYTE_ARRAY` | `STRING` |
-| `timestamp(us,UTC)` | `INT64` | `TIMESTAMP(MICROS, true)` |
-| `list(item:T)` | `list` | - |
-| `struct(...)` | `group` | - |
-
-Not all Parquet logical types have direct Planar equivalents. Unsupported types should error gracefully.
-
-### Lance ↔ Planar
-
-Lance uses Arrow's type system internally, so conversion is simpler. However, Lance has restrictions on certain types (e.g., no large types).
-
-### Vortex ↔ Planar
-
-Vortex is a compressed columnar format that also uses Arrow types. Conversion should be straightforward, but compression-specific types may need special handling.
+Engine-specific connectors will map Arrow types to SQL types (Spark, Trino, DuckDB) when those integrations are added.
 
 ## Schema Evolution Rules
 
@@ -317,14 +212,19 @@ These changes are **allowed** without data rewrite:
 
 | From | To | Rationale |
 |------|----|-----------| 
-| `int8` | `int16`, `int32`, `int64` | Widening preserves values |
-| `int16` | `int32`, `int64` | Widening preserves values |
-| `int32` | `int64` | Widening preserves values |
-| `float32` | `float64` | Widening preserves values |
-| `date32` | `date64` | Date64 is more precise |
-| `timestamp(s,tz)` | `timestamp(ms,tz)`, `timestamp(us,tz)`, `timestamp(ns,tz)` | Increased precision |
-| `T` | `T?` (nullable) | Making a column nullable is safe |
-| `decimal(p1,s)` | `decimal(p2,s)` where `p2 > p1` | Increased precision |
+| `Int8` | `Int16`, `Int32`, `Int64` | Widening preserves values |
+| `Int16` | `Int32`, `Int64` | Widening preserves values |
+| `Int32` | `Int64` | Widening preserves values |
+| `UInt8` | `UInt16`, `UInt32`, `UInt64` | Widening preserves values |
+| `UInt16` | `UInt32`, `UInt64` | Widening preserves values |
+| `UInt32` | `UInt64` | Widening preserves values |
+| `Float32` | `Float64` | Widening preserves values |
+| `Date32` | `Date64` | Date64 is more precise |
+| `Timestamp(Second, tz)` | `Timestamp(Millisecond\|Microsecond\|Nanosecond, tz)` | Increased precision |
+| `Timestamp(Millisecond, tz)` | `Timestamp(Microsecond\|Nanosecond, tz)` | Increased precision |
+| `Timestamp(Microsecond, tz)` | `Timestamp(Nanosecond, tz)` | Increased precision |
+| Non-nullable field | Nullable field | Making a column nullable is safe |
+| `Decimal128(p1, s)` | `Decimal128(p2, s)` where `p2 > p1` | Increased precision |
 
 ### Unsafe Type Changes (Backward-Incompatible)
 
@@ -332,182 +232,59 @@ These changes are **not allowed** without explicit data rewrite:
 
 | From | To | Rationale |
 |------|----|-----------| 
-| `int64` | `int32` | Narrowing can overflow |
-| `float64` | `float32` | Loss of precision |
-| `string` | `int32` | Type mismatch |
-| `T?` (nullable) | `T` (non-null) | Existing nulls would violate constraint |
-| `decimal(p,s1)` | `decimal(p,s2)` where `s1 != s2` | Changing scale requires rewrite |
-| `timestamp(ns,tz)` | `timestamp(us,tz)` | Loss of precision |
+| `Int64` | `Int32` | Narrowing can overflow |
+| `Float64` | `Float32` | Loss of precision |
+| `Utf8` | `Int32` | Type mismatch |
+| Nullable field | Non-nullable field | Existing nulls would violate constraint |
+| `Decimal128(p, s1)` | `Decimal128(p, s2)` where `s1 != s2` | Changing scale requires rewrite |
+| `Timestamp(Nanosecond, tz)` | `Timestamp(Microsecond\|Millisecond\|Second, tz)` | Loss of precision |
+| `Utf8` | `LargeUtf8` | Offset type change requires rewrite |
 
-### Struct Field Changes
-
-For struct types, these rules apply:
-
-- **Adding a nullable field**: Safe (new field is null for existing rows)
-- **Adding a non-null field**: Unsafe (no value for existing rows)
-- **Removing a field**: Safe (field is ignored in reads)
-- **Renaming a field**: Unsafe (breaks existing queries)
-- **Reordering fields**: Unsafe (breaks positional access)
 
 ### Implementation
 
-Schema evolution validation happens in `SqlCatalog::commit` when processing `MutationOp::UpdateSchema`:
-
-```rust
-impl SqlCatalog {
-    async fn validate_schema_evolution(
-        &self,
-        old_schema: &Schema,
-        new_schema: &SchemaSpec,
-    ) -> Result<()> {
-        // For each old column, check if new column exists
-        for old_col in &old_schema.columns {
-            if let Some(new_col) = new_schema.columns.iter().find(|c| c.name == old_col.column_name) {
-                // Column exists, validate type change
-                let old_type = DataType::from_str(&old_col.column_type)?;
-                let new_type = DataType::from_str(&new_col.column_type)?;
-                
-                if !old_type.can_evolve_to(&new_type) {
-                    return Err(CatalogError::InvalidSchemaEvolution(
-                        format!("Cannot change {} from {} to {}", 
-                            old_col.column_name, old_type, new_type)
-                    ));
-                }
-                
-                // Check nullability
-                if old_col.is_nullable && !new_col.is_nullable {
-                    return Err(CatalogError::InvalidSchemaEvolution(
-                        format!("Cannot make nullable column {} non-nullable", old_col.column_name)
-                    ));
-                }
-            }
-            // Column removed is OK (ignored in reads)
-        }
-        
-        // Check new columns
-        for new_col in &new_schema.columns {
-            if !old_schema.columns.iter().any(|c| c.column_name == new_col.name) {
-                // New column added
-                if !new_col.is_nullable {
-                    return Err(CatalogError::InvalidSchemaEvolution(
-                        format!("Cannot add non-nullable column {}", new_col.name)
-                    ));
-                }
-            }
-        }
-        
-        Ok(())
-    }
-}
-```
+Implemented as `can_evolve_to()` in `src/catalog/data_type.rs`. Validates type widening for integers, floats, timestamps, and decimals. Called in `SqlCatalog::commit()` when processing `MutationOp::UpdateSchema`.
 
 ## Statistics Storage
 
-File column statistics store min/max values as binary blobs. With proper type handling, these can be serialized and deserialized correctly.
+File column statistics store min/max values as binary blobs. Planar uses Arrow's `ScalarValue` for in-memory representation.
 
-### Binary Encoding
-
-Each type defines its binary encoding:
-
-```rust
-pub trait TypeEncoder {
-    fn encode(&self, value: &ScalarValue) -> Result<Vec<u8>>;
-    fn decode(&self, bytes: &[u8]) -> Result<ScalarValue>;
-}
-```
-
-For primitive types, use native byte order (little-endian):
-
-- `int32`: 4 bytes (little-endian)
-- `int64`: 8 bytes (little-endian)
-- `float64`: 8 bytes (IEEE 754, little-endian)
-- `string`: UTF-8 bytes
-- `timestamp(us)`: 8 bytes (microseconds since epoch, little-endian)
-
-For complex types, use a format-specific encoding (e.g., Arrow IPC format).
-
-### Comparison Semantics
-
-Statistics are used for query optimization (predicate pushdown). Each type defines comparison rules:
-
-```rust
-pub trait TypeComparator {
-    fn compare(&self, a: &ScalarValue, b: &ScalarValue) -> Ordering;
-}
-```
-
-For types with non-obvious ordering (e.g., structs, maps), comparison may not be supported.
+**Implementation** (`src/catalog/data_type.rs`):
+- `encode_scalar()` - Encode ScalarValue to bytes (primitives use little-endian, strings use UTF-8)
+- `decode_scalar()` - Decode bytes to ScalarValue given a DataType
+- Arrow's `ScalarValue` implements `PartialOrd` for comparisons and predicate pushdown
 
 ## Implementation Plan
 
-### Phase 1: Core Type System (MVP)
+### Phase 1: Integrate Arrow Types (MVP)
+- Change `ColumnSpec` to use `arrow::datatypes::DataType`
+- Migrate database `column_type` from TEXT to BLOB
+- Implement `encode_data_type()` / `decode_data_type()` using Arrow IPC format in `src/catalog/data_type.rs`
+- Update `SqlCatalog` to serialize/deserialize types using IPC
 
-1. Define `DataType` enum with primitive, decimal, string, binary, and temporal types.
-2. Implement `FromStr` and `Display` for string serialization.
-3. Implement `From<arrow::datatypes::DataType>` and `TryFrom<planar::DataType>` for Arrow conversion.
-4. Update `ColumnSpec` to use `DataType` instead of `String`.
-5. Add migration to preserve existing string types (parse and re-serialize).
+### Phase 2: Schema Evolution Validation
+- Implement `can_evolve_to()` function for safe type changes
+- Add validation in `SqlCatalog::commit()` for `MutationOp::UpdateSchema`
+- Enforce nullability rules
 
-### Phase 2: Format Conversions
+### Phase 3: Statistics Encoding
+- Implement `encode_scalar()` / `decode_scalar()` for ScalarValue
+- Update file format readers to populate statistics
+- Store in `FileColumnStats` table
 
-1. Implement Parquet ↔ Planar conversions.
-2. Implement Lance ↔ Planar conversions.
-3. Implement Vortex ↔ Planar conversions.
-4. Add integration tests for round-trip conversions.
+### Phase 4: Format Integration
+- Validate Lance-compatible types (no Large* types)
+- Document Parquet/Lance/Vortex integration
 
-### Phase 3: Schema Evolution
+### Phase 5: External Engines (Future)
+- Build type mapping for Spark, Trino, DuckDB
+- Implement catalog translation layers
 
-1. Implement `DataType::can_evolve_to` method.
-2. Add validation in `SqlCatalog::commit` for `UpdateSchema`.
-3. Add tests for safe and unsafe schema evolution scenarios.
-4. Document schema evolution rules in user-facing docs.
-
-### Phase 4: Statistics Encoding
-
-1. Implement `TypeEncoder` trait for all types.
-2. Update `FileColumnStats` to use typed min/max values.
-3. Add statistics serialization/deserialization in file format readers/writers.
-
-### Phase 5: External Engine Types
-
-1. Add SQL type conversions (for Spark, Trino, DuckDB).
-2. Document type mapping tables for each engine.
-3. Add integration tests with external engines.
-
-## Testing Strategy
-
-### Unit Tests
-
-- Parse and serialize all type variants
-- Validate evolution rules (safe and unsafe)
-- Test Arrow conversions (bidirectional)
-- Test format-specific conversions (Parquet, Lance, Vortex)
-
-### Integration Tests
-
-- Create tables with all type variants
-- Perform schema evolution operations
-- Write and read files in all formats
-- Verify statistics encoding/decoding
-
-### Compatibility Tests
-
-- Ensure old type strings parse correctly after format changes
-- Test migration from string-based types to typed `DataType`
-
-## Open Questions
-
-1. **Nested nullability**: Should `list(item:int32?)` allow nulls in the list items, or only null lists? Arrow supports both. Planar should decide if both are needed or if one is sufficient.
-
-2. **Timezone handling**: Should timestamps without timezones be allowed? Some systems (e.g., Parquet) allow timezone-naive timestamps, but Arrow recommends always using UTC. Planar should document its stance.
-
-3. **Custom types**: Should Planar support user-defined types or extensions? This adds complexity but enables use cases like UUID, JSON, or domain-specific types.
-
-4. **Type aliases**: Should common types have aliases? For example, `bigint` as an alias for `int64`, or `varchar` for `string`. This improves usability but adds maintenance burden.
 
 ## References
 
-- [Apache Arrow Type System](https://arrow.apache.org/docs/status.html)
-- [Apache Parquet Logical Types](https://parquet.apache.org/docs/file-format/types/)
-- [Apache Iceberg Type System](https://iceberg.apache.org/spec/#schemas-and-data-types)
-- [Delta Lake Schema Specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#schema-serialization-format)
+- [Arrow DataType Documentation](https://docs.rs/arrow/57.2.0/arrow/datatypes/enum.DataType.html) - Complete Arrow type reference
+- [Arrow Type System Specification](https://arrow.apache.org/docs/format/Columnar.html#schema-message) - Official Arrow specification
+- [arrow-parquet Type Conversions](https://docs.rs/parquet/latest/parquet/) - Parquet integration
+- [Apache Iceberg Type System](https://iceberg.apache.org/spec/#schemas-and-data-types) - Similar approach using standard types
+- [Delta Lake Schema Specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#schema-serialization-format) - Alternative approach with JSON schemas

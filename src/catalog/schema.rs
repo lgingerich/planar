@@ -1,3 +1,4 @@
+use arrow::datatypes::DataType;
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -65,7 +66,7 @@ pub struct Column {
     /// Column name
     pub column_name: String,
     /// Column type string
-    pub column_type: String,
+    pub column_type: DataType,
     /// Column position in schema
     pub ordinal_position: i32,
     /// Whether the column allows null values

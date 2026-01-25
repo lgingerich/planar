@@ -149,6 +149,9 @@ Features are listed in priority order. Each item links to detailed architecture 
 - **Security**: Authentication, authorization, encryption, and audit logging for production deployments. See [security.md](docs/architecture/security.md)
 
 
+## Open Questions
+- Is the DataType <> Arrow IPC design optimal?
+
 ## License
 
 [TBD]
