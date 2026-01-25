@@ -18,6 +18,7 @@
 //! This example uses an in-memory SQLite database, making it easy to run without any external dependencies.
 
 use planar::catalog::{Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent};
+use arrow::datatypes::{DataType, TimeUnit};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,10 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Using builder pattern for schema definition
     let schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("id", "bigint"))
-        .with_column(ColumnSpec::new("customer_id", "bigint"))
-        .with_column(ColumnSpec::new("amount", "double"))
-        .with_column(ColumnSpec::new("timestamp", "timestamp").nullable());
+        .with_column(ColumnSpec::new("id", DataType::Int64))
+        .with_column(ColumnSpec::new("customer_id", DataType::Int64))
+        .with_column(ColumnSpec::new("amount", DataType::Float64))
+        .with_column(ColumnSpec::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None)).nullable());
     
     let properties = serde_json::json!({
         "description": "Sales transactions table",
