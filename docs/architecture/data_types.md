@@ -256,13 +256,13 @@ File column statistics store min/max values as binary blobs. Planar uses Arrow's
 
 ## Implementation Plan
 
-### Phase 1: Integrate Arrow Types (MVP)
+### (DONE) Phase 1: Integrate Arrow Types
 - Change `ColumnSpec` to use `arrow::datatypes::DataType`
 - Migrate database `column_type` from TEXT to BLOB
 - Implement `encode_data_type()` / `decode_data_type()` using Arrow IPC format in `src/catalog/data_type.rs`
 - Update `SqlCatalog` to serialize/deserialize types using IPC
 
-### Phase 2: Schema Evolution Validation
+### (DONE) Phase 2: Schema Evolution Validation
 - Implement `can_evolve_to()` function for safe type changes
 - Add validation in `SqlCatalog::commit()` for `MutationOp::UpdateSchema`
 - Enforce nullability rules

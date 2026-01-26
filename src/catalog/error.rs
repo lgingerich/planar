@@ -6,7 +6,7 @@ pub enum CatalogError {
     /// Table not found
     #[error("table not found: {0}")]
     NotFound(String),
-    /// Operation conflict (e.g., concurrent modification)
+    /// Operation conflict
     #[error("conflict on table: {0}")]
     Conflict(String),
     /// Invalid argument provided

@@ -8,6 +8,7 @@ pub mod file_format;
 use std::path::Path;
 use std::str::FromStr;
 use arrow_array::RecordBatch;
+use async_trait::async_trait;
 
 pub use error::{Result, StorageError};
 
@@ -16,15 +17,17 @@ use file_format::parquet::{ParquetReader, ParquetWriter};
 use file_format::vortex::{VortexReader, VortexWriter};
 
 /// Trait for reading file formats into Arrow RecordBatches
+#[async_trait]
 pub trait Reader: Send + Sync {
     /// Read a file and return an Arrow RecordBatch
-    fn read(&self, path: &Path) -> Result<RecordBatch>;
+    async fn read(&self, path: &Path) -> Result<RecordBatch>;
 }
 
 /// Trait for writing Arrow RecordBatches to file formats
+#[async_trait]
 pub trait Writer: Send + Sync {
     /// Write a RecordBatch to a file
-    fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()>;
+    async fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()>;
 }
 
 /// Supported file formats
@@ -96,12 +99,13 @@ impl FromStr for ReaderEnum {
     }
 }
 
+#[async_trait]
 impl Reader for ReaderEnum {
-    fn read(&self, path: &Path) -> Result<RecordBatch> {
+    async fn read(&self, path: &Path) -> Result<RecordBatch> {
         match self {
-            ReaderEnum::Parquet(r) => r.read(path),
-            ReaderEnum::Lance(r) => r.read(path),
-            ReaderEnum::Vortex(r) => r.read(path),
+            ReaderEnum::Parquet(r) => r.read(path).await,
+            ReaderEnum::Lance(r) => r.read(path).await,
+            ReaderEnum::Vortex(r) => r.read(path).await,
         }
     }
 }
@@ -137,12 +141,13 @@ impl FromStr for WriterEnum {
     }
 }
 
+#[async_trait]
 impl Writer for WriterEnum {
-    fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()> {
+    async fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()> {
         match self {
-            WriterEnum::Parquet(w) => w.write(batch, path),
-            WriterEnum::Lance(w) => w.write(batch, path),
-            WriterEnum::Vortex(w) => w.write(batch, path),
+            WriterEnum::Parquet(w) => w.write(batch, path).await,
+            WriterEnum::Lance(w) => w.write(batch, path).await,
+            WriterEnum::Vortex(w) => w.write(batch, path).await,
         }
     }
 }
