@@ -589,23 +589,43 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .execute(tx.as_mut())
         .await?;
 
-        for (index, column) in schema.columns.iter().enumerate() {
-            let column_uuid = uuid::Uuid::new_v4();
-            let ordinal_position = (index + 1) as i32;
-            let encoded_type = encode_data_type(&column.column_type)?;
-
-            sqlx::query::<sqlx::Sqlite>(
+        let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+        for (chunk_index, col_chunk) in schema.columns.chunks(col_chunk_size as usize).enumerate() {
+            let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
+                .iter()
+                .enumerate()
+                .map(|(i, column)| {
+                                let ordinal_position = (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                    let encoded_type = encode_data_type(&column.column_type)?;
+                    Ok((
+                        uuid::Uuid::new_v4(),
+                        column.name.clone(),
+                        encoded_type,
+                        ordinal_position,
+                        column.is_nullable,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let row_placeholders: String = (0..row_data.len())
+                .map(|_| "(?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
                 "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )
-            .bind(column_uuid.as_bytes().as_slice())
-            .bind(schema_uuid.as_bytes().as_slice())
-            .bind(column.name.as_str())
-            .bind(&encoded_type)
-            .bind(ordinal_position)
-            .bind(column.is_nullable)
-            .execute(tx.as_mut())
-            .await?;
+                 VALUES {}",
+                row_placeholders
+            );
+            let mut query = sqlx::query::<sqlx::Sqlite>(&sql);
+            for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in &row_data {
+                query = query
+                    .bind(column_uuid.as_bytes().as_slice())
+                    .bind(schema_uuid.as_bytes().as_slice())
+                    .bind(name.as_str())
+                    .bind(encoded_type.as_slice())
+                    .bind(*ordinal_position)
+                    .bind(*is_nullable);
+            }
+            query.execute(tx.as_mut()).await?;
         }
 
         sqlx::query::<sqlx::Sqlite>(
@@ -1008,25 +1028,46 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             limits::MAX_FILES_PER_APPEND
                         )));
                     }
-                    for file in files {
-                        let file_uuid = file.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
-                        let partition_text = serialize_json_optional(file.partition_values.as_ref())?;
-
-                        sqlx::query::<sqlx::Sqlite>(
+                    let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
+                    for chunk in files.chunks(chunk_size as usize) {
+                        let row_data: Vec<(uuid::Uuid, String, String, i64, i64, Option<String>)> = chunk
+                            .iter()
+                            .map(|f| {
+                                let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
+                                let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                                Ok((
+                                    file_uuid,
+                                    f.file_format.clone(),
+                                    f.file_path.clone(),
+                                    f.record_count,
+                                    f.file_size_bytes,
+                                    partition_text,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let row_placeholders: String = (0..row_data.len())
+                            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)")
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
                             "INSERT INTO files (file_uuid, table_uuid, file_format, file_path, record_count,
                                                  file_size_bytes, added_in_transaction_id, partition_values)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        )
-                        .bind(file_uuid.as_bytes().as_slice())
-                        .bind(table_uuid.as_bytes().as_slice())
-                        .bind(file.file_format.as_str())
-                        .bind(file.file_path.as_str())
-                        .bind(file.record_count)
-                        .bind(file.file_size_bytes)
-                        .bind(transaction_id.as_bytes().as_slice())
-                        .bind(partition_text.as_deref())
-                        .execute(tx.as_mut())
-                        .await?;
+                             VALUES {}",
+                            row_placeholders
+                        );
+                        let mut query = sqlx::query::<sqlx::Sqlite>(&sql);
+                        for (file_uuid, format, path, rc, size, part) in &row_data {
+                            query = query
+                                .bind(file_uuid.as_bytes().as_slice())
+                                .bind(table_uuid.as_bytes().as_slice())
+                                .bind(format.as_str())
+                                .bind(path.as_str())
+                                .bind(*rc)
+                                .bind(*size)
+                                .bind(transaction_id.as_bytes().as_slice())
+                                .bind(part.as_deref());
+                        }
+                        query.execute(tx.as_mut()).await?;
                     }
                 }
                 MutationOp::DeleteFiles(file_uuids) => {
@@ -1037,16 +1078,24 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             limits::MAX_FILES_PER_DELETE
                         )));
                     }
-                    for file_uuid in file_uuids {
-                        sqlx::query::<sqlx::Sqlite>(
+                    let chunk_size = limits::BATCH_DELETE_FILES_CHUNK;
+                    for chunk in file_uuids.chunks(chunk_size as usize) {
+                        let in_placeholders: String = (0..chunk.len())
+                            .map(|i| format!("?{}", i + 3))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
                             "UPDATE files SET removed_in_transaction_id = ?1
-                             WHERE file_uuid = ?2 AND table_uuid = ?3 AND removed_in_transaction_id IS NULL",
-                        )
-                        .bind(transaction_id.as_bytes().as_slice())
-                        .bind(file_uuid.as_bytes().as_slice())
-                        .bind(table_uuid.as_bytes().as_slice())
-                        .execute(tx.as_mut())
-                        .await?;
+                             WHERE table_uuid = ?2 AND removed_in_transaction_id IS NULL AND file_uuid IN ({})",
+                            in_placeholders
+                        );
+                        let mut query = sqlx::query::<sqlx::Sqlite>(&sql)
+                            .bind(transaction_id.as_bytes().as_slice())
+                            .bind(table_uuid.as_bytes().as_slice());
+                        for file_uuid in chunk {
+                            query = query.bind(file_uuid.as_bytes().as_slice());
+                        }
+                        query.execute(tx.as_mut()).await?;
                     }
                 }
                 MutationOp::UpdateSchema(schema_spec) => {
@@ -1142,23 +1191,44 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     .execute(tx.as_mut())
                     .await?;
 
-                    for (index, column) in schema_spec.columns.iter().enumerate() {
-                        let column_uuid = uuid::Uuid::new_v4();
-                        let ordinal_position = (index + 1) as i32;
-                        let encoded_type = encode_data_type(&column.column_type)?;
-
-                        sqlx::query::<sqlx::Sqlite>(
+                    let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+                    for (chunk_index, col_chunk) in schema_spec.columns.chunks(col_chunk_size as usize).enumerate() {
+                        let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
+                            .iter()
+                            .enumerate()
+                            .map(|(i, column)| {
+                                let ordinal_position =
+                                    (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                                let encoded_type = encode_data_type(&column.column_type)?;
+                                Ok((
+                                    uuid::Uuid::new_v4(),
+                                    column.name.clone(),
+                                    encoded_type,
+                                    ordinal_position,
+                                    column.is_nullable,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let row_placeholders: String = (0..row_data.len())
+                            .map(|_| "(?, ?, ?, ?, ?, ?)")
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
                             "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        )
-                        .bind(column_uuid.as_bytes().as_slice())
-                        .bind(schema_uuid.as_bytes().as_slice())
-                        .bind(column.name.as_str())
-                        .bind(&encoded_type)
-                        .bind(ordinal_position)
-                        .bind(column.is_nullable)
-                        .execute(tx.as_mut())
-                        .await?;
+                             VALUES {}",
+                            row_placeholders
+                        );
+                        let mut query = sqlx::query::<sqlx::Sqlite>(&sql);
+                        for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in &row_data {
+                            query = query
+                                .bind(column_uuid.as_bytes().as_slice())
+                                .bind(schema_uuid.as_bytes().as_slice())
+                                .bind(name.as_str())
+                                .bind(encoded_type.as_slice())
+                                .bind(*ordinal_position)
+                                .bind(*is_nullable);
+                        }
+                        query.execute(tx.as_mut()).await?;
                     }
 
                     new_schema_uuid = Some(schema_uuid);
@@ -1294,23 +1364,56 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .execute(tx.as_mut())
         .await?;
 
-        for (index, column) in schema.columns.iter().enumerate() {
-            let column_uuid = uuid::Uuid::new_v4();
-            let ordinal_position = (index + 1) as i32;
-            let encoded_type = encode_data_type(&column.column_type)?;
-
-            sqlx::query::<sqlx::Postgres>(
+        let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+        for (chunk_index, col_chunk) in schema.columns.chunks(col_chunk_size as usize).enumerate() {
+            let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
+                .iter()
+                .enumerate()
+                .map(|(i, column)| {
+                                let ordinal_position = (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                    let encoded_type = encode_data_type(&column.column_type)?;
+                    Ok((
+                        uuid::Uuid::new_v4(),
+                        column.name.clone(),
+                        encoded_type,
+                        ordinal_position,
+                        column.is_nullable,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut param = 1u32;
+            let row_placeholders: String = (0..row_data.len())
+                .map(|_| {
+                    let s = format!(
+                        "(${}, ${}, ${}, ${}, ${}, ${})",
+                        param,
+                        param + 1,
+                        param + 2,
+                        param + 3,
+                        param + 4,
+                        param + 5
+                    );
+                    param += 6;
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
                 "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind(column_uuid.as_bytes().as_slice())
-            .bind(schema_uuid.as_bytes().as_slice())
-            .bind(column.name.as_str())
-            .bind(&encoded_type)
-            .bind(ordinal_position)
-            .bind(column.is_nullable)
-            .execute(tx.as_mut())
-            .await?;
+                 VALUES {}",
+                row_placeholders
+            );
+            let mut query = sqlx::query::<sqlx::Postgres>(&sql);
+            for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in &row_data {
+                query = query
+                    .bind(column_uuid.as_bytes().as_slice())
+                    .bind(schema_uuid.as_bytes().as_slice())
+                    .bind(name.as_str())
+                    .bind(encoded_type.as_slice())
+                    .bind(*ordinal_position)
+                    .bind(*is_nullable);
+            }
+            query.execute(tx.as_mut()).await?;
         }
 
         sqlx::query::<sqlx::Postgres>(
@@ -1713,25 +1816,61 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             limits::MAX_FILES_PER_APPEND
                         )));
                     }
-                    for file in files {
-                        let file_uuid = file.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
-                        let partition_text = serialize_json_optional(file.partition_values.as_ref())?;
-
-                        sqlx::query::<sqlx::Postgres>(
+                    let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
+                    for chunk in files.chunks(chunk_size as usize) {
+                        let row_data: Vec<(uuid::Uuid, String, String, i64, i64, Option<String>)> = chunk
+                            .iter()
+                            .map(|f| {
+                                let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
+                                let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                                Ok((
+                                    file_uuid,
+                                    f.file_format.clone(),
+                                    f.file_path.clone(),
+                                    f.record_count,
+                                    f.file_size_bytes,
+                                    partition_text,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let mut param = 1u32;
+                        let row_placeholders: String = (0..row_data.len())
+                            .map(|_| {
+                                let s = format!(
+                                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                                    param,
+                                    param + 1,
+                                    param + 2,
+                                    param + 3,
+                                    param + 4,
+                                    param + 5,
+                                    param + 6,
+                                    param + 7
+                                );
+                                param += 8;
+                                s
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
                             "INSERT INTO files (file_uuid, table_uuid, file_format, file_path, record_count,
                                                  file_size_bytes, added_in_transaction_id, partition_values)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                        )
-                        .bind(file_uuid.as_bytes().as_slice())
-                        .bind(table_uuid.as_bytes().as_slice())
-                        .bind(file.file_format.as_str())
-                        .bind(file.file_path.as_str())
-                        .bind(file.record_count)
-                        .bind(file.file_size_bytes)
-                        .bind(transaction_id.as_bytes().as_slice())
-                        .bind(partition_text.as_deref())
-                        .execute(tx.as_mut())
-                        .await?;
+                             VALUES {}",
+                            row_placeholders
+                        );
+                        let mut query = sqlx::query::<sqlx::Postgres>(&sql);
+                        for (file_uuid, format, path, rc, size, part) in &row_data {
+                            query = query
+                                .bind(file_uuid.as_bytes().as_slice())
+                                .bind(table_uuid.as_bytes().as_slice())
+                                .bind(format.as_str())
+                                .bind(path.as_str())
+                                .bind(*rc)
+                                .bind(*size)
+                                .bind(transaction_id.as_bytes().as_slice())
+                                .bind(part.as_deref());
+                        }
+                        query.execute(tx.as_mut()).await?;
                     }
                 }
                 MutationOp::DeleteFiles(file_uuids) => {
@@ -1742,16 +1881,24 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             limits::MAX_FILES_PER_DELETE
                         )));
                     }
-                    for file_uuid in file_uuids {
-                        sqlx::query::<sqlx::Postgres>(
+                    let chunk_size = limits::BATCH_DELETE_FILES_CHUNK;
+                    for chunk in file_uuids.chunks(chunk_size as usize) {
+                        let in_placeholders: String = (1..=chunk.len())
+                            .map(|i| format!("${}", i + 2))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
                             "UPDATE files SET removed_in_transaction_id = $1
-                             WHERE file_uuid = $2 AND table_uuid = $3 AND removed_in_transaction_id IS NULL",
-                        )
-                        .bind(transaction_id.as_bytes().as_slice())
-                        .bind(file_uuid.as_bytes().as_slice())
-                        .bind(table_uuid.as_bytes().as_slice())
-                        .execute(tx.as_mut())
-                        .await?;
+                             WHERE table_uuid = $2 AND removed_in_transaction_id IS NULL AND file_uuid IN ({})",
+                            in_placeholders
+                        );
+                        let mut query = sqlx::query::<sqlx::Postgres>(&sql)
+                            .bind(transaction_id.as_bytes().as_slice())
+                            .bind(table_uuid.as_bytes().as_slice());
+                        for file_uuid in chunk {
+                            query = query.bind(file_uuid.as_bytes().as_slice());
+                        }
+                        query.execute(tx.as_mut()).await?;
                     }
                 }
                 MutationOp::UpdateSchema(schema_spec) => {
@@ -1847,23 +1994,57 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     .execute(tx.as_mut())
                     .await?;
 
-                    for (index, column) in schema_spec.columns.iter().enumerate() {
-                        let column_uuid = uuid::Uuid::new_v4();
-                        let ordinal_position = (index + 1) as i32;
-                        let encoded_type = encode_data_type(&column.column_type)?;
-
-                        sqlx::query::<sqlx::Postgres>(
+                    let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+                    for (chunk_index, col_chunk) in schema_spec.columns.chunks(col_chunk_size as usize).enumerate() {
+                        let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
+                            .iter()
+                            .enumerate()
+                            .map(|(i, column)| {
+                                let ordinal_position =
+                                    (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                                let encoded_type = encode_data_type(&column.column_type)?;
+                                Ok((
+                                    uuid::Uuid::new_v4(),
+                                    column.name.clone(),
+                                    encoded_type,
+                                    ordinal_position,
+                                    column.is_nullable,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let mut param = 1u32;
+                        let row_placeholders: String = (0..row_data.len())
+                            .map(|_| {
+                                let s = format!(
+                                    "(${}, ${}, ${}, ${}, ${}, ${})",
+                                    param,
+                                    param + 1,
+                                    param + 2,
+                                    param + 3,
+                                    param + 4,
+                                    param + 5
+                                );
+                                param += 6;
+                                s
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
                             "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
-                             VALUES ($1, $2, $3, $4, $5, $6)",
-                        )
-                        .bind(column_uuid.as_bytes().as_slice())
-                        .bind(schema_uuid.as_bytes().as_slice())
-                        .bind(column.name.as_str())
-                        .bind(&encoded_type)
-                        .bind(ordinal_position)
-                        .bind(column.is_nullable)
-                        .execute(tx.as_mut())
-                        .await?;
+                             VALUES {}",
+                            row_placeholders
+                        );
+                        let mut query = sqlx::query::<sqlx::Postgres>(&sql);
+                        for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in &row_data {
+                            query = query
+                                .bind(column_uuid.as_bytes().as_slice())
+                                .bind(schema_uuid.as_bytes().as_slice())
+                                .bind(name.as_str())
+                                .bind(encoded_type.as_slice())
+                                .bind(*ordinal_position)
+                                .bind(*is_nullable);
+                        }
+                        query.execute(tx.as_mut()).await?;
                     }
 
                     new_schema_uuid = Some(schema_uuid);

@@ -31,6 +31,16 @@ pub const MAX_PROPERTY_KEYS_TO_REMOVE: u32 = 100;
 /// Prevents malicious or accidental huge property blobs.
 pub const MAX_JSON_SIZE_BYTES: u32 = 1_048_576; // 1 MB
 
+/// Batch size for multi-row INSERT of files (amortizes round-trips).
+/// Must keep total bound parameters under DB limit (e.g. SQLite 999); 8 params per row.
+pub const BATCH_INSERT_FILES_CHUNK: u32 = 100;
+
+/// Batch size for UPDATE files WHERE file_uuid IN (...); 2 fixed params + N UUIDs.
+pub const BATCH_DELETE_FILES_CHUNK: u32 = 500;
+
+/// Batch size for multi-row INSERT of columns (6 params per row).
+pub const BATCH_INSERT_COLUMNS_CHUNK: u32 = 100;
+
 // Invariants (documented; Rust const assertions would require nightly):
 // - MAX_FILES_PER_APPEND <= MAX_FILES_PER_QUERY
 // - MAX_FILES_PER_DELETE <= MAX_FILES_PER_QUERY
