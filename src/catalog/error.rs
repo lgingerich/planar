@@ -9,6 +9,9 @@ pub enum CatalogError {
     /// Operation conflict
     #[error("conflict on table: {0}")]
     Conflict(String),
+    /// Resource limit exceeded
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
     /// Invalid argument provided
     #[error("invalid argument: {0}")]
     InvalidArgument(String),

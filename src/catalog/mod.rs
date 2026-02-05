@@ -13,6 +13,8 @@ pub mod database;
 pub mod data_type;
 /// Catalog error types
 pub mod error;
+/// Bounded limits for catalog operations
+pub mod limits;
 /// Schema definitions
 pub mod schema;
 
@@ -519,6 +521,14 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             ));
         }
 
+        if schema.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
+            return Err(CatalogError::LimitExceeded(format!(
+                "schema has {} columns, exceeds limit of {}",
+                schema.columns.len(),
+                limits::MAX_COLUMNS_PER_SCHEMA
+            )));
+        }
+
         let mut tx = self.pool.begin().await?;
 
         let exists = sqlx::query_scalar::<sqlx::Sqlite, i64>(
@@ -635,17 +645,31 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
     async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>> {
         let rows = if let Some(namespace) = namespace {
-            sqlx::query::<sqlx::Sqlite>("SELECT namespace, table_name FROM tables WHERE namespace = ?1")
-                .bind(namespace)
-                .fetch_all(&self.pool)
-                .await?
+            sqlx::query::<sqlx::Sqlite>(
+                "SELECT namespace, table_name FROM tables WHERE namespace = ?1 LIMIT ?2",
+            )
+            .bind(namespace)
+            .bind(limits::MAX_TABLES_PER_LIST as i64)
+            .fetch_all(&self.pool)
+            .await?
         } else {
-            sqlx::query::<sqlx::Sqlite>("SELECT namespace, table_name FROM tables")
-                .fetch_all(&self.pool)
-                .await?
+            sqlx::query::<sqlx::Sqlite>(
+                "SELECT namespace, table_name FROM tables LIMIT ?1",
+            )
+            .bind(limits::MAX_TABLES_PER_LIST as i64)
+            .fetch_all(&self.pool)
+            .await?
         };
 
-        let mut tables = Vec::with_capacity(rows.len());
+        if rows.len() as u32 >= limits::MAX_TABLES_PER_LIST {
+            return Err(CatalogError::LimitExceeded(format!(
+                "table count exceeds limit of {}",
+                limits::MAX_TABLES_PER_LIST
+            )));
+        }
+
+        let capacity = std::cmp::min(rows.len(), limits::MAX_TABLES_PER_LIST as usize);
+        let mut tables = Vec::with_capacity(capacity);
         for row in rows {
             let namespace: String = row.try_get("namespace")?;
             let name: String = row.try_get("table_name")?;
@@ -737,13 +761,22 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         let column_rows = sqlx::query::<sqlx::Sqlite>(
             "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
-             FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position",
+             FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
         )
         .bind(schema_uuid.as_bytes().as_slice())
+        .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut columns = Vec::with_capacity(column_rows.len());
+        if column_rows.len() as u32 >= limits::MAX_COLUMNS_PER_SCHEMA {
+            return Err(CatalogError::LimitExceeded(format!(
+                "column count exceeds limit of {}",
+                limits::MAX_COLUMNS_PER_SCHEMA
+            )));
+        }
+
+        let capacity = std::cmp::min(column_rows.len(), limits::MAX_COLUMNS_PER_SCHEMA as usize);
+        let mut columns = Vec::with_capacity(capacity);
         for row in column_rows {
             let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
             let column_type = decode_data_type(&column_type_bytes)?;
@@ -775,14 +808,24 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
              FROM files
              WHERE table_uuid = ?1
                AND added_in_transaction_id <= ?2
-               AND (removed_in_transaction_id IS NULL OR removed_in_transaction_id > ?2)",
+               AND (removed_in_transaction_id IS NULL OR removed_in_transaction_id > ?2)
+             LIMIT ?3",
         )
         .bind(table_uuid.as_bytes().as_slice())
         .bind(effective_transaction_id.as_bytes().as_slice())
+        .bind(limits::MAX_FILES_PER_QUERY as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut files = Vec::with_capacity(file_rows.len());
+        if file_rows.len() as u32 >= limits::MAX_FILES_PER_QUERY {
+            return Err(CatalogError::LimitExceeded(format!(
+                "file count exceeds limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
+
+        let capacity = std::cmp::min(file_rows.len(), limits::MAX_FILES_PER_QUERY as usize);
+        let mut files = Vec::with_capacity(capacity);
         for row in file_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
             let file = schema::File {
@@ -894,6 +937,14 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             ));
         }
 
+        if mutation.operations.len() as u32 > limits::MAX_OPERATIONS_PER_MUTATION {
+            return Err(CatalogError::LimitExceeded(format!(
+                "mutation has {} operations, exceeds limit of {}",
+                mutation.operations.len(),
+                limits::MAX_OPERATIONS_PER_MUTATION
+            )));
+        }
+
         let mut tx = self.pool.begin().await?;
 
         let table_row = sqlx::query::<sqlx::Sqlite>(
@@ -950,6 +1001,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         for op in mutation.operations {
             match op {
                 MutationOp::AppendFiles(files) => {
+                    if files.len() as u32 > limits::MAX_FILES_PER_APPEND {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "cannot append {} files, exceeds limit of {}",
+                            files.len(),
+                            limits::MAX_FILES_PER_APPEND
+                        )));
+                    }
                     for file in files {
                         let file_uuid = file.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
                         let partition_text = serialize_json_optional(file.partition_values.as_ref())?;
@@ -972,6 +1030,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     }
                 }
                 MutationOp::DeleteFiles(file_uuids) => {
+                    if file_uuids.len() as u32 > limits::MAX_FILES_PER_DELETE {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "cannot delete {} files, exceeds limit of {}",
+                            file_uuids.len(),
+                            limits::MAX_FILES_PER_DELETE
+                        )));
+                    }
                     for file_uuid in file_uuids {
                         sqlx::query::<sqlx::Sqlite>(
                             "UPDATE files SET removed_in_transaction_id = ?1
@@ -985,6 +1050,19 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     }
                 }
                 MutationOp::UpdateSchema(schema_spec) => {
+                    if schema_spec.columns.is_empty() {
+                        return Err(CatalogError::InvalidArgument(
+                            "schema must have at least one column".to_string(),
+                        ));
+                    }
+                    if schema_spec.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "schema has {} columns, exceeds limit of {}",
+                            schema_spec.columns.len(),
+                            limits::MAX_COLUMNS_PER_SCHEMA
+                        )));
+                    }
+
                     let current_schema_uuid = current_schema_uuid.ok_or_else(|| {
                         CatalogError::InvalidArgument(
                             "cannot update schema without a current schema".to_string(),
@@ -1092,6 +1170,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     if keys.is_empty() {
                         continue;
                     }
+                    if keys.len() as u32 > limits::MAX_PROPERTY_KEYS_TO_REMOVE {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "cannot remove {} property keys, exceeds limit of {}",
+                            keys.len(),
+                            limits::MAX_PROPERTY_KEYS_TO_REMOVE
+                        )));
+                    }
                     let map = properties_value
                         .as_object_mut()
                         .ok_or_else(|| CatalogError::InvalidArgument("properties must be an object".to_string()))?;
@@ -1139,6 +1224,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             return Err(CatalogError::InvalidArgument(
                 "schema must include at least one column".to_string(),
             ));
+        }
+
+        if schema.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
+            return Err(CatalogError::LimitExceeded(format!(
+                "schema has {} columns, exceeds limit of {}",
+                schema.columns.len(),
+                limits::MAX_COLUMNS_PER_SCHEMA
+            )));
         }
 
         let mut tx = self.pool.begin().await?;
@@ -1257,17 +1350,31 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
     async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>> {
         let rows = if let Some(namespace) = namespace {
-            sqlx::query::<sqlx::Postgres>("SELECT namespace, table_name FROM tables WHERE namespace = $1")
-                .bind(namespace)
-                .fetch_all(&self.pool)
-                .await?
+            sqlx::query::<sqlx::Postgres>(
+                "SELECT namespace, table_name FROM tables WHERE namespace = $1 LIMIT $2",
+            )
+            .bind(namespace)
+            .bind(limits::MAX_TABLES_PER_LIST as i64)
+            .fetch_all(&self.pool)
+            .await?
         } else {
-            sqlx::query::<sqlx::Postgres>("SELECT namespace, table_name FROM tables")
-                .fetch_all(&self.pool)
-                .await?
+            sqlx::query::<sqlx::Postgres>(
+                "SELECT namespace, table_name FROM tables LIMIT $1",
+            )
+            .bind(limits::MAX_TABLES_PER_LIST as i64)
+            .fetch_all(&self.pool)
+            .await?
         };
 
-        let mut tables = Vec::with_capacity(rows.len());
+        if rows.len() as u32 >= limits::MAX_TABLES_PER_LIST {
+            return Err(CatalogError::LimitExceeded(format!(
+                "table count exceeds limit of {}",
+                limits::MAX_TABLES_PER_LIST
+            )));
+        }
+
+        let capacity = std::cmp::min(rows.len(), limits::MAX_TABLES_PER_LIST as usize);
+        let mut tables = Vec::with_capacity(capacity);
         for row in rows {
             let namespace: String = row.try_get("namespace")?;
             let name: String = row.try_get("table_name")?;
@@ -1359,13 +1466,22 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         let column_rows = sqlx::query::<sqlx::Postgres>(
             "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
-             FROM columns WHERE schema_uuid = $1 ORDER BY ordinal_position",
+             FROM columns WHERE schema_uuid = $1 ORDER BY ordinal_position LIMIT $2",
         )
         .bind(schema_uuid.as_bytes().as_slice())
+        .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut columns = Vec::with_capacity(column_rows.len());
+        if column_rows.len() as u32 >= limits::MAX_COLUMNS_PER_SCHEMA {
+            return Err(CatalogError::LimitExceeded(format!(
+                "column count exceeds limit of {}",
+                limits::MAX_COLUMNS_PER_SCHEMA
+            )));
+        }
+
+        let capacity = std::cmp::min(column_rows.len(), limits::MAX_COLUMNS_PER_SCHEMA as usize);
+        let mut columns = Vec::with_capacity(capacity);
         for row in column_rows {
             let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
             let column_type = decode_data_type(&column_type_bytes)?;
@@ -1397,14 +1513,24 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
              FROM files
              WHERE table_uuid = $1
                AND added_in_transaction_id <= $2
-               AND (removed_in_transaction_id IS NULL OR removed_in_transaction_id > $2)",
+               AND (removed_in_transaction_id IS NULL OR removed_in_transaction_id > $2)
+             LIMIT $3",
         )
         .bind(table_uuid.as_bytes().as_slice())
         .bind(effective_transaction_id.as_bytes().as_slice())
+        .bind(limits::MAX_FILES_PER_QUERY as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut files = Vec::with_capacity(file_rows.len());
+        if file_rows.len() as u32 >= limits::MAX_FILES_PER_QUERY {
+            return Err(CatalogError::LimitExceeded(format!(
+                "file count exceeds limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
+
+        let capacity = std::cmp::min(file_rows.len(), limits::MAX_FILES_PER_QUERY as usize);
+        let mut files = Vec::with_capacity(capacity);
         for row in file_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
             let file = schema::File {
@@ -1516,6 +1642,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             ));
         }
 
+        if mutation.operations.len() as u32 > limits::MAX_OPERATIONS_PER_MUTATION {
+            return Err(CatalogError::LimitExceeded(format!(
+                "mutation has {} operations, exceeds limit of {}",
+                mutation.operations.len(),
+                limits::MAX_OPERATIONS_PER_MUTATION
+            )));
+        }
+
         let mut tx = self.pool.begin().await?;
 
         let table_row = sqlx::query::<sqlx::Postgres>(
@@ -1572,6 +1706,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         for op in mutation.operations {
             match op {
                 MutationOp::AppendFiles(files) => {
+                    if files.len() as u32 > limits::MAX_FILES_PER_APPEND {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "cannot append {} files, exceeds limit of {}",
+                            files.len(),
+                            limits::MAX_FILES_PER_APPEND
+                        )));
+                    }
                     for file in files {
                         let file_uuid = file.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
                         let partition_text = serialize_json_optional(file.partition_values.as_ref())?;
@@ -1594,6 +1735,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     }
                 }
                 MutationOp::DeleteFiles(file_uuids) => {
+                    if file_uuids.len() as u32 > limits::MAX_FILES_PER_DELETE {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "cannot delete {} files, exceeds limit of {}",
+                            file_uuids.len(),
+                            limits::MAX_FILES_PER_DELETE
+                        )));
+                    }
                     for file_uuid in file_uuids {
                         sqlx::query::<sqlx::Postgres>(
                             "UPDATE files SET removed_in_transaction_id = $1
@@ -1607,6 +1755,19 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     }
                 }
                 MutationOp::UpdateSchema(schema_spec) => {
+                    if schema_spec.columns.is_empty() {
+                        return Err(CatalogError::InvalidArgument(
+                            "schema must have at least one column".to_string(),
+                        ));
+                    }
+                    if schema_spec.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "schema has {} columns, exceeds limit of {}",
+                            schema_spec.columns.len(),
+                            limits::MAX_COLUMNS_PER_SCHEMA
+                        )));
+                    }
+
                     let current_schema_uuid = current_schema_uuid.ok_or_else(|| {
                         CatalogError::InvalidArgument(
                             "cannot update schema without a current schema".to_string(),
@@ -1714,6 +1875,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     if keys.is_empty() {
                         continue;
                     }
+                    if keys.len() as u32 > limits::MAX_PROPERTY_KEYS_TO_REMOVE {
+                        return Err(CatalogError::LimitExceeded(format!(
+                            "cannot remove {} property keys, exceeds limit of {}",
+                            keys.len(),
+                            limits::MAX_PROPERTY_KEYS_TO_REMOVE
+                        )));
+                    }
                     let map = properties_value
                         .as_object_mut()
                         .ok_or_else(|| CatalogError::InvalidArgument("properties must be an object".to_string()))?;
@@ -1780,32 +1948,61 @@ where
     }
 }
 
-/// Parse JSON from optional string (defaults to empty object)
+/// Parse JSON from optional string (defaults to empty object).
+/// Enforces MAX_JSON_SIZE_BYTES to prevent unbounded allocation.
 fn parse_json(value: Option<String>) -> Result<serde_json::Value> {
     match value {
-        Some(text) => serde_json::from_str(&text)
-            .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}"))),
+        Some(text) => {
+            if text.len() as u32 > limits::MAX_JSON_SIZE_BYTES {
+                return Err(CatalogError::LimitExceeded(format!(
+                    "JSON size {} bytes exceeds limit of {} bytes",
+                    text.len(),
+                    limits::MAX_JSON_SIZE_BYTES
+                )));
+            }
+            serde_json::from_str(&text)
+                .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}")))
+        }
         None => Ok(serde_json::json!({})),
     }
 }
 
-/// Parse optional JSON from optional string
+/// Parse optional JSON from optional string.
+/// Enforces MAX_JSON_SIZE_BYTES when present.
 fn parse_json_optional(value: Option<String>) -> Result<Option<serde_json::Value>> {
     match value {
-        Some(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}"))),
+        Some(text) => {
+            if text.len() as u32 > limits::MAX_JSON_SIZE_BYTES {
+                return Err(CatalogError::LimitExceeded(format!(
+                    "JSON size {} bytes exceeds limit of {} bytes",
+                    text.len(),
+                    limits::MAX_JSON_SIZE_BYTES
+                )));
+            }
+            serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}")))
+        }
         None => Ok(None),
     }
 }
 
-/// Serialize JSON value to string
+/// Serialize JSON value to string.
+/// Enforces MAX_JSON_SIZE_BYTES to prevent unbounded output.
 fn serialize_json(value: &serde_json::Value) -> Result<String> {
-    serde_json::to_string(value)
-        .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}")))
+    let json_str = serde_json::to_string(value)
+        .map_err(|error| CatalogError::InvalidArgument(format!("invalid json: {error}")))?;
+    if json_str.len() as u32 > limits::MAX_JSON_SIZE_BYTES {
+        return Err(CatalogError::LimitExceeded(format!(
+            "JSON size {} bytes exceeds limit of {} bytes",
+            json_str.len(),
+            limits::MAX_JSON_SIZE_BYTES
+        )));
+    }
+    Ok(json_str)
 }
 
-/// Serialize optional JSON value to optional string
+/// Serialize optional JSON value to optional string.
 fn serialize_json_optional(value: Option<&serde_json::Value>) -> Result<Option<String>> {
     value.map(serialize_json).transpose()
 }
