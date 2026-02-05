@@ -3,6 +3,8 @@
 //! All operations have explicit upper bounds to prevent unbounded resource usage
 //! and tail latency spikes (TigerStyle: "put a limit on everything").
 
+// TODO: Review and update all limits below.
+
 /// Maximum number of files returned per table query.
 /// At ~1KB per file metadata, 10_000 files is ~10MB in memory.
 pub const MAX_FILES_PER_QUERY: u32 = 10_000;

@@ -590,22 +590,20 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .await?;
 
         let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+        let mut row_data = Vec::with_capacity(col_chunk_size as usize);
         for (chunk_index, col_chunk) in schema.columns.chunks(col_chunk_size as usize).enumerate() {
-            let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
-                .iter()
-                .enumerate()
-                .map(|(i, column)| {
-                                let ordinal_position = (chunk_index * col_chunk_size as usize + i + 1) as i32;
-                    let encoded_type = encode_data_type(&column.column_type)?;
-                    Ok((
-                        uuid::Uuid::new_v4(),
-                        column.name.clone(),
-                        encoded_type,
-                        ordinal_position,
-                        column.is_nullable,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            row_data.clear();
+            for (i, column) in col_chunk.iter().enumerate() {
+                let ordinal_position = (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                let encoded_type = encode_data_type(&column.column_type)?;
+                row_data.push((
+                    uuid::Uuid::new_v4(),
+                    column.name.clone(),
+                    encoded_type,
+                    ordinal_position,
+                    column.is_nullable,
+                ));
+            }
             let row_placeholders: String = (0..row_data.len())
                 .map(|_| "(?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
@@ -1029,22 +1027,22 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                         )));
                     }
                     let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
+                    let mut row_data =
+                        Vec::with_capacity(chunk_size as usize);
                     for chunk in files.chunks(chunk_size as usize) {
-                        let row_data: Vec<(uuid::Uuid, String, String, i64, i64, Option<String>)> = chunk
-                            .iter()
-                            .map(|f| {
-                                let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
-                                let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
-                                Ok((
-                                    file_uuid,
-                                    f.file_format.clone(),
-                                    f.file_path.clone(),
-                                    f.record_count,
-                                    f.file_size_bytes,
-                                    partition_text,
-                                ))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                        row_data.clear();
+                        for f in chunk {
+                            let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
+                            let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                            row_data.push((
+                                file_uuid,
+                                f.file_format.clone(),
+                                f.file_path.clone(),
+                                f.record_count,
+                                f.file_size_bytes,
+                                partition_text,
+                            ));
+                        }
                         let row_placeholders: String = (0..row_data.len())
                             .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)")
                             .collect::<Vec<_>>()
@@ -1192,23 +1190,22 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     .await?;
 
                     let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+                    let mut row_data =
+                        Vec::with_capacity(col_chunk_size as usize);
                     for (chunk_index, col_chunk) in schema_spec.columns.chunks(col_chunk_size as usize).enumerate() {
-                        let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
-                            .iter()
-                            .enumerate()
-                            .map(|(i, column)| {
-                                let ordinal_position =
-                                    (chunk_index * col_chunk_size as usize + i + 1) as i32;
-                                let encoded_type = encode_data_type(&column.column_type)?;
-                                Ok((
-                                    uuid::Uuid::new_v4(),
-                                    column.name.clone(),
-                                    encoded_type,
-                                    ordinal_position,
-                                    column.is_nullable,
-                                ))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                        row_data.clear();
+                        for (i, column) in col_chunk.iter().enumerate() {
+                            let ordinal_position =
+                                (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                            let encoded_type = encode_data_type(&column.column_type)?;
+                            row_data.push((
+                                uuid::Uuid::new_v4(),
+                                column.name.clone(),
+                                encoded_type,
+                                ordinal_position,
+                                column.is_nullable,
+                            ));
+                        }
                         let row_placeholders: String = (0..row_data.len())
                             .map(|_| "(?, ?, ?, ?, ?, ?)")
                             .collect::<Vec<_>>()
@@ -1365,22 +1362,20 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .await?;
 
         let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+        let mut row_data = Vec::with_capacity(col_chunk_size as usize);
         for (chunk_index, col_chunk) in schema.columns.chunks(col_chunk_size as usize).enumerate() {
-            let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
-                .iter()
-                .enumerate()
-                .map(|(i, column)| {
-                                let ordinal_position = (chunk_index * col_chunk_size as usize + i + 1) as i32;
-                    let encoded_type = encode_data_type(&column.column_type)?;
-                    Ok((
-                        uuid::Uuid::new_v4(),
-                        column.name.clone(),
-                        encoded_type,
-                        ordinal_position,
-                        column.is_nullable,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            row_data.clear();
+            for (i, column) in col_chunk.iter().enumerate() {
+                let ordinal_position = (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                let encoded_type = encode_data_type(&column.column_type)?;
+                row_data.push((
+                    uuid::Uuid::new_v4(),
+                    column.name.clone(),
+                    encoded_type,
+                    ordinal_position,
+                    column.is_nullable,
+                ));
+            }
             let mut param = 1u32;
             let row_placeholders: String = (0..row_data.len())
                 .map(|_| {
@@ -1817,22 +1812,22 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                         )));
                     }
                     let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
+                    let mut row_data =
+                        Vec::with_capacity(chunk_size as usize);
                     for chunk in files.chunks(chunk_size as usize) {
-                        let row_data: Vec<(uuid::Uuid, String, String, i64, i64, Option<String>)> = chunk
-                            .iter()
-                            .map(|f| {
-                                let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
-                                let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
-                                Ok((
-                                    file_uuid,
-                                    f.file_format.clone(),
-                                    f.file_path.clone(),
-                                    f.record_count,
-                                    f.file_size_bytes,
-                                    partition_text,
-                                ))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                        row_data.clear();
+                        for f in chunk {
+                            let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
+                            let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                            row_data.push((
+                                file_uuid,
+                                f.file_format.clone(),
+                                f.file_path.clone(),
+                                f.record_count,
+                                f.file_size_bytes,
+                                partition_text,
+                            ));
+                        }
                         let mut param = 1u32;
                         let row_placeholders: String = (0..row_data.len())
                             .map(|_| {
@@ -1995,23 +1990,22 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     .await?;
 
                     let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+                    let mut row_data =
+                        Vec::with_capacity(col_chunk_size as usize);
                     for (chunk_index, col_chunk) in schema_spec.columns.chunks(col_chunk_size as usize).enumerate() {
-                        let row_data: Vec<(uuid::Uuid, String, Vec<u8>, i32, bool)> = col_chunk
-                            .iter()
-                            .enumerate()
-                            .map(|(i, column)| {
-                                let ordinal_position =
-                                    (chunk_index * col_chunk_size as usize + i + 1) as i32;
-                                let encoded_type = encode_data_type(&column.column_type)?;
-                                Ok((
-                                    uuid::Uuid::new_v4(),
-                                    column.name.clone(),
-                                    encoded_type,
-                                    ordinal_position,
-                                    column.is_nullable,
-                                ))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                        row_data.clear();
+                        for (i, column) in col_chunk.iter().enumerate() {
+                            let ordinal_position =
+                                (chunk_index * col_chunk_size as usize + i + 1) as i32;
+                            let encoded_type = encode_data_type(&column.column_type)?;
+                            row_data.push((
+                                uuid::Uuid::new_v4(),
+                                column.name.clone(),
+                                encoded_type,
+                                ordinal_position,
+                                column.is_nullable,
+                            ));
+                        }
                         let mut param = 1u32;
                         let row_placeholders: String = (0..row_data.len())
                             .map(|_| {
