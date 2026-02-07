@@ -7,7 +7,7 @@ It covers the current surface area and intended patterns for storage and catalog
 
 - Keep the API concrete and explicit.
 - Avoid JSON in core APIs except where persisted (catalog `format_options`).
-- Prefer async methods for I/O and consistency across formats.
+- Prefer sync methods for I/O; offer optional async wrappers for event loops.
 - Align read/write/stream behavior across formats.
 
 ## Installation
@@ -23,16 +23,17 @@ pip install -e .
 ### Catalog
 
 The catalog is the entry point for table metadata and commits.
+Catalog and table methods are synchronous; async wrappers are available with `_async` suffixes.
 
 ```python
 from planar import Catalog, TableIdent, SchemaSpec, ColumnSpec
 import pyarrow as pa
 
-catalog = await Catalog.in_memory()
+catalog = Catalog.in_memory()
 ident = TableIdent("default", "events")
 
 schema = SchemaSpec().with_column(ColumnSpec("id", pa.int64()))
-handle = await catalog.create_table(
+handle = catalog.create_table(
     ident=ident,
     location="file:///tmp/planar/events",
     schema=schema,
@@ -42,8 +43,8 @@ handle = await catalog.create_table(
 ### TableHandle
 
 ```python
-view = await handle.read()
-delta = await handle.diff(view.transaction_id, view.transaction_id)
+view = handle.read()
+delta = handle.diff(view.transaction_id, view.transaction_id)
 ```
 
 ### FileSpec
@@ -68,7 +69,7 @@ file = FileSpec(
 The Python surface will mirror the Rust core behavior. These APIs are defined in Rust
 and will be exposed through bindings.
 
-### Common Patterns
+### Common Patterns (Sync)
 
 - `read(path, options)` returns a single `RecordBatch` (materialized).
 - `read_stream(path, options)` yields batches for streaming.
@@ -77,6 +78,8 @@ and will be exposed through bindings.
 
 `read` and `read_stream` accept the same options; the difference is only
 batch vs stream delivery.
+
+`write_stream` requires at least one batch and will error on empty streams.
 
 ### Parquet
 
@@ -98,24 +101,44 @@ Vortex exposes concrete types:
 - `VortexOpenOptions` for reads.
 - `VortexWriteOptions` for writes.
 
-## Planned Python Storage API
+## Python Storage API (Sync)
 
 The intended Python interface (names subject to change) aligns with the Rust core:
 
 ```python
 from planar.storage import read, read_stream, write
 
-batch = await read(
+batch = read(
     "data.parquet",
     file_format="parquet",
     options={"batch_size": 8192},
 )
-stream = await read_stream(
+stream = read_stream(
     "data.parquet",
     file_format="parquet",
     options={"batch_size": 8192},
 )
-await write(
+write(
+    batch,
+    "data.parquet",
+    file_format="parquet",
+    options={"compression": "zstd"},
+)
+```
+
+### Optional Async Wrappers
+
+For asyncio-based applications, use the `_async` helpers that run sync calls in a thread:
+
+```python
+from planar.storage import read_async, write_async
+
+batch = await read_async(
+    "data.parquet",
+    file_format="parquet",
+    options={"batch_size": 8192},
+)
+await write_async(
     batch,
     "data.parquet",
     file_format="parquet",
@@ -128,6 +151,6 @@ We will only accept JSON-ish dicts where the core must persist options.
 
 ## Notes
 
-- The Python API is async-first.
-- Streaming APIs will return async iterators of `RecordBatch` objects.
+- The Python API is sync-first; async wrappers are provided via `asyncio.to_thread`.
+- Streaming APIs return `pyarrow.ipc.RecordBatchStreamReader` objects.
 - File format options should be explicit and typed when possible.

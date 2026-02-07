@@ -13,15 +13,14 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::{AsyncArrowWriter, AsyncFileWriter};
-use parquet::basic::{BloomFilterPosition, Compression, WriterVersion};
+use parquet::basic::Compression;
 use parquet::errors::ParquetError;
-use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
+use parquet::file::properties::{BloomFilterPosition, WriterProperties, WriterPropertiesBuilder, WriterVersion};
 use serde_json::Value;
 use std::str::FromStr;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
-use crate::storage::StorageError;
 
 /// Parquet file reader
 ///
@@ -31,9 +30,12 @@ use crate::storage::StorageError;
 #[derive(Debug, Default)]
 pub struct ParquetReader;
 
+/// Read-time options for Parquet scans.
 #[derive(Debug, Clone)]
 pub struct ParquetReadOptions {
+    /// Low-level Arrow reader configuration (e.g., page index usage).
     pub arrow_options: ArrowReaderOptions,
+    /// Optional record batch size for streaming reads.
     pub batch_size: Option<usize>,
 }
 
@@ -84,6 +86,7 @@ impl ParquetReader {
         }
     }
 
+    /// Streams a Parquet file as a RecordBatch stream.
     pub async fn read_stream(
         &self,
         path: &Path,
@@ -152,6 +155,7 @@ impl ParquetWriter {
         Ok(())
     }
 
+    /// Writes a stream of RecordBatches to a Parquet file.
     pub async fn write_stream(
         &self,
         mut stream: RecordBatchStream,
@@ -167,15 +171,24 @@ impl ParquetWriter {
                 ))
             }
         };
+        let expected_schema = first.schema();
         let mut writer = AsyncArrowWriter::try_new(
             TokioAsyncWriter::new(file),
-            first.schema(),
+            expected_schema.clone(),
             Some(options.clone()),
         )?;
 
         writer.write(&first).await?;
         while let Some(batch) = stream.next().await {
-            writer.write(&batch?).await?;
+            let batch = batch?;
+            if batch.schema() != expected_schema {
+                return Err(StorageError::Unsupported(format!(
+                    "Schema mismatch in stream: expected {:?}, got {:?}",
+                    expected_schema,
+                    batch.schema()
+                )));
+            }
+            writer.write(&batch).await?;
         }
 
         writer.close().await?;
@@ -183,6 +196,7 @@ impl ParquetWriter {
     }
 }
 
+/// Parses Parquet writer options from JSON into `WriterProperties`.
 pub fn parse_write_options(options: Option<&Value>) -> Result<WriterProperties> {
     let Some(options) = options else {
         return Ok(WriterProperties::builder().build());
@@ -259,10 +273,10 @@ fn parse_compression(value: &str) -> Result<Compression> {
     match value.to_lowercase().as_str() {
         "uncompressed" | "none" => Ok(Compression::UNCOMPRESSED),
         "snappy" => Ok(Compression::SNAPPY),
-        "gzip" => Ok(Compression::GZIP),
-        "brotli" => Ok(Compression::BROTLI),
+        "gzip" => Ok(Compression::GZIP(Default::default())),
+        "brotli" => Ok(Compression::BROTLI(Default::default())),
         "lz4" => Ok(Compression::LZ4),
-        "zstd" => Ok(Compression::ZSTD),
+        "zstd" => Ok(Compression::ZSTD(Default::default())),
         other => Err(StorageError::Unsupported(format!(
             "Unsupported compression: {}",
             other
@@ -331,6 +345,8 @@ mod tests {
     use futures::TryStreamExt;
     use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
+    use futures::stream;
+    use crate::storage::StorageError;
 
     #[tokio::test]
     async fn read_matches_stream_read() {
@@ -375,5 +391,48 @@ mod tests {
         for idx in 0..direct.num_columns() {
             assert!(direct.column(idx).equals(streamed.column(idx).as_ref()));
         }
+    }
+
+    #[tokio::test]
+    async fn write_stream_propagates_stream_error() {
+        let path = std::env::temp_dir().join(format!(
+            "planar_parquet_err_{}.parquet",
+            uuid::Uuid::new_v4()
+        ));
+        let stream = Box::pin(stream::iter(vec![Err(StorageError::Unsupported(
+            "boom".to_string(),
+        ))]));
+        let err = ParquetWriter::new()
+            .write_stream(stream, &path, &WriterProperties::builder().build())
+            .await
+            .expect_err("stream error should surface");
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn write_stream_schema_mismatch_is_error() {
+        let schema_a = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch_a = RecordBatch::try_new(
+            schema_a,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch a");
+        let batch_b = RecordBatch::try_new(
+            schema_b,
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .expect("batch b");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_parquet_schema_mismatch_{}.parquet",
+            uuid::Uuid::new_v4()
+        ));
+        let stream = Box::pin(stream::iter(vec![Ok(batch_a), Ok(batch_b)]));
+        let err = ParquetWriter::new()
+            .write_stream(stream, &path, &WriterProperties::builder().build())
+            .await
+            .expect_err("schema mismatch should error");
+        assert!(err.to_string().contains("Schema mismatch"));
     }
 }

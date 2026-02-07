@@ -6,11 +6,14 @@ use futures::{stream, TryStreamExt};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList};
-use pyo3::types::PyBytes;
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyType};
+use pyo3::IntoPyObjectExt;
+use once_cell::sync::Lazy;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+use std::future::Future;
+use tokio::runtime::{Builder, Runtime};
 
 use crate::catalog::{
     Catalog, CatalogError as CoreCatalogError, ColumnSpec, CommitResult, FileSpec, SchemaSpec,
@@ -25,11 +28,26 @@ use crate::storage::{
     file_format::vortex::parse_write_options as parse_vortex_write_options,
     RecordBatchStream,
 };
-use crate::storage::{Reader, StorageError as CoreStorageError, Writer};
+use crate::storage::StorageError as CoreStorageError;
 
 create_exception!(planar, PlanarError, PyException);
 create_exception!(planar, CatalogError, PlanarError);
 create_exception!(planar, StorageError, PlanarError);
+
+static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime for Python API")
+});
+
+fn block_on_py<T, F>(py: Python, fut: F) -> PyResult<T>
+where
+    T: Send,
+    F: Future<Output = PyResult<T>> + Send,
+{
+    py.detach(|| RUNTIME.block_on(fut))
+}
 
 fn catalog_error_to_py(err: CoreCatalogError) -> PyErr {
     PyErr::new::<CatalogError, _>(err.to_string())
@@ -39,7 +57,7 @@ fn storage_error_to_py(err: crate::storage::StorageError) -> PyErr {
     PyErr::new::<StorageError, _>(err.to_string())
 }
 
-fn py_to_json_value(value: &PyAny) -> PyResult<serde_json::Value> {
+fn py_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     if value.is_none() {
         return Ok(serde_json::Value::Null);
     }
@@ -62,7 +80,7 @@ fn py_to_json_value(value: &PyAny) -> PyResult<serde_json::Value> {
     if let Ok(list) = value.downcast::<PyList>() {
         let mut items = Vec::with_capacity(list.len());
         for item in list.iter() {
-            items.push(py_to_json_value(item)?);
+            items.push(py_to_json_value(&item)?);
         }
         return Ok(serde_json::Value::Array(items));
     }
@@ -70,7 +88,7 @@ fn py_to_json_value(value: &PyAny) -> PyResult<serde_json::Value> {
         let mut map = serde_json::Map::new();
         for (key, val) in dict.iter() {
             let key_str = key.extract::<String>()?;
-            map.insert(key_str, py_to_json_value(val)?);
+            map.insert(key_str, py_to_json_value(&val)?);
         }
         return Ok(serde_json::Value::Object(map));
     }
@@ -80,35 +98,35 @@ fn py_to_json_value(value: &PyAny) -> PyResult<serde_json::Value> {
     ))
 }
 
-fn json_value_to_py(py: Python, value: &serde_json::Value) -> PyResult<PyObject> {
-    Ok(match value {
-        serde_json::Value::Null => py.None(),
-        serde_json::Value::Bool(val) => val.into_py(py),
+fn json_value_to_py(py: Python, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    match value {
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(val) => val.into_py_any(py),
         serde_json::Value::Number(val) => {
             if let Some(num) = val.as_i64() {
-                num.into_py(py)
+                num.into_py_any(py)
             } else if let Some(num) = val.as_f64() {
-                num.into_py(py)
+                num.into_py_any(py)
             } else {
-                py.None()
+                Ok(py.None())
             }
         }
-        serde_json::Value::String(val) => val.into_py(py),
+        serde_json::Value::String(val) => val.into_py_any(py),
         serde_json::Value::Array(values) => {
             let list = PyList::empty(py);
             for item in values {
                 list.append(json_value_to_py(py, item)?)?;
             }
-            list.into_py(py)
+            list.into_py_any(py)
         }
         serde_json::Value::Object(values) => {
             let dict = PyDict::new(py);
             for (key, val) in values {
                 dict.set_item(key, json_value_to_py(py, val)?)?;
             }
-            dict.into_py(py)
+            dict.into_py_any(py)
         }
-    })
+    }
 }
 
 fn record_batches_to_ipc(batches: Vec<RecordBatch>) -> std::result::Result<Vec<u8>, CoreStorageError> {
@@ -160,32 +178,32 @@ fn time_unit_from_str(value: &str) -> PyResult<TimeUnit> {
     }
 }
 
-fn field_to_spec(py: Python, field: &Field) -> PyResult<PyObject> {
+fn field_to_spec(py: Python, field: &Field) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("name", field.name())?;
     dict.set_item("nullable", field.is_nullable())?;
     dict.set_item("dtype", data_type_to_spec(py, field.data_type())?)?;
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
-fn field_from_spec(py: Python, spec: &PyAny) -> PyResult<Field> {
+fn field_from_spec(py: Python, spec: &Bound<'_, PyAny>) -> PyResult<Field> {
     let dict = spec.downcast::<PyDict>()?;
     let name: String = dict
-        .get_item("name")
+        .get_item("name")?
         .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing field name"))?
         .extract()?;
     let nullable: bool = dict
-        .get_item("nullable")
+        .get_item("nullable")?
         .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing field nullable"))?
         .extract()?;
     let dtype_spec = dict
-        .get_item("dtype")
+        .get_item("dtype")?
         .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing field dtype"))?;
-    let data_type = data_type_from_spec(py, dtype_spec)?;
+    let data_type = data_type_from_spec(py, &dtype_spec)?;
     Ok(Field::new(name, data_type, nullable))
 }
 
-fn data_type_to_spec(py: Python, data_type: &DataType) -> PyResult<PyObject> {
+fn data_type_to_spec(py: Python, data_type: &DataType) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     match data_type {
         DataType::Null => {
@@ -230,7 +248,7 @@ fn data_type_to_spec(py: Python, data_type: &DataType) -> PyResult<PyObject> {
             dict.set_item("kind", "timestamp")?;
             dict.set_item("unit", time_unit_to_str(unit))?;
             match tz {
-                Some(value) => dict.set_item("tz", value.as_str())?,
+                Some(value) => dict.set_item("tz", value.as_ref())?,
                 None => dict.set_item("tz", py.None())?,
             };
         }
@@ -272,13 +290,13 @@ fn data_type_to_spec(py: Python, data_type: &DataType) -> PyResult<PyObject> {
             )))
         }
     }
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
-fn data_type_from_spec(py: Python, spec: &PyAny) -> PyResult<DataType> {
+fn data_type_from_spec(py: Python, spec: &Bound<'_, PyAny>) -> PyResult<DataType> {
     let dict = spec.downcast::<PyDict>()?;
     let kind: String = dict
-        .get_item("kind")
+        .get_item("kind")?
         .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing dtype kind"))?
         .extract()?;
 
@@ -301,7 +319,7 @@ fn data_type_from_spec(py: Python, spec: &PyAny) -> PyResult<DataType> {
         "large_binary" => Ok(DataType::LargeBinary),
         "fixed_size_binary" => {
             let size: i32 = dict
-                .get_item("byte_width")
+                .get_item("byte_width")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing byte_width"))?
                 .extract()?;
             Ok(DataType::FixedSizeBinary(size))
@@ -310,32 +328,32 @@ fn data_type_from_spec(py: Python, spec: &PyAny) -> PyResult<DataType> {
         "date64" => Ok(DataType::Date64),
         "time32" => {
             let unit: String = dict
-                .get_item("unit")
+                .get_item("unit")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing time unit"))?
                 .extract()?;
             Ok(DataType::Time32(time_unit_from_str(&unit)?))
         }
         "time64" => {
             let unit: String = dict
-                .get_item("unit")
+                .get_item("unit")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing time unit"))?
                 .extract()?;
             Ok(DataType::Time64(time_unit_from_str(&unit)?))
         }
         "duration" => {
             let unit: String = dict
-                .get_item("unit")
+                .get_item("unit")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing duration unit"))?
                 .extract()?;
             Ok(DataType::Duration(time_unit_from_str(&unit)?))
         }
         "timestamp" => {
             let unit: String = dict
-                .get_item("unit")
+                .get_item("unit")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing timestamp unit"))?
                 .extract()?;
             let tz: Option<String> = dict
-                .get_item("tz")
+                .get_item("tz")?
                 .map(|value| value.extract::<Option<String>>())
                 .transpose()?
                 .flatten();
@@ -346,59 +364,59 @@ fn data_type_from_spec(py: Python, spec: &PyAny) -> PyResult<DataType> {
         }
         "decimal128" => {
             let precision: u8 = dict
-                .get_item("precision")
+                .get_item("precision")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing precision"))?
                 .extract()?;
             let scale: i8 = dict
-                .get_item("scale")
+                .get_item("scale")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing scale"))?
                 .extract()?;
             Ok(DataType::Decimal128(precision, scale))
         }
         "decimal256" => {
             let precision: u8 = dict
-                .get_item("precision")
+                .get_item("precision")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing precision"))?
                 .extract()?;
             let scale: i8 = dict
-                .get_item("scale")
+                .get_item("scale")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing scale"))?
                 .extract()?;
             Ok(DataType::Decimal256(precision, scale))
         }
         "list" => {
             let field_spec = dict
-                .get_item("field")
+                .get_item("field")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing list field"))?;
-            Ok(DataType::List(Arc::new(field_from_spec(py, field_spec)?)))
+            Ok(DataType::List(Arc::new(field_from_spec(py, &field_spec)?)))
         }
         "large_list" => {
             let field_spec = dict
-                .get_item("field")
+                .get_item("field")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing list field"))?;
-            Ok(DataType::LargeList(Arc::new(field_from_spec(py, field_spec)?)))
+            Ok(DataType::LargeList(Arc::new(field_from_spec(py, &field_spec)?)))
         }
         "fixed_size_list" => {
             let field_spec = dict
-                .get_item("field")
+                .get_item("field")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing list field"))?;
             let size: i32 = dict
-                .get_item("size")
+                .get_item("size")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing list size"))?
                 .extract()?;
             Ok(DataType::FixedSizeList(
-                Arc::new(field_from_spec(py, field_spec)?),
+                Arc::new(field_from_spec(py, &field_spec)?),
                 size,
             ))
         }
         "struct" => {
-            let fields = dict
-                .get_item("fields")
-                .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing struct fields"))?
-                .downcast::<PyList>()?;
+            let fields_value = dict
+                .get_item("fields")?
+                .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing struct fields"))?;
+            let fields = fields_value.downcast::<PyList>()?;
             let mut converted = Vec::with_capacity(fields.len());
             for field in fields.iter() {
-                converted.push(field_from_spec(py, field)?);
+                converted.push(field_from_spec(py, &field)?);
             }
             Ok(DataType::Struct(converted.into()))
         }
@@ -432,7 +450,9 @@ impl PyTableIdent {
     fn name(&self) -> &str {
         &self.name
     }
+}
 
+impl PyTableIdent {
     fn to_core(&self) -> TableIdent {
         TableIdent::new(self.namespace.clone(), self.name.clone())
     }
@@ -447,7 +467,7 @@ pub struct PyColumnSpec {
 #[pymethods]
 impl PyColumnSpec {
     #[new]
-    fn new(py: Python, name: String, dtype_spec: &PyAny) -> PyResult<Self> {
+    fn new(py: Python, name: String, dtype_spec: &Bound<'_, PyAny>) -> PyResult<Self> {
         let data_type = data_type_from_spec(py, dtype_spec)?;
         Ok(Self {
             inner: ColumnSpec::new(name, data_type),
@@ -477,7 +497,9 @@ impl PySchemaSpec {
         self.columns.push(column.inner.clone());
         Ok(())
     }
+}
 
+impl PySchemaSpec {
     fn to_core(&self) -> SchemaSpec {
         SchemaSpec {
             columns: self.columns.clone(),
@@ -499,7 +521,7 @@ impl PyFileSpec {
         file_path: String,
         record_count: i64,
         file_size_bytes: i64,
-        format_options: Option<&PyAny>,
+        format_options: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let mut inner = FileSpec::new(file_format, file_path, record_count, file_size_bytes);
         if let Some(options) = format_options {
@@ -513,7 +535,7 @@ impl PyFileSpec {
         Ok(Self { inner })
     }
 
-    fn with_partition_values(&mut self, values: &PyAny) -> PyResult<()> {
+    fn with_partition_values(&mut self, values: &Bound<'_, PyAny>) -> PyResult<()> {
         let json_values = py_to_json_value(values)?;
         self.inner = self.inner.clone().with_partition_values(json_values);
         Ok(())
@@ -529,19 +551,23 @@ pub struct PyCatalog {
 #[pymethods]
 impl PyCatalog {
     #[classmethod]
-    fn in_memory(_cls: &PyAny, py: Python) -> PyResult<&PyAny> {
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+    fn in_memory(_cls: &Bound<'_, PyType>, py: Python) -> PyResult<Self> {
+        block_on_py(py, async move {
             let catalog = crate::catalog::SqlCatalog::<sqlx::Sqlite>::in_memory()
                 .await
-                .map_err(catalog_error_to_py)?;
+                .map_err(|err| catalog_error_to_py(err.into()))?;
             let catalog: Arc<dyn Catalog> = catalog;
             Ok(PyCatalog { inner: catalog })
         })
     }
 
     #[classmethod]
-    fn from_connection_string(_cls: &PyAny, py: Python, connection_string: String) -> PyResult<&PyAny> {
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+    fn from_connection_string(
+        _cls: &Bound<'_, PyType>,
+        py: Python,
+        connection_string: String,
+    ) -> PyResult<Self> {
+        block_on_py(py, async move {
             let is_postgres = connection_string.starts_with("postgres://")
                 || connection_string.starts_with("postgresql://");
 
@@ -550,11 +576,11 @@ impl PyCatalog {
                     &connection_string,
                 )
                 .await
-                .map_err(catalog_error_to_py)?
+                .map_err(|err| catalog_error_to_py(err.into()))?
             } else {
                 crate::catalog::SqlCatalog::<sqlx::Sqlite>::from_connection_string(&connection_string)
                     .await
-                    .map_err(catalog_error_to_py)?
+                    .map_err(|err| catalog_error_to_py(err.into()))?
             };
 
             Ok(PyCatalog { inner: catalog })
@@ -567,8 +593,8 @@ impl PyCatalog {
         ident: PyRef<PyTableIdent>,
         location: String,
         schema: PyRef<PySchemaSpec>,
-        properties: Option<&PyAny>,
-    ) -> PyResult<&PyAny> {
+        properties: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyTableHandle> {
         let catalog = self.inner.clone();
         let ident = ident.to_core();
         let schema = schema.to_core();
@@ -577,7 +603,7 @@ impl PyCatalog {
             None => None,
         };
 
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let handle = catalog
                 .clone()
                 .create_table(ident, location, schema, properties)
@@ -587,10 +613,10 @@ impl PyCatalog {
         })
     }
 
-    fn load_table(&self, py: Python, ident: PyRef<PyTableIdent>) -> PyResult<&PyAny> {
+    fn load_table(&self, py: Python, ident: PyRef<PyTableIdent>) -> PyResult<Option<PyTableHandle>> {
         let catalog = self.inner.clone();
         let ident = ident.to_core();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let handle = catalog
                 .clone()
                 .load_table(ident)
@@ -600,9 +626,9 @@ impl PyCatalog {
         })
     }
 
-    fn list_tables(&self, py: Python, namespace: Option<String>) -> PyResult<&PyAny> {
+    fn list_tables(&self, py: Python, namespace: Option<String>) -> PyResult<Vec<PyTableIdent>> {
         let catalog = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let tables = catalog
                 .list_tables(namespace.as_deref())
                 .await
@@ -617,10 +643,10 @@ impl PyCatalog {
         })
     }
 
-    fn drop_table(&self, py: Python, ident: PyRef<PyTableIdent>) -> PyResult<&PyAny> {
+    fn drop_table(&self, py: Python, ident: PyRef<PyTableIdent>) -> PyResult<()> {
         let catalog = self.inner.clone();
         let ident = ident.to_core();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             catalog.drop_table(&ident).await.map_err(catalog_error_to_py)?;
             Ok(())
         })
@@ -635,22 +661,22 @@ pub struct PyTableHandle {
 
 #[pymethods]
 impl PyTableHandle {
-    fn read(&self, py: Python) -> PyResult<&PyAny> {
+    fn read(&self, py: Python) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let view = handle.read().await.map_err(catalog_error_to_py)?;
-            Python::with_gil(|py| table_view_to_py(py, &view))
+            Python::attach(|py| table_view_to_py(py, &view))
         })
     }
 
-    fn read_at(&self, py: Python, transaction_id: String) -> PyResult<&PyAny> {
+    fn read_at(&self, py: Python, transaction_id: String) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
         let txn_id = uuid::Uuid::parse_str(&transaction_id).map_err(|err| {
             PyErr::new::<PyValueError, _>(format!("Invalid transaction id: {}", err))
         })?;
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let view = handle.read_at(txn_id).await.map_err(catalog_error_to_py)?;
-            Python::with_gil(|py| table_view_to_py(py, &view))
+            Python::attach(|py| table_view_to_py(py, &view))
         })
     }
 
@@ -659,7 +685,7 @@ impl PyTableHandle {
         py: Python,
         from_transaction_id: String,
         to_transaction_id: String,
-    ) -> PyResult<&PyAny> {
+    ) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
         let from_txn = uuid::Uuid::parse_str(&from_transaction_id).map_err(|err| {
             PyErr::new::<PyValueError, _>(format!("Invalid transaction id: {}", err))
@@ -668,28 +694,28 @@ impl PyTableHandle {
             PyErr::new::<PyValueError, _>(format!("Invalid transaction id: {}", err))
         })?;
 
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let delta = handle
                 .diff(from_txn, to_txn)
                 .await
                 .map_err(catalog_error_to_py)?;
-            Python::with_gil(|py| table_delta_to_py(py, &delta))
+            Python::attach(|py| table_delta_to_py(py, &delta))
         })
     }
 
-    fn append_file(&self, py: Python, file: PyRef<PyFileSpec>) -> PyResult<&PyAny> {
+    fn append_file(&self, py: Python, file: PyRef<PyFileSpec>) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
         let file = file.inner.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let result = handle.append_file(file).await.map_err(catalog_error_to_py)?;
-            Python::with_gil(|py| commit_result_to_py(py, &result))
+            Python::attach(|py| commit_result_to_py(py, &result))
         })
     }
 
-    fn append_files(&self, py: Python, files: Vec<Py<PyFileSpec>>) -> PyResult<&PyAny> {
+    fn append_files(&self, py: Python, files: Vec<Py<PyFileSpec>>) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
         let mut core_files = Vec::with_capacity(files.len());
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for file in files {
                 let file_ref = file.borrow(py);
                 core_files.push(file_ref.inner.clone());
@@ -697,16 +723,16 @@ impl PyTableHandle {
             Ok::<(), PyErr>(())
         })?;
 
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let result = handle
                 .append_files(core_files)
                 .await
                 .map_err(catalog_error_to_py)?;
-            Python::with_gil(|py| commit_result_to_py(py, &result))
+            Python::attach(|py| commit_result_to_py(py, &result))
         })
     }
 
-    fn delete_files(&self, py: Python, file_uuids: Vec<String>) -> PyResult<&PyAny> {
+    fn delete_files(&self, py: Python, file_uuids: Vec<String>) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
         let mut uuids = Vec::with_capacity(file_uuids.len());
         for uuid_str in file_uuids {
@@ -715,29 +741,29 @@ impl PyTableHandle {
             })?);
         }
 
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let result = handle
                 .delete_files(uuids)
                 .await
                 .map_err(catalog_error_to_py)?;
-            Python::with_gil(|py| commit_result_to_py(py, &result))
+            Python::attach(|py| commit_result_to_py(py, &result))
         })
     }
 
-    fn set_properties(&self, py: Python, properties: &PyAny) -> PyResult<&PyAny> {
+    fn set_properties(&self, py: Python, properties: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
         let json = py_to_json_value(properties)?;
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        block_on_py(py, async move {
             let result = handle
                 .set_properties(json)
                 .await
                 .map_err(catalog_error_to_py)?;
-            Python::with_gil(|py| commit_result_to_py(py, &result))
+            Python::attach(|py| commit_result_to_py(py, &result))
         })
     }
 }
 
-fn file_to_py(py: Python, file: &crate::catalog::schema::File) -> PyResult<PyObject> {
+fn file_to_py(py: Python, file: &crate::catalog::schema::File) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("file_uuid", file.file_uuid.to_string())?;
     dict.set_item("table_uuid", file.table_uuid.to_string())?;
@@ -758,10 +784,10 @@ fn file_to_py(py: Python, file: &crate::catalog::schema::File) -> PyResult<PyObj
         Some(values) => dict.set_item("format_options", json_value_to_py(py, values)?)?,
         None => dict.set_item("format_options", py.None())?,
     };
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
-fn schema_to_py(py: Python, schema: &crate::catalog::schema::Schema) -> PyResult<PyObject> {
+fn schema_to_py(py: Python, schema: &crate::catalog::schema::Schema) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("schema_uuid", schema.schema_uuid.to_string())?;
     dict.set_item("table_uuid", schema.table_uuid.to_string())?;
@@ -788,10 +814,13 @@ fn schema_to_py(py: Python, schema: &crate::catalog::schema::Schema) -> PyResult
         columns.append(column_dict)?;
     }
     dict.set_item("columns", columns)?;
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
-fn table_stats_to_py(py: Python, stats: &crate::catalog::schema::TableStats) -> PyResult<PyObject> {
+fn table_stats_to_py(
+    py: Python,
+    stats: &crate::catalog::schema::TableStats,
+) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("table_uuid", stats.table_uuid.to_string())?;
     dict.set_item("transaction_id", stats.transaction_id.to_string())?;
@@ -799,10 +828,10 @@ fn table_stats_to_py(py: Python, stats: &crate::catalog::schema::TableStats) -> 
     dict.set_item("file_size_bytes", stats.file_size_bytes)?;
     dict.set_item("file_count", stats.file_count)?;
     dict.set_item("last_updated", stats.last_updated.to_rfc3339())?;
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
-fn table_view_to_py(py: Python, view: &TableView) -> PyResult<PyObject> {
+fn table_view_to_py(py: Python, view: &TableView) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     let ident = PyDict::new(py);
     ident.set_item("namespace", view.ident.namespace.as_str())?;
@@ -824,10 +853,10 @@ fn table_view_to_py(py: Python, view: &TableView) -> PyResult<PyObject> {
         None => dict.set_item("stats", py.None())?,
     };
 
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
-fn table_delta_to_py(py: Python, delta: &TableDelta) -> PyResult<PyObject> {
+fn table_delta_to_py(py: Python, delta: &TableDelta) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("from_transaction_id", delta.from_transaction_id.to_string())?;
     dict.set_item("to_transaction_id", delta.to_transaction_id.to_string())?;
@@ -854,17 +883,17 @@ fn table_delta_to_py(py: Python, delta: &TableDelta) -> PyResult<PyObject> {
         None => dict.set_item("new_properties", py.None())?,
     };
 
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
-fn commit_result_to_py(py: Python, result: &CommitResult) -> PyResult<PyObject> {
+fn commit_result_to_py(py: Python, result: &CommitResult) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("transaction_id", result.transaction_id.to_string())?;
     match &result.table_view {
         Some(view) => dict.set_item("table_view", table_view_to_py(py, view)?)?,
         None => dict.set_item("table_view", py.None())?,
     };
-    Ok(dict.into_py(py))
+    dict.into_py_any(py)
 }
 
 fn batches_to_stream(batches: Vec<RecordBatch>) -> RecordBatchStream {
@@ -876,8 +905,8 @@ fn read_parquet_ipc(
     py: Python,
     path: String,
     batch_size: Option<usize>,
-) -> PyResult<&PyAny> {
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+) -> PyResult<Py<PyAny>> {
+    block_on_py(py, async move {
         let reader = ParquetReader::new();
         let options = ParquetReadOptions {
             batch_size,
@@ -888,7 +917,7 @@ fn read_parquet_ipc(
             .await
             .map_err(storage_error_to_py)?;
         let bytes = record_batches_to_ipc(vec![batch]).map_err(storage_error_to_py)?;
-        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+        Python::attach(|py| PyBytes::new(py, &bytes).into_py_any(py))
     })
 }
 
@@ -897,8 +926,8 @@ fn read_parquet_stream_ipc(
     py: Python,
     path: String,
     batch_size: Option<usize>,
-) -> PyResult<&PyAny> {
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+) -> PyResult<Py<PyAny>> {
+    block_on_py(py, async move {
         let reader = ParquetReader::new();
         let options = ParquetReadOptions {
             batch_size,
@@ -910,7 +939,7 @@ fn read_parquet_stream_ipc(
             .map_err(storage_error_to_py)?;
         let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(storage_error_to_py)?;
         let bytes = record_batches_to_ipc(batches).map_err(storage_error_to_py)?;
-        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+        Python::attach(|py| PyBytes::new(py, &bytes).into_py_any(py))
     })
 }
 
@@ -918,15 +947,15 @@ fn read_parquet_stream_ipc(
 fn write_parquet_ipc(
     py: Python,
     path: String,
-    data: &PyBytes,
-    options: Option<&PyAny>,
-) -> PyResult<&PyAny> {
+    data: &Bound<'_, PyBytes>,
+    options: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let data = data.as_bytes().to_vec();
     let options_value = match options {
         Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
         _ => None,
     };
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+    block_on_py(py, async move {
         let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
         let Some(first) = batches.first() else {
             return Err(storage_error_to_py(CoreStorageError::Unsupported(
@@ -939,7 +968,7 @@ fn write_parquet_ipc(
             .write_with_options(first, Path::new(&path), &props)
             .await
             .map_err(storage_error_to_py)?;
-        Ok(Python::with_gil(|py| py.None()))
+        Ok(())
     })
 }
 
@@ -947,15 +976,15 @@ fn write_parquet_ipc(
 fn write_parquet_stream_ipc(
     py: Python,
     path: String,
-    data: &PyBytes,
-    options: Option<&PyAny>,
-) -> PyResult<&PyAny> {
+    data: &Bound<'_, PyBytes>,
+    options: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let data = data.as_bytes().to_vec();
     let options_value = match options {
         Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
         _ => None,
     };
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+    block_on_py(py, async move {
         let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
         if batches.is_empty() {
             return Err(storage_error_to_py(CoreStorageError::Unsupported(
@@ -969,7 +998,7 @@ fn write_parquet_stream_ipc(
             .write_stream(stream, Path::new(&path), &props)
             .await
             .map_err(storage_error_to_py)?;
-        Ok(Python::with_gil(|py| py.None()))
+        Ok(())
     })
 }
 
@@ -984,8 +1013,8 @@ fn read_lance_ipc(
     offset: Option<i64>,
     scan_in_order: Option<bool>,
     io_buffer_size: Option<u64>,
-) -> PyResult<&PyAny> {
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+) -> PyResult<Py<PyAny>> {
+    block_on_py(py, async move {
         let reader = crate::storage::file_format::lance::LanceReader::new();
         let options = LanceReadOptions {
             batch_size,
@@ -1001,7 +1030,7 @@ fn read_lance_ipc(
             .await
             .map_err(storage_error_to_py)?;
         let bytes = record_batches_to_ipc(vec![batch]).map_err(storage_error_to_py)?;
-        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+        Python::attach(|py| PyBytes::new(py, &bytes).into_py_any(py))
     })
 }
 
@@ -1016,8 +1045,8 @@ fn read_lance_stream_ipc(
     offset: Option<i64>,
     scan_in_order: Option<bool>,
     io_buffer_size: Option<u64>,
-) -> PyResult<&PyAny> {
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+) -> PyResult<Py<PyAny>> {
+    block_on_py(py, async move {
         let reader = crate::storage::file_format::lance::LanceReader::new();
         let options = LanceReadOptions {
             batch_size,
@@ -1034,7 +1063,7 @@ fn read_lance_stream_ipc(
             .map_err(storage_error_to_py)?;
         let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(storage_error_to_py)?;
         let bytes = record_batches_to_ipc(batches).map_err(storage_error_to_py)?;
-        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+        Python::attach(|py| PyBytes::new(py, &bytes).into_py_any(py))
     })
 }
 
@@ -1042,15 +1071,15 @@ fn read_lance_stream_ipc(
 fn write_lance_ipc(
     py: Python,
     path: String,
-    data: &PyBytes,
-    options: Option<&PyAny>,
-) -> PyResult<&PyAny> {
+    data: &Bound<'_, PyBytes>,
+    options: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let data = data.as_bytes().to_vec();
     let options_value = match options {
         Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
         _ => None,
     };
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+    block_on_py(py, async move {
         let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
         let Some(first) = batches.first() else {
             return Err(storage_error_to_py(CoreStorageError::Unsupported(
@@ -1063,7 +1092,7 @@ fn write_lance_ipc(
             .write_with_options(first, Path::new(&path), &params)
             .await
             .map_err(storage_error_to_py)?;
-        Ok(Python::with_gil(|py| py.None()))
+        Ok(())
     })
 }
 
@@ -1071,15 +1100,15 @@ fn write_lance_ipc(
 fn write_lance_stream_ipc(
     py: Python,
     path: String,
-    data: &PyBytes,
-    options: Option<&PyAny>,
-) -> PyResult<&PyAny> {
+    data: &Bound<'_, PyBytes>,
+    options: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let data = data.as_bytes().to_vec();
     let options_value = match options {
         Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
         _ => None,
     };
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+    block_on_py(py, async move {
         let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
         if batches.is_empty() {
             return Err(storage_error_to_py(CoreStorageError::Unsupported(
@@ -1093,7 +1122,7 @@ fn write_lance_stream_ipc(
             .write_stream(stream, Path::new(&path), &params)
             .await
             .map_err(storage_error_to_py)?;
-        Ok(Python::with_gil(|py| py.None()))
+        Ok(())
     })
 }
 
@@ -1103,8 +1132,8 @@ fn read_vortex_ipc(
     path: String,
     initial_read_size: Option<usize>,
     segment_cache: Option<bool>,
-) -> PyResult<&PyAny> {
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+) -> PyResult<Py<PyAny>> {
+    block_on_py(py, async move {
         let reader = VortexReader::new();
         let options = VortexReadOptions {
             initial_read_size,
@@ -1115,7 +1144,7 @@ fn read_vortex_ipc(
             .await
             .map_err(storage_error_to_py)?;
         let bytes = record_batches_to_ipc(vec![batch]).map_err(storage_error_to_py)?;
-        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+        Python::attach(|py| PyBytes::new(py, &bytes).into_py_any(py))
     })
 }
 
@@ -1125,8 +1154,8 @@ fn read_vortex_stream_ipc(
     path: String,
     initial_read_size: Option<usize>,
     segment_cache: Option<bool>,
-) -> PyResult<&PyAny> {
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+) -> PyResult<Py<PyAny>> {
+    block_on_py(py, async move {
         let reader = VortexReader::new();
         let options = VortexReadOptions {
             initial_read_size,
@@ -1138,7 +1167,7 @@ fn read_vortex_stream_ipc(
             .map_err(storage_error_to_py)?;
         let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(storage_error_to_py)?;
         let bytes = record_batches_to_ipc(batches).map_err(storage_error_to_py)?;
-        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+        Python::attach(|py| PyBytes::new(py, &bytes).into_py_any(py))
     })
 }
 
@@ -1146,15 +1175,15 @@ fn read_vortex_stream_ipc(
 fn write_vortex_ipc(
     py: Python,
     path: String,
-    data: &PyBytes,
-    options: Option<&PyAny>,
-) -> PyResult<&PyAny> {
+    data: &Bound<'_, PyBytes>,
+    options: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let data = data.as_bytes().to_vec();
     let options_value = match options {
         Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
         _ => None,
     };
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+    block_on_py(py, async move {
         let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
         let Some(first) = batches.first() else {
             return Err(storage_error_to_py(CoreStorageError::Unsupported(
@@ -1167,7 +1196,7 @@ fn write_vortex_ipc(
             .write_with_options(first, Path::new(&path), &opts)
             .await
             .map_err(storage_error_to_py)?;
-        Ok(Python::with_gil(|py| py.None()))
+        Ok(())
     })
 }
 
@@ -1175,15 +1204,15 @@ fn write_vortex_ipc(
 fn write_vortex_stream_ipc(
     py: Python,
     path: String,
-    data: &PyBytes,
-    options: Option<&PyAny>,
-) -> PyResult<&PyAny> {
+    data: &Bound<'_, PyBytes>,
+    options: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let data = data.as_bytes().to_vec();
     let options_value = match options {
         Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
         _ => None,
     };
-    pyo3_asyncio::tokio::future_into_py(py, async move {
+    block_on_py(py, async move {
         let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
         if batches.is_empty() {
             return Err(storage_error_to_py(CoreStorageError::Unsupported(
@@ -1197,12 +1226,12 @@ fn write_vortex_stream_ipc(
             .write_stream(stream, Path::new(&path), &opts)
             .await
             .map_err(storage_error_to_py)?;
-        Ok(Python::with_gil(|py| py.None()))
+        Ok(())
     })
 }
 
-pub fn init_module(py: Python, module: &PyModule) -> PyResult<()> {
-    pyo3_asyncio::tokio::init_multi_thread_once();
+pub fn init_module(py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let _ = Lazy::force(&RUNTIME);
     module.add("PlanarError", py.get_type::<PlanarError>())?;
     module.add("CatalogError", py.get_type::<CatalogError>())?;
     module.add("StorageError", py.get_type::<StorageError>())?;

@@ -50,7 +50,6 @@ pub enum FormatReadOptions {
 }
 
 /// Format-specific write options for dispatch
-#[derive(Debug)]
 pub enum FormatWriteOptions {
     /// Parquet writer properties
     Parquet(WriterProperties),
@@ -58,6 +57,16 @@ pub enum FormatWriteOptions {
     Lance(WriteParams),
     /// Vortex write options
     Vortex(VortexWriteOptions),
+}
+
+impl std::fmt::Debug for FormatWriteOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FormatWriteOptions::Parquet(_) => f.debug_tuple("Parquet").finish(),
+            FormatWriteOptions::Lance(_) => f.debug_tuple("Lance").finish(),
+            FormatWriteOptions::Vortex(_) => f.debug_tuple("Vortex").finish(),
+        }
+    }
 }
 
 /// Supported file formats

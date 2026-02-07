@@ -5,15 +5,18 @@
 //! random access, and efficient updates.
 
 use std::path::Path;
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use async_trait::async_trait;
-use futures::TryStreamExt;
-use lance::dataset::{Dataset, WriteParams};
-use lance::dataset::write::WriteMode;
+use futures::{StreamExt, TryStreamExt};
+use lance::dataset::{Dataset, WriteMode, WriteParams};
 use serde_json::Value;
 use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
 use crate::storage::file_format::path_to_utf8;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 
 /// Lance file reader
 ///
@@ -23,14 +26,22 @@ use crate::storage::file_format::path_to_utf8;
 #[derive(Debug, Default)]
 pub struct LanceReader;
 
+/// Read-time options for Lance scans.
 #[derive(Debug, Clone, Default)]
 pub struct LanceReadOptions {
+    /// Optional record batch size for scanning.
     pub batch_size: Option<usize>,
+    /// Optional column projection list.
     pub columns: Option<Vec<String>>,
+    /// Optional filter expression string.
     pub filter: Option<String>,
+    /// Optional row limit.
     pub limit: Option<i64>,
+    /// Optional row offset.
     pub offset: Option<i64>,
+    /// Optional scan ordering preference.
     pub scan_in_order: Option<bool>,
+    /// Optional I/O buffer size in bytes.
     pub io_buffer_size: Option<u64>,
 }
 
@@ -74,6 +85,7 @@ impl LanceReader {
         Ok(batch)
     }
 
+    /// Streams a Lance dataset as a RecordBatch stream.
     pub async fn read_stream(
         &self,
         path: &Path,
@@ -131,26 +143,76 @@ impl LanceWriter {
         Ok(())
     }
 
+    /// Writes a stream of RecordBatches to a Lance dataset.
     pub async fn write_stream(
         &self,
-        stream: RecordBatchStream,
+        mut stream: RecordBatchStream,
         path: &Path,
         options: &WriteParams,
     ) -> Result<()> {
         let uri = path_to_utf8(path)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        let Some(first) = batches.first() else {
-            return Err(StorageError::Unsupported(
-                "write_stream requires at least one RecordBatch".to_string(),
-            ));
+        let first = match stream.next().await {
+            Some(batch) => batch?,
+            None => {
+                return Err(StorageError::Unsupported(
+                    "write_stream requires at least one RecordBatch".to_string(),
+                ))
+            }
         };
         let schema = first.schema();
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        Dataset::write(reader, uri, Some(options.clone())).await?;
+        let (tx, rx) = mpsc::channel::<std::result::Result<RecordBatch, ArrowError>>(2);
+        let expected_schema = schema.clone();
+
+        let pump = tokio::spawn(async move {
+            while let Some(batch) = stream.next().await {
+                let batch = match batch {
+                    Ok(batch) => {
+                        if batch.schema() != expected_schema {
+                            let err = schema_mismatch_error(&expected_schema, batch.schema());
+                            let _ = tx.send(Err(err)).await;
+                            return;
+                        }
+                        batch
+                    }
+                    Err(err) => {
+                        let err = ArrowError::ExternalError(Box::new(err));
+                        let _ = tx.send(Err(err)).await;
+                        return;
+                    }
+                };
+                if tx.send(Ok(batch)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let reader = StreamRecordBatchReader::new(schema, first, rx);
+        let params = options.clone();
+        let uri = uri.to_string();
+        let handle = Handle::current();
+
+        let write_result = tokio::task::spawn_blocking(move || {
+            handle.block_on(Dataset::write(reader, &uri, Some(params)))
+        })
+        .await
+        .map_err(|err| StorageError::Unsupported(format!("write_stream join error: {err}")))?
+        .map_err(Into::into);
+
+        let pump_result = pump
+            .await
+            .map_err(|err| StorageError::Unsupported(format!("write_stream pump error: {err}")));
+
+        if let Err(err) = write_result {
+            let _ = pump_result?;
+            return Err(err);
+        }
+        pump_result?;
+
         Ok(())
     }
 }
 
+/// Parses Lance write options from JSON into `WriteParams`.
 pub fn parse_write_options(options: Option<&Value>) -> Result<WriteParams> {
     let Some(options) = options else {
         return Ok(WriteParams::default());
@@ -245,4 +307,154 @@ fn apply_read_options(
         scanner.io_buffer_size(io_buffer_size);
     }
     Ok(())
+}
+
+struct StreamRecordBatchReader {
+    schema: SchemaRef,
+    first: Option<std::result::Result<RecordBatch, ArrowError>>,
+    rx: mpsc::Receiver<std::result::Result<RecordBatch, ArrowError>>,
+}
+
+impl StreamRecordBatchReader {
+    fn new(
+        schema: SchemaRef,
+        first: RecordBatch,
+        rx: mpsc::Receiver<std::result::Result<RecordBatch, ArrowError>>,
+    ) -> Self {
+        Self {
+            schema,
+            first: Some(Ok(first)),
+            rx,
+        }
+    }
+}
+
+impl Iterator for StreamRecordBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(first) = self.first.take() {
+            return Some(first);
+        }
+        self.rx.blocking_recv()
+    }
+}
+
+impl arrow_array::RecordBatchReader for StreamRecordBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+fn schema_mismatch_error(expected: &SchemaRef, actual: SchemaRef) -> ArrowError {
+    ArrowError::SchemaError(format!(
+        "Schema mismatch in stream: expected {:?}, got {:?}",
+        expected, actual
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LanceReadOptions, LanceReader, LanceWriter};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use futures::stream;
+    use std::sync::Arc;
+    use crate::storage::StorageError;
+
+    #[tokio::test]
+    async fn write_stream_round_trip() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_lance_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let stream = Box::pin(stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]));
+        LanceWriter::new()
+            .write_stream(stream, &path, &Default::default())
+            .await
+            .expect("write stream");
+
+        let reader = LanceReader::new();
+        let read = reader
+            .read_with_options(&path, &LanceReadOptions::default())
+            .await
+            .expect("read");
+
+        assert_eq!(read.num_columns(), batch.num_columns());
+        assert_eq!(read.num_rows(), batch.num_rows() * 2);
+        for idx in 0..read.num_columns() {
+            assert!(read.column(idx).len() == batch.column(idx).len() * 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_stream_empty_is_error() {
+        let path = std::env::temp_dir().join(format!(
+            "planar_lance_empty_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let stream = Box::pin(stream::empty());
+        let err = LanceWriter::new()
+            .write_stream(stream, &path, &Default::default())
+            .await
+            .expect_err("empty stream should error");
+        assert!(err.to_string().contains("write_stream requires at least one RecordBatch"));
+    }
+
+    #[tokio::test]
+    async fn write_stream_propagates_stream_error() {
+        let path = std::env::temp_dir().join(format!(
+            "planar_lance_err_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let stream = Box::pin(stream::iter(vec![Err(StorageError::Unsupported(
+            "boom".to_string(),
+        ))]));
+        let err = LanceWriter::new()
+            .write_stream(stream, &path, &Default::default())
+            .await
+            .expect_err("stream error should surface");
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn write_stream_schema_mismatch_is_error() {
+        let schema_a = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch_a = RecordBatch::try_new(
+            schema_a,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch a");
+        let batch_b = RecordBatch::try_new(
+            schema_b,
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .expect("batch b");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_lance_schema_mismatch_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let stream = Box::pin(stream::iter(vec![Ok(batch_a), Ok(batch_b)]));
+        let err = LanceWriter::new()
+            .write_stream(stream, &path, &Default::default())
+            .await
+            .expect_err("schema mismatch should error");
+        assert!(err.to_string().contains("Schema mismatch"));
+    }
 }

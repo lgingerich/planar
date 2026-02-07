@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -172,72 +173,121 @@ class Catalog:
         self._inner = inner
 
     @classmethod
-    async def in_memory(cls) -> "Catalog":
-        inner = await _native.Catalog.in_memory()
+    def in_memory(cls) -> "Catalog":
+        inner = _native.Catalog.in_memory()
         return cls(inner)
 
     @classmethod
-    async def from_connection_string(cls, connection_string: str) -> "Catalog":
-        inner = await _native.Catalog.from_connection_string(connection_string)
+    def from_connection_string(cls, connection_string: str) -> "Catalog":
+        inner = _native.Catalog.from_connection_string(connection_string)
         return cls(inner)
 
-    async def create_table(
+    @classmethod
+    async def in_memory_async(cls) -> "Catalog":
+        return await asyncio.to_thread(cls.in_memory)
+
+    @classmethod
+    async def from_connection_string_async(cls, connection_string: str) -> "Catalog":
+        return await asyncio.to_thread(cls.from_connection_string, connection_string)
+
+    def create_table(
         self,
         ident: TableIdent,
         location: str,
         schema: SchemaSpec,
         properties: Optional[Dict[str, Any]] = None,
     ) -> "TableHandle":
-        handle = await self._inner.create_table(
-            ident._inner, location, schema._inner, properties
-        )
+        handle = self._inner.create_table(ident._inner, location, schema._inner, properties)
         return TableHandle(handle)
 
-    async def load_table(self, ident: TableIdent) -> Optional["TableHandle"]:
-        handle = await self._inner.load_table(ident._inner)
+    def load_table(self, ident: TableIdent) -> Optional["TableHandle"]:
+        handle = self._inner.load_table(ident._inner)
         if handle is None:
             return None
         return TableHandle(handle)
 
-    async def list_tables(self, namespace: Optional[str] = None) -> List[TableIdent]:
-        tables = await self._inner.list_tables(namespace)
+    def list_tables(self, namespace: Optional[str] = None) -> List[TableIdent]:
+        tables = self._inner.list_tables(namespace)
         return [TableIdent(table.namespace, table.name) for table in tables]
 
-    async def drop_table(self, ident: TableIdent) -> None:
-        await self._inner.drop_table(ident._inner)
+    def drop_table(self, ident: TableIdent) -> None:
+        self._inner.drop_table(ident._inner)
+
+    async def create_table_async(
+        self,
+        ident: TableIdent,
+        location: str,
+        schema: SchemaSpec,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> "TableHandle":
+        return await asyncio.to_thread(
+            self.create_table, ident, location, schema, properties
+        )
+
+    async def load_table_async(self, ident: TableIdent) -> Optional["TableHandle"]:
+        return await asyncio.to_thread(self.load_table, ident)
+
+    async def list_tables_async(self, namespace: Optional[str] = None) -> List[TableIdent]:
+        return await asyncio.to_thread(self.list_tables, namespace)
+
+    async def drop_table_async(self, ident: TableIdent) -> None:
+        await asyncio.to_thread(self.drop_table, ident)
 
 
 class TableHandle:
     def __init__(self, inner: _native.TableHandle) -> None:
         self._inner = inner
 
-    async def read(self) -> TableView:
-        raw = await self._inner.read()
+    def read(self) -> TableView:
+        raw = self._inner.read()
         return _table_view_from_dict(raw)
 
-    async def read_at(self, transaction_id: str) -> TableView:
-        raw = await self._inner.read_at(transaction_id)
+    def read_at(self, transaction_id: str) -> TableView:
+        raw = self._inner.read_at(transaction_id)
         return _table_view_from_dict(raw)
 
-    async def diff(self, from_transaction_id: str, to_transaction_id: str) -> TableDelta:
-        raw = await self._inner.diff(from_transaction_id, to_transaction_id)
+    def diff(self, from_transaction_id: str, to_transaction_id: str) -> TableDelta:
+        raw = self._inner.diff(from_transaction_id, to_transaction_id)
         return _table_delta_from_dict(raw)
 
-    async def append_file(self, file: FileSpec) -> CommitResult:
-        raw = await self._inner.append_file(file._inner)
+    def append_file(self, file: FileSpec) -> CommitResult:
+        raw = self._inner.append_file(file._inner)
         return _commit_result_from_dict(raw)
 
-    async def append_files(self, files: List[FileSpec]) -> CommitResult:
-        raw = await self._inner.append_files([file._inner for file in files])
+    def append_files(self, files: List[FileSpec]) -> CommitResult:
+        raw = self._inner.append_files([file._inner for file in files])
         return _commit_result_from_dict(raw)
 
-    async def delete_files(self, file_uuids: List[str]) -> CommitResult:
-        raw = await self._inner.delete_files(file_uuids)
+    def delete_files(self, file_uuids: List[str]) -> CommitResult:
+        raw = self._inner.delete_files(file_uuids)
         return _commit_result_from_dict(raw)
 
-    async def set_properties(self, properties: Dict[str, Any]) -> CommitResult:
-        raw = await self._inner.set_properties(properties)
+    def set_properties(self, properties: Dict[str, Any]) -> CommitResult:
+        raw = self._inner.set_properties(properties)
         return _commit_result_from_dict(raw)
+
+    async def read_async(self) -> TableView:
+        return await asyncio.to_thread(self.read)
+
+    async def read_at_async(self, transaction_id: str) -> TableView:
+        return await asyncio.to_thread(self.read_at, transaction_id)
+
+    async def diff_async(
+        self, from_transaction_id: str, to_transaction_id: str
+    ) -> TableDelta:
+        return await asyncio.to_thread(self.diff, from_transaction_id, to_transaction_id)
+
+    async def append_file_async(self, file: FileSpec) -> CommitResult:
+        return await asyncio.to_thread(self.append_file, file)
+
+    async def append_files_async(self, files: List[FileSpec]) -> CommitResult:
+        return await asyncio.to_thread(self.append_files, files)
+
+    async def delete_files_async(self, file_uuids: List[str]) -> CommitResult:
+        return await asyncio.to_thread(self.delete_files, file_uuids)
+
+    async def set_properties_async(self, properties: Dict[str, Any]) -> CommitResult:
+        return await asyncio.to_thread(self.set_properties, properties)
 
 
 __all__ = [

@@ -11,6 +11,6 @@ mod python;
 use pyo3::prelude::*;
 
 #[pymodule]
-fn _native(py: Python, module: &PyModule) -> PyResult<()> {
+fn _native(py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     python::init_module(py, module)
 }

@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::storage::{Result, StorageError};
 use std::path::Path;
 
+/// Validates JSON writer options for a specific file format.
 pub fn validate_format_options(file_format: &str, options: &Value) -> Result<()> {
     match file_format.to_lowercase().as_str() {
         "parquet" => {

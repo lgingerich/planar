@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Iterable, Optional
 
 import pyarrow as pa
@@ -41,33 +42,33 @@ def _normalize_format(file_format: str) -> str:
     raise ValueError(f"Unsupported file format: {file_format}")
 
 
-async def read_parquet(path: str, *, batch_size: Optional[int] = None) -> pa.RecordBatch:
-    data = await _native.read_parquet_ipc(path, batch_size)
+def read_parquet(path: str, *, batch_size: Optional[int] = None) -> pa.RecordBatch:
+    data = _native.read_parquet_ipc(path, batch_size)
     return _ipc_to_record_batch(data)
 
 
-async def read_parquet_stream(
+def read_parquet_stream(
     path: str, *, batch_size: Optional[int] = None
 ) -> pa.ipc.RecordBatchStreamReader:
-    data = await _native.read_parquet_stream_ipc(path, batch_size)
+    data = _native.read_parquet_stream_ipc(path, batch_size)
     return _ipc_to_stream_reader(data)
 
 
-async def write_parquet(
+def write_parquet(
     batch: pa.RecordBatch, path: str, *, options: Optional[dict] = None
 ) -> None:
     data = _batches_to_ipc([batch])
-    await _native.write_parquet_ipc(path, data, options)
+    _native.write_parquet_ipc(path, data, options)
 
 
-async def write_parquet_stream(
+def write_parquet_stream(
     batches: Iterable[pa.RecordBatch], path: str, *, options: Optional[dict] = None
 ) -> None:
     data = _batches_to_ipc(batches)
-    await _native.write_parquet_stream_ipc(path, data, options)
+    _native.write_parquet_stream_ipc(path, data, options)
 
 
-async def read_lance(
+def read_lance(
     path: str,
     *,
     batch_size: Optional[int] = None,
@@ -78,7 +79,7 @@ async def read_lance(
     scan_in_order: Optional[bool] = None,
     io_buffer_size: Optional[int] = None,
 ) -> pa.RecordBatch:
-    data = await _native.read_lance_ipc(
+    data = _native.read_lance_ipc(
         path,
         batch_size,
         columns,
@@ -91,7 +92,7 @@ async def read_lance(
     return _ipc_to_record_batch(data)
 
 
-async def read_lance_stream(
+def read_lance_stream(
     path: str,
     *,
     batch_size: Optional[int] = None,
@@ -102,7 +103,7 @@ async def read_lance_stream(
     scan_in_order: Optional[bool] = None,
     io_buffer_size: Optional[int] = None,
 ) -> pa.ipc.RecordBatchStreamReader:
-    data = await _native.read_lance_stream_ipc(
+    data = _native.read_lance_stream_ipc(
         path,
         batch_size,
         columns,
@@ -115,55 +116,55 @@ async def read_lance_stream(
     return _ipc_to_stream_reader(data)
 
 
-async def write_lance(
+def write_lance(
     batch: pa.RecordBatch, path: str, *, options: Optional[dict] = None
 ) -> None:
     data = _batches_to_ipc([batch])
-    await _native.write_lance_ipc(path, data, options)
+    _native.write_lance_ipc(path, data, options)
 
 
-async def write_lance_stream(
+def write_lance_stream(
     batches: Iterable[pa.RecordBatch], path: str, *, options: Optional[dict] = None
 ) -> None:
     data = _batches_to_ipc(batches)
-    await _native.write_lance_stream_ipc(path, data, options)
+    _native.write_lance_stream_ipc(path, data, options)
 
 
-async def read_vortex(
+def read_vortex(
     path: str,
     *,
     initial_read_size: Optional[int] = None,
     segment_cache: Optional[bool] = None,
 ) -> pa.RecordBatch:
-    data = await _native.read_vortex_ipc(path, initial_read_size, segment_cache)
+    data = _native.read_vortex_ipc(path, initial_read_size, segment_cache)
     return _ipc_to_record_batch(data)
 
 
-async def read_vortex_stream(
+def read_vortex_stream(
     path: str,
     *,
     initial_read_size: Optional[int] = None,
     segment_cache: Optional[bool] = None,
 ) -> pa.ipc.RecordBatchStreamReader:
-    data = await _native.read_vortex_stream_ipc(path, initial_read_size, segment_cache)
+    data = _native.read_vortex_stream_ipc(path, initial_read_size, segment_cache)
     return _ipc_to_stream_reader(data)
 
 
-async def write_vortex(
+def write_vortex(
     batch: pa.RecordBatch, path: str, *, options: Optional[dict] = None
 ) -> None:
     data = _batches_to_ipc([batch])
-    await _native.write_vortex_ipc(path, data, options)
+    _native.write_vortex_ipc(path, data, options)
 
 
-async def write_vortex_stream(
+def write_vortex_stream(
     batches: Iterable[pa.RecordBatch], path: str, *, options: Optional[dict] = None
 ) -> None:
     data = _batches_to_ipc(batches)
-    await _native.write_vortex_stream_ipc(path, data, options)
+    _native.write_vortex_stream_ipc(path, data, options)
 
 
-async def read(
+def read(
     path: str,
     *,
     file_format: str,
@@ -172,9 +173,9 @@ async def read(
     fmt = _normalize_format(file_format)
     options = options or {}
     if fmt == "parquet":
-        return await read_parquet(path, batch_size=options.get("batch_size"))
+        return read_parquet(path, batch_size=options.get("batch_size"))
     if fmt == "lance":
-        return await read_lance(
+        return read_lance(
             path,
             batch_size=options.get("batch_size"),
             columns=options.get("columns"),
@@ -184,14 +185,14 @@ async def read(
             scan_in_order=options.get("scan_in_order"),
             io_buffer_size=options.get("io_buffer_size"),
         )
-    return await read_vortex(
+    return read_vortex(
         path,
         initial_read_size=options.get("initial_read_size"),
         segment_cache=options.get("segment_cache"),
     )
 
 
-async def read_stream(
+def read_stream(
     path: str,
     *,
     file_format: str,
@@ -200,9 +201,9 @@ async def read_stream(
     fmt = _normalize_format(file_format)
     options = options or {}
     if fmt == "parquet":
-        return await read_parquet_stream(path, batch_size=options.get("batch_size"))
+        return read_parquet_stream(path, batch_size=options.get("batch_size"))
     if fmt == "lance":
-        return await read_lance_stream(
+        return read_lance_stream(
             path,
             batch_size=options.get("batch_size"),
             columns=options.get("columns"),
@@ -212,14 +213,14 @@ async def read_stream(
             scan_in_order=options.get("scan_in_order"),
             io_buffer_size=options.get("io_buffer_size"),
         )
-    return await read_vortex_stream(
+    return read_vortex_stream(
         path,
         initial_read_size=options.get("initial_read_size"),
         segment_cache=options.get("segment_cache"),
     )
 
 
-async def write(
+def write(
     batch: pa.RecordBatch,
     path: str,
     *,
@@ -228,15 +229,15 @@ async def write(
 ) -> None:
     fmt = _normalize_format(file_format)
     if fmt == "parquet":
-        await write_parquet(batch, path, options=options)
+        write_parquet(batch, path, options=options)
         return
     if fmt == "lance":
-        await write_lance(batch, path, options=options)
+        write_lance(batch, path, options=options)
         return
-    await write_vortex(batch, path, options=options)
+    write_vortex(batch, path, options=options)
 
 
-async def write_stream(
+def write_stream(
     batches: Iterable[pa.RecordBatch],
     path: str,
     *,
@@ -245,12 +246,173 @@ async def write_stream(
 ) -> None:
     fmt = _normalize_format(file_format)
     if fmt == "parquet":
-        await write_parquet_stream(batches, path, options=options)
+        write_parquet_stream(batches, path, options=options)
         return
     if fmt == "lance":
-        await write_lance_stream(batches, path, options=options)
+        write_lance_stream(batches, path, options=options)
         return
-    await write_vortex_stream(batches, path, options=options)
+    write_vortex_stream(batches, path, options=options)
+
+
+async def read_parquet_async(path: str, *, batch_size: Optional[int] = None) -> pa.RecordBatch:
+    return await asyncio.to_thread(read_parquet, path, batch_size=batch_size)
+
+
+async def read_parquet_stream_async(
+    path: str, *, batch_size: Optional[int] = None
+) -> pa.ipc.RecordBatchStreamReader:
+    return await asyncio.to_thread(read_parquet_stream, path, batch_size=batch_size)
+
+
+async def write_parquet_async(
+    batch: pa.RecordBatch, path: str, *, options: Optional[dict] = None
+) -> None:
+    await asyncio.to_thread(write_parquet, batch, path, options=options)
+
+
+async def write_parquet_stream_async(
+    batches: Iterable[pa.RecordBatch], path: str, *, options: Optional[dict] = None
+) -> None:
+    await asyncio.to_thread(write_parquet_stream, batches, path, options=options)
+
+
+async def read_lance_async(
+    path: str,
+    *,
+    batch_size: Optional[int] = None,
+    columns: Optional[list[str]] = None,
+    filter: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    scan_in_order: Optional[bool] = None,
+    io_buffer_size: Optional[int] = None,
+) -> pa.RecordBatch:
+    return await asyncio.to_thread(
+        read_lance,
+        path,
+        batch_size=batch_size,
+        columns=columns,
+        filter=filter,
+        limit=limit,
+        offset=offset,
+        scan_in_order=scan_in_order,
+        io_buffer_size=io_buffer_size,
+    )
+
+
+async def read_lance_stream_async(
+    path: str,
+    *,
+    batch_size: Optional[int] = None,
+    columns: Optional[list[str]] = None,
+    filter: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    scan_in_order: Optional[bool] = None,
+    io_buffer_size: Optional[int] = None,
+) -> pa.ipc.RecordBatchStreamReader:
+    return await asyncio.to_thread(
+        read_lance_stream,
+        path,
+        batch_size=batch_size,
+        columns=columns,
+        filter=filter,
+        limit=limit,
+        offset=offset,
+        scan_in_order=scan_in_order,
+        io_buffer_size=io_buffer_size,
+    )
+
+
+async def write_lance_async(
+    batch: pa.RecordBatch, path: str, *, options: Optional[dict] = None
+) -> None:
+    await asyncio.to_thread(write_lance, batch, path, options=options)
+
+
+async def write_lance_stream_async(
+    batches: Iterable[pa.RecordBatch], path: str, *, options: Optional[dict] = None
+) -> None:
+    await asyncio.to_thread(write_lance_stream, batches, path, options=options)
+
+
+async def read_vortex_async(
+    path: str,
+    *,
+    initial_read_size: Optional[int] = None,
+    segment_cache: Optional[bool] = None,
+) -> pa.RecordBatch:
+    return await asyncio.to_thread(
+        read_vortex, path, initial_read_size=initial_read_size, segment_cache=segment_cache
+    )
+
+
+async def read_vortex_stream_async(
+    path: str,
+    *,
+    initial_read_size: Optional[int] = None,
+    segment_cache: Optional[bool] = None,
+) -> pa.ipc.RecordBatchStreamReader:
+    return await asyncio.to_thread(
+        read_vortex_stream,
+        path,
+        initial_read_size=initial_read_size,
+        segment_cache=segment_cache,
+    )
+
+
+async def write_vortex_async(
+    batch: pa.RecordBatch, path: str, *, options: Optional[dict] = None
+) -> None:
+    await asyncio.to_thread(write_vortex, batch, path, options=options)
+
+
+async def write_vortex_stream_async(
+    batches: Iterable[pa.RecordBatch], path: str, *, options: Optional[dict] = None
+) -> None:
+    await asyncio.to_thread(write_vortex_stream, batches, path, options=options)
+
+
+async def read_async(
+    path: str,
+    *,
+    file_format: str,
+    options: Optional[dict] = None,
+) -> pa.RecordBatch:
+    return await asyncio.to_thread(read, path, file_format=file_format, options=options)
+
+
+async def read_stream_async(
+    path: str,
+    *,
+    file_format: str,
+    options: Optional[dict] = None,
+) -> pa.ipc.RecordBatchStreamReader:
+    return await asyncio.to_thread(
+        read_stream, path, file_format=file_format, options=options
+    )
+
+
+async def write_async(
+    batch: pa.RecordBatch,
+    path: str,
+    *,
+    file_format: str,
+    options: Optional[dict] = None,
+) -> None:
+    await asyncio.to_thread(write, batch, path, file_format=file_format, options=options)
+
+
+async def write_stream_async(
+    batches: Iterable[pa.RecordBatch],
+    path: str,
+    *,
+    file_format: str,
+    options: Optional[dict] = None,
+) -> None:
+    await asyncio.to_thread(
+        write_stream, batches, path, file_format=file_format, options=options
+    )
 
 
 __all__ = [
@@ -258,4 +420,32 @@ __all__ = [
     "read_stream",
     "write",
     "write_stream",
+    "read_parquet",
+    "read_parquet_stream",
+    "write_parquet",
+    "write_parquet_stream",
+    "read_lance",
+    "read_lance_stream",
+    "write_lance",
+    "write_lance_stream",
+    "read_vortex",
+    "read_vortex_stream",
+    "write_vortex",
+    "write_vortex_stream",
+    "read_async",
+    "read_stream_async",
+    "write_async",
+    "write_stream_async",
+    "read_parquet_async",
+    "read_parquet_stream_async",
+    "write_parquet_async",
+    "write_parquet_stream_async",
+    "read_lance_async",
+    "read_lance_stream_async",
+    "write_lance_async",
+    "write_lance_stream_async",
+    "read_vortex_async",
+    "read_vortex_stream_async",
+    "write_vortex_async",
+    "write_vortex_stream_async",
 ]
