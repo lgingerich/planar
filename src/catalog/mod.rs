@@ -6,6 +6,7 @@ use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use sqlx::{Database, Pool, Row};
 
+use crate::storage::file_format;
 /// Database-specific configuration
 pub mod database;
 
@@ -163,6 +164,8 @@ pub struct FileSpec {
     pub file_size_bytes: i64,
     /// Optional partition values
     pub partition_values: Option<serde_json::Value>,
+    /// Optional format-specific options
+    pub format_options: Option<serde_json::Value>,
 }
 
 impl FileSpec {
@@ -180,6 +183,7 @@ impl FileSpec {
             record_count,
             file_size_bytes,
             partition_values: None,
+            format_options: None,
         }
     }
 
@@ -193,6 +197,20 @@ impl FileSpec {
     pub fn with_partition_values(mut self, values: serde_json::Value) -> Self {
         self.partition_values = Some(values);
         self
+    }
+
+    /// Set format-specific options from JSON
+    pub fn with_format_options(mut self, options: serde_json::Value) -> Self {
+        self.format_options = Some(options);
+        self
+    }
+
+    /// Set format-specific options from JSON with validation
+    pub fn with_format_options_checked(mut self, options: serde_json::Value) -> Result<Self> {
+        file_format::validate_format_options(&self.file_format, &options)
+            .map_err(|err| CatalogError::InvalidArgument(err.to_string()))?;
+        self.format_options = Some(options);
+        Ok(self)
     }
 }
 
@@ -822,7 +840,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         let file_rows = sqlx::query::<sqlx::Sqlite>(
             "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                    added_in_transaction_id, removed_in_transaction_id, partition_values
+                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
              FROM files
              WHERE table_uuid = ?1
                AND added_in_transaction_id <= ?2
@@ -846,6 +864,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let mut files = Vec::with_capacity(capacity);
         for row in file_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
+            let format_options: Option<String> = row.try_get("format_options")?;
             let file = schema::File {
                 file_uuid: uuid_from_row(&row, "file_uuid")?,
                 table_uuid: uuid_from_row(&row, "table_uuid")?,
@@ -856,6 +875,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                 added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
                 removed_in_transaction_id: uuid_from_row_optional(&row, "removed_in_transaction_id")?,
                 partition_values: parse_json_optional(partition_values)?,
+                format_options: parse_json_optional(format_options)?,
             };
             files.push(file);
         }
@@ -1034,6 +1054,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                         for f in chunk {
                             let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
                             let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                            let format_text = serialize_json_optional(f.format_options.as_ref())?;
                             row_data.push((
                                 file_uuid,
                                 f.file_format.clone(),
@@ -1041,20 +1062,21 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                                 f.record_count,
                                 f.file_size_bytes,
                                 partition_text,
+                                format_text,
                             ));
                         }
                         let row_placeholders: String = (0..row_data.len())
-                            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)")
+                            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?)")
                             .collect::<Vec<_>>()
                             .join(", ");
                         let sql = format!(
                             "INSERT INTO files (file_uuid, table_uuid, file_format, file_path, record_count,
-                                                 file_size_bytes, added_in_transaction_id, partition_values)
+                                                 file_size_bytes, added_in_transaction_id, partition_values, format_options)
                              VALUES {}",
                             row_placeholders
                         );
                         let mut query = sqlx::query::<sqlx::Sqlite>(&sql);
-                        for (file_uuid, format, path, rc, size, part) in &row_data {
+                        for (file_uuid, format, path, rc, size, part, format_opts) in &row_data {
                             query = query
                                 .bind(file_uuid.as_bytes().as_slice())
                                 .bind(table_uuid.as_bytes().as_slice())
@@ -1063,7 +1085,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                                 .bind(*rc)
                                 .bind(*size)
                                 .bind(transaction_id.as_bytes().as_slice())
-                                .bind(part.as_deref());
+                                .bind(part.as_deref())
+                                .bind(format_opts.as_deref());
                         }
                         query.execute(tx.as_mut()).await?;
                     }
@@ -1607,7 +1630,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         let file_rows = sqlx::query::<sqlx::Postgres>(
             "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                    added_in_transaction_id, removed_in_transaction_id, partition_values
+                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
              FROM files
              WHERE table_uuid = $1
                AND added_in_transaction_id <= $2
@@ -1631,6 +1654,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let mut files = Vec::with_capacity(capacity);
         for row in file_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
+            let format_options: Option<String> = row.try_get("format_options")?;
             let file = schema::File {
                 file_uuid: uuid_from_row(&row, "file_uuid")?,
                 table_uuid: uuid_from_row(&row, "table_uuid")?,
@@ -1641,6 +1665,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                 added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
                 removed_in_transaction_id: uuid_from_row_optional(&row, "removed_in_transaction_id")?,
                 partition_values: parse_json_optional(partition_values)?,
+                format_options: parse_json_optional(format_options)?,
             };
             files.push(file);
         }
@@ -1819,6 +1844,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                         for f in chunk {
                             let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
                             let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                            let format_text = serialize_json_optional(f.format_options.as_ref())?;
                             row_data.push((
                                 file_uuid,
                                 f.file_format.clone(),
@@ -1826,13 +1852,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                                 f.record_count,
                                 f.file_size_bytes,
                                 partition_text,
+                                format_text,
                             ));
                         }
                         let mut param = 1u32;
                         let row_placeholders: String = (0..row_data.len())
                             .map(|_| {
                                 let s = format!(
-                                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                                     param,
                                     param + 1,
                                     param + 2,
@@ -1840,21 +1867,22 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                                     param + 4,
                                     param + 5,
                                     param + 6,
-                                    param + 7
+                                    param + 7,
+                                    param + 8
                                 );
-                                param += 8;
+                                param += 9;
                                 s
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
                         let sql = format!(
                             "INSERT INTO files (file_uuid, table_uuid, file_format, file_path, record_count,
-                                                 file_size_bytes, added_in_transaction_id, partition_values)
+                                                 file_size_bytes, added_in_transaction_id, partition_values, format_options)
                              VALUES {}",
                             row_placeholders
                         );
                         let mut query = sqlx::query::<sqlx::Postgres>(&sql);
-                        for (file_uuid, format, path, rc, size, part) in &row_data {
+                        for (file_uuid, format, path, rc, size, part, format_opts) in &row_data {
                             query = query
                                 .bind(file_uuid.as_bytes().as_slice())
                                 .bind(table_uuid.as_bytes().as_slice())
@@ -1863,7 +1891,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                                 .bind(*rc)
                                 .bind(*size)
                                 .bind(transaction_id.as_bytes().as_slice())
-                                .bind(part.as_deref());
+                                .bind(part.as_deref())
+                                .bind(format_opts.as_deref());
                         }
                         query.execute(tx.as_mut()).await?;
                     }

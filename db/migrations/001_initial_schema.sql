@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS files (
     added_in_transaction_id BLOB NOT NULL,
     removed_in_transaction_id BLOB,
     partition_values TEXT,
+    format_options TEXT,
     FOREIGN KEY(table_uuid) REFERENCES tables(table_uuid),
     FOREIGN KEY(added_in_transaction_id) REFERENCES transactions(transaction_id),
     FOREIGN KEY(removed_in_transaction_id) REFERENCES transactions(transaction_id)

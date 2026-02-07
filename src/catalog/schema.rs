@@ -94,6 +94,8 @@ pub struct File {
     pub removed_in_transaction_id: Option<Uuid>,
     /// Partition values if partitioned
     pub partition_values: Option<serde_json::Value>,
+    /// Format-specific options for this file
+    pub format_options: Option<serde_json::Value>,
 }
 
 /// Table statistics at a transaction

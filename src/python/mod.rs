@@ -1,15 +1,31 @@
-use std::sync::Arc;
-
 use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow_array::RecordBatch;
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
+use futures::{stream, TryStreamExt};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
+use pyo3::types::PyBytes;
+use std::io::Cursor;
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::catalog::{
     Catalog, CatalogError as CoreCatalogError, ColumnSpec, CommitResult, FileSpec, SchemaSpec,
     TableDelta, TableHandle, TableIdent, TableView,
 };
+use crate::storage::{
+    file_format::lance::LanceReadOptions,
+    file_format::lance::parse_write_options as parse_lance_write_options,
+    file_format::parquet::{ParquetReadOptions, ParquetReader, ParquetWriter},
+    file_format::parquet::parse_write_options as parse_parquet_write_options,
+    file_format::vortex::{VortexReadOptions, VortexReader, VortexWriter},
+    file_format::vortex::parse_write_options as parse_vortex_write_options,
+    RecordBatchStream,
+};
+use crate::storage::{Reader, StorageError as CoreStorageError, Writer};
 
 create_exception!(planar, PlanarError, PyException);
 create_exception!(planar, CatalogError, PlanarError);
@@ -17,6 +33,10 @@ create_exception!(planar, StorageError, PlanarError);
 
 fn catalog_error_to_py(err: CoreCatalogError) -> PyErr {
     PyErr::new::<CatalogError, _>(err.to_string())
+}
+
+fn storage_error_to_py(err: crate::storage::StorageError) -> PyErr {
+    PyErr::new::<StorageError, _>(err.to_string())
 }
 
 fn py_to_json_value(value: &PyAny) -> PyResult<serde_json::Value> {
@@ -89,6 +109,33 @@ fn json_value_to_py(py: Python, value: &serde_json::Value) -> PyResult<PyObject>
             dict.into_py(py)
         }
     })
+}
+
+fn record_batches_to_ipc(batches: Vec<RecordBatch>) -> std::result::Result<Vec<u8>, CoreStorageError> {
+    let Some(first) = batches.first() else {
+        return Err(CoreStorageError::Unsupported(
+            "expected at least one RecordBatch".to_string(),
+        ));
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, first.schema().as_ref())?;
+        for batch in &batches {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+    }
+    Ok(buffer)
+}
+
+fn ipc_to_record_batches(data: &[u8]) -> std::result::Result<Vec<RecordBatch>, CoreStorageError> {
+    let mut reader = StreamReader::try_new(Cursor::new(data), None)?;
+    let mut batches = Vec::new();
+    while let Some(batch) = reader.next() {
+        batches.push(batch?);
+    }
+    Ok(batches)
 }
 
 fn time_unit_to_str(unit: &TimeUnit) -> &'static str {
@@ -820,6 +867,340 @@ fn commit_result_to_py(py: Python, result: &CommitResult) -> PyResult<PyObject> 
     Ok(dict.into_py(py))
 }
 
+fn batches_to_stream(batches: Vec<RecordBatch>) -> RecordBatchStream {
+    Box::pin(stream::iter(batches.into_iter().map(Ok)))
+}
+
+#[pyfunction]
+fn read_parquet_ipc(
+    py: Python,
+    path: String,
+    batch_size: Option<usize>,
+) -> PyResult<&PyAny> {
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let reader = ParquetReader::new();
+        let options = ParquetReadOptions {
+            batch_size,
+            ..ParquetReadOptions::default()
+        };
+        let batch = reader
+            .read_with_options(Path::new(&path), &options)
+            .await
+            .map_err(storage_error_to_py)?;
+        let bytes = record_batches_to_ipc(vec![batch]).map_err(storage_error_to_py)?;
+        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+    })
+}
+
+#[pyfunction]
+fn read_parquet_stream_ipc(
+    py: Python,
+    path: String,
+    batch_size: Option<usize>,
+) -> PyResult<&PyAny> {
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let reader = ParquetReader::new();
+        let options = ParquetReadOptions {
+            batch_size,
+            ..ParquetReadOptions::default()
+        };
+        let stream = reader
+            .read_stream(Path::new(&path), &options)
+            .await
+            .map_err(storage_error_to_py)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(storage_error_to_py)?;
+        let bytes = record_batches_to_ipc(batches).map_err(storage_error_to_py)?;
+        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+    })
+}
+
+#[pyfunction]
+fn write_parquet_ipc(
+    py: Python,
+    path: String,
+    data: &PyBytes,
+    options: Option<&PyAny>,
+) -> PyResult<&PyAny> {
+    let data = data.as_bytes().to_vec();
+    let options_value = match options {
+        Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
+        _ => None,
+    };
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
+        let Some(first) = batches.first() else {
+            return Err(storage_error_to_py(CoreStorageError::Unsupported(
+                "write_parquet requires at least one RecordBatch".to_string(),
+            )));
+        };
+        let writer = ParquetWriter::new();
+        let props = parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        writer
+            .write_with_options(first, Path::new(&path), &props)
+            .await
+            .map_err(storage_error_to_py)?;
+        Ok(Python::with_gil(|py| py.None()))
+    })
+}
+
+#[pyfunction]
+fn write_parquet_stream_ipc(
+    py: Python,
+    path: String,
+    data: &PyBytes,
+    options: Option<&PyAny>,
+) -> PyResult<&PyAny> {
+    let data = data.as_bytes().to_vec();
+    let options_value = match options {
+        Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
+        _ => None,
+    };
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
+        if batches.is_empty() {
+            return Err(storage_error_to_py(CoreStorageError::Unsupported(
+                "write_parquet_stream requires at least one RecordBatch".to_string(),
+            )));
+        }
+        let stream = batches_to_stream(batches);
+        let writer = ParquetWriter::new();
+        let props = parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        writer
+            .write_stream(stream, Path::new(&path), &props)
+            .await
+            .map_err(storage_error_to_py)?;
+        Ok(Python::with_gil(|py| py.None()))
+    })
+}
+
+#[pyfunction]
+fn read_lance_ipc(
+    py: Python,
+    path: String,
+    batch_size: Option<usize>,
+    columns: Option<Vec<String>>,
+    filter: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    scan_in_order: Option<bool>,
+    io_buffer_size: Option<u64>,
+) -> PyResult<&PyAny> {
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let reader = crate::storage::file_format::lance::LanceReader::new();
+        let options = LanceReadOptions {
+            batch_size,
+            columns,
+            filter,
+            limit,
+            offset,
+            scan_in_order,
+            io_buffer_size,
+        };
+        let batch = reader
+            .read_with_options(Path::new(&path), &options)
+            .await
+            .map_err(storage_error_to_py)?;
+        let bytes = record_batches_to_ipc(vec![batch]).map_err(storage_error_to_py)?;
+        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+    })
+}
+
+#[pyfunction]
+fn read_lance_stream_ipc(
+    py: Python,
+    path: String,
+    batch_size: Option<usize>,
+    columns: Option<Vec<String>>,
+    filter: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    scan_in_order: Option<bool>,
+    io_buffer_size: Option<u64>,
+) -> PyResult<&PyAny> {
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let reader = crate::storage::file_format::lance::LanceReader::new();
+        let options = LanceReadOptions {
+            batch_size,
+            columns,
+            filter,
+            limit,
+            offset,
+            scan_in_order,
+            io_buffer_size,
+        };
+        let stream = reader
+            .read_stream(Path::new(&path), &options)
+            .await
+            .map_err(storage_error_to_py)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(storage_error_to_py)?;
+        let bytes = record_batches_to_ipc(batches).map_err(storage_error_to_py)?;
+        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+    })
+}
+
+#[pyfunction]
+fn write_lance_ipc(
+    py: Python,
+    path: String,
+    data: &PyBytes,
+    options: Option<&PyAny>,
+) -> PyResult<&PyAny> {
+    let data = data.as_bytes().to_vec();
+    let options_value = match options {
+        Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
+        _ => None,
+    };
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
+        let Some(first) = batches.first() else {
+            return Err(storage_error_to_py(CoreStorageError::Unsupported(
+                "write_lance requires at least one RecordBatch".to_string(),
+            )));
+        };
+        let writer = crate::storage::file_format::lance::LanceWriter::new();
+        let params = parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        writer
+            .write_with_options(first, Path::new(&path), &params)
+            .await
+            .map_err(storage_error_to_py)?;
+        Ok(Python::with_gil(|py| py.None()))
+    })
+}
+
+#[pyfunction]
+fn write_lance_stream_ipc(
+    py: Python,
+    path: String,
+    data: &PyBytes,
+    options: Option<&PyAny>,
+) -> PyResult<&PyAny> {
+    let data = data.as_bytes().to_vec();
+    let options_value = match options {
+        Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
+        _ => None,
+    };
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
+        if batches.is_empty() {
+            return Err(storage_error_to_py(CoreStorageError::Unsupported(
+                "write_lance_stream requires at least one RecordBatch".to_string(),
+            )));
+        }
+        let stream = batches_to_stream(batches);
+        let writer = crate::storage::file_format::lance::LanceWriter::new();
+        let params = parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        writer
+            .write_stream(stream, Path::new(&path), &params)
+            .await
+            .map_err(storage_error_to_py)?;
+        Ok(Python::with_gil(|py| py.None()))
+    })
+}
+
+#[pyfunction]
+fn read_vortex_ipc(
+    py: Python,
+    path: String,
+    initial_read_size: Option<usize>,
+    segment_cache: Option<bool>,
+) -> PyResult<&PyAny> {
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let reader = VortexReader::new();
+        let options = VortexReadOptions {
+            initial_read_size,
+            segment_cache,
+        };
+        let batch = reader
+            .read_with_options(Path::new(&path), &options)
+            .await
+            .map_err(storage_error_to_py)?;
+        let bytes = record_batches_to_ipc(vec![batch]).map_err(storage_error_to_py)?;
+        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+    })
+}
+
+#[pyfunction]
+fn read_vortex_stream_ipc(
+    py: Python,
+    path: String,
+    initial_read_size: Option<usize>,
+    segment_cache: Option<bool>,
+) -> PyResult<&PyAny> {
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let reader = VortexReader::new();
+        let options = VortexReadOptions {
+            initial_read_size,
+            segment_cache,
+        };
+        let stream = reader
+            .read_stream(Path::new(&path), &options)
+            .await
+            .map_err(storage_error_to_py)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(storage_error_to_py)?;
+        let bytes = record_batches_to_ipc(batches).map_err(storage_error_to_py)?;
+        Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).into_py(py)))
+    })
+}
+
+#[pyfunction]
+fn write_vortex_ipc(
+    py: Python,
+    path: String,
+    data: &PyBytes,
+    options: Option<&PyAny>,
+) -> PyResult<&PyAny> {
+    let data = data.as_bytes().to_vec();
+    let options_value = match options {
+        Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
+        _ => None,
+    };
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
+        let Some(first) = batches.first() else {
+            return Err(storage_error_to_py(CoreStorageError::Unsupported(
+                "write_vortex requires at least one RecordBatch".to_string(),
+            )));
+        };
+        let writer = VortexWriter::new();
+        let opts = parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        writer
+            .write_with_options(first, Path::new(&path), &opts)
+            .await
+            .map_err(storage_error_to_py)?;
+        Ok(Python::with_gil(|py| py.None()))
+    })
+}
+
+#[pyfunction]
+fn write_vortex_stream_ipc(
+    py: Python,
+    path: String,
+    data: &PyBytes,
+    options: Option<&PyAny>,
+) -> PyResult<&PyAny> {
+    let data = data.as_bytes().to_vec();
+    let options_value = match options {
+        Some(value) if !value.is_none() => Some(py_to_json_value(value)?),
+        _ => None,
+    };
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        let batches = ipc_to_record_batches(&data).map_err(storage_error_to_py)?;
+        if batches.is_empty() {
+            return Err(storage_error_to_py(CoreStorageError::Unsupported(
+                "write_vortex_stream requires at least one RecordBatch".to_string(),
+            )));
+        }
+        let stream = batches_to_stream(batches);
+        let writer = VortexWriter::new();
+        let opts = parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        writer
+            .write_stream(stream, Path::new(&path), &opts)
+            .await
+            .map_err(storage_error_to_py)?;
+        Ok(Python::with_gil(|py| py.None()))
+    })
+}
+
 pub fn init_module(py: Python, module: &PyModule) -> PyResult<()> {
     pyo3_asyncio::tokio::init_multi_thread_once();
     module.add("PlanarError", py.get_type::<PlanarError>())?;
@@ -831,5 +1212,17 @@ pub fn init_module(py: Python, module: &PyModule) -> PyResult<()> {
     module.add_class::<PyFileSpec>()?;
     module.add_class::<PyCatalog>()?;
     module.add_class::<PyTableHandle>()?;
+    module.add_function(wrap_pyfunction!(read_parquet_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(read_parquet_stream_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(write_parquet_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(write_parquet_stream_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(read_lance_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(read_lance_stream_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(write_lance_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(write_lance_stream_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(read_vortex_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(read_vortex_stream_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(write_vortex_ipc, module)?)?;
+    module.add_function(wrap_pyfunction!(write_vortex_stream_ipc, module)?)?;
     Ok(())
 }

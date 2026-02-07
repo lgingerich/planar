@@ -6,15 +6,23 @@ pub mod error;
 pub mod file_format;
 
 use std::path::Path;
+use std::pin::Pin;
 use std::str::FromStr;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
+use futures::stream::Stream;
+use lance::dataset::WriteParams;
+use parquet::file::properties::WriterProperties;
+use vortex::file::VortexWriteOptions;
 
 pub use error::{Result, StorageError};
 
-use file_format::lance::{LanceReader, LanceWriter};
-use file_format::parquet::{ParquetReader, ParquetWriter};
-use file_format::vortex::{VortexReader, VortexWriter};
+use file_format::lance::{LanceReadOptions, LanceReader, LanceWriter};
+use file_format::parquet::{ParquetReadOptions, ParquetReader, ParquetWriter};
+use file_format::vortex::{VortexReadOptions, VortexReader, VortexWriter};
+
+/// Stream of Arrow RecordBatches
+pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
 
 /// Trait for reading file formats into Arrow RecordBatches
 #[async_trait]
@@ -28,6 +36,28 @@ pub trait Reader: Send + Sync {
 pub trait Writer: Send + Sync {
     /// Write a RecordBatch to a file
     async fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()>;
+}
+
+/// Format-specific read options for dispatch
+#[derive(Debug)]
+pub enum FormatReadOptions {
+    /// Parquet reader options
+    Parquet(ParquetReadOptions),
+    /// Lance reader options
+    Lance(LanceReadOptions),
+    /// Vortex reader options
+    Vortex(VortexReadOptions),
+}
+
+/// Format-specific write options for dispatch
+#[derive(Debug)]
+pub enum FormatWriteOptions {
+    /// Parquet writer properties
+    Parquet(WriterProperties),
+    /// Lance write parameters
+    Lance(WriteParams),
+    /// Vortex write options
+    Vortex(VortexWriteOptions),
 }
 
 /// Supported file formats
@@ -88,6 +118,50 @@ impl ReaderEnum {
             Format::Vortex => ReaderEnum::Vortex(VortexReader::new()),
         }
     }
+
+    /// Read a file with format-specific options
+    pub async fn read_with_options(
+        &self,
+        path: &Path,
+        options: &FormatReadOptions,
+    ) -> Result<RecordBatch> {
+        match (self, options) {
+            (ReaderEnum::Parquet(r), FormatReadOptions::Parquet(options)) => {
+                r.read_with_options(path, options).await
+            }
+            (ReaderEnum::Lance(r), FormatReadOptions::Lance(options)) => {
+                r.read_with_options(path, options).await
+            }
+            (ReaderEnum::Vortex(r), FormatReadOptions::Vortex(options)) => {
+                r.read_with_options(path, options).await
+            }
+            _ => Err(StorageError::Unsupported(
+                "read options do not match reader format".to_string(),
+            )),
+        }
+    }
+
+    /// Stream a file as RecordBatches with format-specific options
+    pub async fn read_stream(
+        &self,
+        path: &Path,
+        options: &FormatReadOptions,
+    ) -> Result<RecordBatchStream> {
+        match (self, options) {
+            (ReaderEnum::Parquet(r), FormatReadOptions::Parquet(options)) => {
+                r.read_stream(path, options).await
+            }
+            (ReaderEnum::Lance(r), FormatReadOptions::Lance(options)) => {
+                r.read_stream(path, options).await
+            }
+            (ReaderEnum::Vortex(r), FormatReadOptions::Vortex(options)) => {
+                r.read_stream(path, options).await
+            }
+            _ => Err(StorageError::Unsupported(
+                "read options do not match reader format".to_string(),
+            )),
+        }
+    }
 }
 
 impl FromStr for ReaderEnum {
@@ -128,6 +202,52 @@ impl WriterEnum {
             Format::Parquet => WriterEnum::Parquet(ParquetWriter::new()),
             Format::Lance => WriterEnum::Lance(LanceWriter::new()),
             Format::Vortex => WriterEnum::Vortex(VortexWriter::new()),
+        }
+    }
+
+    /// Write a RecordBatch with format-specific options
+    pub async fn write_with_options(
+        &self,
+        batch: &RecordBatch,
+        path: &Path,
+        options: &FormatWriteOptions,
+    ) -> Result<()> {
+        match (self, options) {
+            (WriterEnum::Parquet(w), FormatWriteOptions::Parquet(options)) => {
+                w.write_with_options(batch, path, options).await
+            }
+            (WriterEnum::Lance(w), FormatWriteOptions::Lance(options)) => {
+                w.write_with_options(batch, path, options).await
+            }
+            (WriterEnum::Vortex(w), FormatWriteOptions::Vortex(options)) => {
+                w.write_with_options(batch, path, options).await
+            }
+            _ => Err(StorageError::Unsupported(
+                "write options do not match writer format".to_string(),
+            )),
+        }
+    }
+
+    /// Write a stream of RecordBatches with format-specific options
+    pub async fn write_stream(
+        &self,
+        stream: RecordBatchStream,
+        path: &Path,
+        options: &FormatWriteOptions,
+    ) -> Result<()> {
+        match (self, options) {
+            (WriterEnum::Parquet(w), FormatWriteOptions::Parquet(options)) => {
+                w.write_stream(stream, path, options).await
+            }
+            (WriterEnum::Lance(w), FormatWriteOptions::Lance(options)) => {
+                w.write_stream(stream, path, options).await
+            }
+            (WriterEnum::Vortex(w), FormatWriteOptions::Vortex(options)) => {
+                w.write_stream(stream, path, options).await
+            }
+            _ => Err(StorageError::Unsupported(
+                "write options do not match writer format".to_string(),
+            )),
         }
     }
 }

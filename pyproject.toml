@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5"]
+build-backend = "maturin"
+
+[project]
+name = "planar"
+version = "0.1.0"
+description = "Transaction-based open table format"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pyarrow>=14.0.0"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "License :: Other/Proprietary License",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "planar._native"
+python-source = "python"
