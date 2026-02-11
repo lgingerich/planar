@@ -342,7 +342,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
     use futures::TryStreamExt;
+    use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
+    use parquet::file::reader::SerializedFileReader;
     use std::sync::Arc;
     use futures::stream;
     use crate::storage::StorageError;
@@ -433,5 +435,95 @@ mod tests {
             .await
             .expect_err("schema mismatch should error");
         assert!(err.to_string().contains("Schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn write_with_options_sets_created_by() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_parquet_created_by_{}.parquet",
+            uuid::Uuid::new_v4()
+        ));
+
+        let props = WriterProperties::builder()
+            .set_created_by("planar-test".to_string())
+            .build();
+        ParquetWriter::new()
+            .write_with_options(&batch, &path, &props)
+            .await
+            .expect("write parquet");
+
+        let file = std::fs::File::open(&path).expect("open parquet");
+        let reader = SerializedFileReader::new(file).expect("reader");
+        let created_by = reader
+            .metadata()
+            .file_metadata()
+            .created_by()
+            .unwrap_or_default();
+        assert_eq!(created_by, "planar-test");
+    }
+
+    #[tokio::test]
+    async fn write_stream_with_options_sets_created_by() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_parquet_stream_created_by_{}.parquet",
+            uuid::Uuid::new_v4()
+        ));
+
+        let props = WriterProperties::builder()
+            .set_created_by("planar-test-stream".to_string())
+            .build();
+        let stream = Box::pin(stream::iter(vec![Ok(batch)]));
+        ParquetWriter::new()
+            .write_stream(stream, &path, &props)
+            .await
+            .expect("write parquet stream");
+
+        let file = std::fs::File::open(&path).expect("open parquet");
+        let reader = SerializedFileReader::new(file).expect("reader");
+        let created_by = reader
+            .metadata()
+            .file_metadata()
+            .created_by()
+            .unwrap_or_default();
+        assert_eq!(created_by, "planar-test-stream");
+    }
+
+    #[tokio::test]
+    async fn write_with_options_sets_compression() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_parquet_compression_{}.parquet",
+            uuid::Uuid::new_v4()
+        ));
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::GZIP(Default::default()))
+            .build();
+        ParquetWriter::new()
+            .write_with_options(&batch, &path, &props)
+            .await
+            .expect("write parquet");
+
+        let file = std::fs::File::open(&path).expect("open parquet");
+        let reader = SerializedFileReader::new(file).expect("reader");
+        let column_meta = reader.metadata().row_group(0).column(0);
+        assert_eq!(
+            column_meta.compression(),
+            Compression::GZIP(Default::default())
+        );
     }
 }

@@ -359,6 +359,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use futures::stream;
+    use lance::dataset::{Dataset, WriteMode, WriteParams};
     use std::sync::Arc;
     use crate::storage::StorageError;
 
@@ -456,5 +457,106 @@ mod tests {
             .await
             .expect_err("schema mismatch should error");
         assert!(err.to_string().contains("Schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn write_with_options_append_mode_appends_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_lance_append_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        LanceWriter::new()
+            .write(&batch, &path)
+            .await
+            .expect("initial write");
+
+        let options = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        LanceWriter::new()
+            .write_with_options(&batch, &path, &options)
+            .await
+            .expect("append write");
+
+        let reader = LanceReader::new();
+        let read = reader
+            .read_with_options(&path, &LanceReadOptions::default())
+            .await
+            .expect("read");
+        assert_eq!(read.num_rows(), batch.num_rows() * 2);
+    }
+
+    #[tokio::test]
+    async fn write_stream_append_mode_appends_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_lance_stream_append_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        LanceWriter::new()
+            .write(&batch, &path)
+            .await
+            .expect("initial write");
+
+        let options = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let expected_rows = batch.num_rows() * 2;
+        let stream = Box::pin(stream::iter(vec![Ok(batch.clone())]));
+        LanceWriter::new()
+            .write_stream(stream, &path, &options)
+            .await
+            .expect("append stream write");
+
+        let reader = LanceReader::new();
+        let read = reader
+            .read_with_options(&path, &LanceReadOptions::default())
+            .await
+            .expect("read");
+        assert_eq!(read.num_rows(), expected_rows);
+    }
+
+    #[tokio::test]
+    async fn write_with_options_max_rows_per_file_splits_fragments() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_lance_max_rows_{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let options = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        LanceWriter::new()
+            .write_with_options(&batch, &path, &options)
+            .await
+            .expect("write with max_rows_per_file");
+
+        let uri = path.to_str().expect("path utf-8");
+        let dataset = Dataset::open(uri).await.expect("open dataset");
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() > 1,
+            "expected multiple fragments for max_rows_per_file=1, got {}",
+            fragments.len()
+        );
     }
 }

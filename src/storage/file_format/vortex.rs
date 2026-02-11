@@ -398,4 +398,141 @@ mod tests {
             .expect_err("dtype mismatch should error");
         assert!(err.to_string().contains("dtype mismatch"));
     }
+
+    #[tokio::test]
+    async fn write_with_options_round_trip() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_vortex_write_opts_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
+
+        let options = VortexWriteOptions::new(VortexSession::default()).exclude_dtype();
+        VortexWriter::new()
+            .write_with_options(&batch, &path, &options)
+            .await
+            .expect("write with options");
+
+        let reader = VortexReader::new();
+        let read = reader
+            .read_with_options(&path, &VortexReadOptions::default())
+            .await
+            .expect("read");
+
+        assert_eq!(read.num_columns(), batch.num_columns());
+        assert_eq!(read.num_rows(), batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn write_stream_with_options_round_trip() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("record batch");
+
+        let path = std::env::temp_dir().join(format!(
+            "planar_vortex_stream_write_opts_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
+
+        let options = VortexWriteOptions::new(VortexSession::default()).exclude_dtype();
+        let stream = Box::pin(stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]));
+        VortexWriter::new()
+            .write_stream(stream, &path, &options)
+            .await
+            .expect("write stream with options");
+
+        let reader = VortexReader::new();
+        let read = reader
+            .read_with_options(&path, &VortexReadOptions::default())
+            .await
+            .expect("read");
+
+        assert_eq!(read.num_columns(), batch.num_columns());
+        assert_eq!(read.num_rows(), batch.num_rows() * 2);
+    }
+
+    #[tokio::test]
+    async fn write_with_options_exclude_dtype_reduces_file_size() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int64, false),
+            Field::new("c2", DataType::Int64, false),
+            Field::new("c3", DataType::Int64, false),
+            Field::new("c4", DataType::Int64, false),
+            Field::new("c5", DataType::Int64, false),
+            Field::new("c6", DataType::Int64, false),
+            Field::new("c7", DataType::Int64, false),
+            Field::new("c8", DataType::Int64, false),
+        ]));
+        let base = Int64Array::from(vec![1, 2, 3, 4, 5]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(base.clone()),
+                Arc::new(base.clone()),
+                Arc::new(base.clone()),
+                Arc::new(base.clone()),
+                Arc::new(base.clone()),
+                Arc::new(base.clone()),
+                Arc::new(base.clone()),
+                Arc::new(base),
+            ],
+        )
+        .expect("record batch");
+
+        let path_default = std::env::temp_dir().join(format!(
+            "planar_vortex_default_dtype_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
+        let path_exclude = std::env::temp_dir().join(format!(
+            "planar_vortex_exclude_dtype_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
+
+        let default_opts = VortexWriteOptions::new(VortexSession::default());
+        VortexWriter::new()
+            .write_with_options(&batch, &path_default, &default_opts)
+            .await
+            .expect("write default");
+
+        let exclude_opts = VortexWriteOptions::new(VortexSession::default()).exclude_dtype();
+        VortexWriter::new()
+            .write_with_options(&batch, &path_exclude, &exclude_opts)
+            .await
+            .expect("write exclude_dtype");
+
+        let default_size = std::fs::metadata(&path_default)
+            .expect("default metadata")
+            .len();
+        let exclude_size = std::fs::metadata(&path_exclude)
+            .expect("exclude metadata")
+            .len();
+
+        assert!(
+            exclude_size < default_size,
+            "expected exclude_dtype to reduce size (default {}, exclude {})",
+            default_size,
+            exclude_size
+        );
+    }
 }
