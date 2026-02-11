@@ -71,13 +71,12 @@ impl ParquetReader {
         .await?;
         let builder = apply_read_options(builder, options);
 
+        let schema = builder.schema().clone();
         let stream = builder.build()?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
 
         match batches.len() {
-            0 => Err(StorageError::Parquet(ParquetError::General(
-                "empty parquet file".to_string(),
-            ))),
+            0 => Ok(RecordBatch::new_empty(schema)),
             1 => Ok(batches.into_iter().next().expect("length checked")),
             _ => {
                 let schema = batches[0].schema();

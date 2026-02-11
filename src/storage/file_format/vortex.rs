@@ -140,18 +140,13 @@ impl VortexWriter {
         &self,
         batch: &RecordBatch,
         path: &Path,
-        _options: &VortexWriteOptions,
+        options: &VortexWriteOptions,
     ) -> Result<()> {
         let vortex_array = ArrayRef::from_arrow(batch.clone(), false);
         let stream = vortex_array.to_array_stream();
 
         let mut file = tokio::fs::File::create(path).await?;
-        // VortexWriteOptions::write takes ownership, so we need to clone
-        // Reconstruct options if Clone is not available - for now, create new default
-        // This is a workaround - ideally VortexWriteOptions would implement Clone
-        let write_opts = VortexWriteOptions::new(VortexSession::default());
-        // Apply any options that were set (this is a simplified version)
-        // In practice, you'd want to preserve the options state
+        let write_opts = options.clone();
         let _summary = write_opts.write(&mut file, stream).await?;
 
         Ok(())
@@ -162,7 +157,7 @@ impl VortexWriter {
         &self,
         stream: RecordBatchStream,
         path: &Path,
-        _options: &VortexWriteOptions,
+        options: &VortexWriteOptions,
     ) -> Result<()> {
         let mut source = stream;
         let first = match source.next().await {
@@ -185,18 +180,16 @@ impl VortexWriter {
                 }
                 Ok(array)
             }
-            Err(err) => Err(map_storage_error(err)),
+            Err(err) => Err(VortexError::from(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                err,
+            ))),
         });
         let stream = futures::stream::once(async move { Ok(first_array) }).chain(rest);
         let array_stream = RecordBatchArrayStream::new(dtype, Box::pin(stream));
 
         let mut file = tokio::fs::File::create(path).await?;
-        // VortexWriteOptions::write takes ownership, so we need to clone
-        // Reconstruct options if Clone is not available - for now, create new default
-        // This is a workaround - ideally VortexWriteOptions would implement Clone
-        let write_opts = VortexWriteOptions::new(VortexSession::default());
-        // Apply any options that were set (this is a simplified version)
-        // In practice, you'd want to preserve the options state
+        let write_opts = options.clone();
         let _summary = write_opts.write(&mut file, array_stream).await?;
         Ok(())
     }
@@ -286,10 +279,6 @@ impl vortex::stream::ArrayStream for RecordBatchArrayStream {
     fn dtype(&self) -> &DType {
         &self.dtype
     }
-}
-
-fn map_storage_error(error: StorageError) -> VortexError {
-    VortexError::from(std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
 }
 
 fn vortex_dtype_mismatch_error(expected: &DType, actual: &DType) -> VortexError {
