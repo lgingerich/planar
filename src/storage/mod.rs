@@ -219,7 +219,7 @@ impl WriterEnum {
         &self,
         batch: &RecordBatch,
         path: &Path,
-        options: &FormatWriteOptions,
+        options: FormatWriteOptions,
     ) -> Result<()> {
         match (self, options) {
             (WriterEnum::Parquet(w), FormatWriteOptions::Parquet(options)) => {
@@ -242,7 +242,7 @@ impl WriterEnum {
         &self,
         stream: RecordBatchStream,
         path: &Path,
-        options: &FormatWriteOptions,
+        options: FormatWriteOptions,
     ) -> Result<()> {
         match (self, options) {
             (WriterEnum::Parquet(w), FormatWriteOptions::Parquet(options)) => {

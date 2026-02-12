@@ -131,7 +131,7 @@ impl LanceWriter {
         &self,
         batch: &RecordBatch,
         path: &Path,
-        options: &WriteParams,
+        options: WriteParams,
     ) -> Result<()> {
         let uri = path_to_utf8(path)?;
         let schema = batch.schema();
@@ -139,7 +139,7 @@ impl LanceWriter {
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
-        Dataset::write(reader, uri, Some(options.clone())).await?;
+        Dataset::write(reader, uri, Some(options)).await?;
         Ok(())
     }
 
@@ -148,7 +148,7 @@ impl LanceWriter {
         &self,
         mut stream: RecordBatchStream,
         path: &Path,
-        options: &WriteParams,
+        options: WriteParams,
     ) -> Result<()> {
         let uri = path_to_utf8(path)?;
         let first = match stream.next().await {
@@ -187,7 +187,7 @@ impl LanceWriter {
         });
 
         let reader = StreamRecordBatchReader::new(schema, first, rx);
-        let params = options.clone();
+        let params = options;
         let uri = uri.to_string();
         let handle = Handle::current();
 
@@ -279,7 +279,7 @@ fn parse_write_mode(value: &str) -> Result<WriteMode> {
 impl Writer for LanceWriter {
     /// Writes a RecordBatch with default options
     async fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()> {
-        self.write_with_options(batch, path, &WriteParams::default())
+        self.write_with_options(batch, path, WriteParams::default())
             .await
     }
 }
@@ -385,7 +385,7 @@ mod tests {
 
         let stream = Box::pin(stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]));
         LanceWriter::new()
-            .write_stream(stream, &path, &Default::default())
+            .write_stream(stream, &path, Default::default())
             .await
             .expect("write stream");
 
@@ -410,7 +410,7 @@ mod tests {
         ));
         let stream = Box::pin(stream::empty());
         let err = LanceWriter::new()
-            .write_stream(stream, &path, &Default::default())
+            .write_stream(stream, &path, Default::default())
             .await
             .expect_err("empty stream should error");
         assert!(err.to_string().contains("write_stream requires at least one RecordBatch"));
@@ -426,7 +426,7 @@ mod tests {
             "boom".to_string(),
         ))]));
         let err = LanceWriter::new()
-            .write_stream(stream, &path, &Default::default())
+            .write_stream(stream, &path, Default::default())
             .await
             .expect_err("stream error should surface");
         assert!(err.to_string().contains("boom"));
@@ -453,7 +453,7 @@ mod tests {
         ));
         let stream = Box::pin(stream::iter(vec![Ok(batch_a), Ok(batch_b)]));
         let err = LanceWriter::new()
-            .write_stream(stream, &path, &Default::default())
+            .write_stream(stream, &path, Default::default())
             .await
             .expect_err("schema mismatch should error");
         assert!(err.to_string().contains("Schema mismatch"));
@@ -481,7 +481,7 @@ mod tests {
             ..Default::default()
         };
         LanceWriter::new()
-            .write_with_options(&batch, &path, &options)
+            .write_with_options(&batch, &path, options)
             .await
             .expect("append write");
 
@@ -517,7 +517,7 @@ mod tests {
         let expected_rows = batch.num_rows() * 2;
         let stream = Box::pin(stream::iter(vec![Ok(batch.clone())]));
         LanceWriter::new()
-            .write_stream(stream, &path, &options)
+            .write_stream(stream, &path, options)
             .await
             .expect("append stream write");
 
@@ -546,7 +546,7 @@ mod tests {
             ..Default::default()
         };
         LanceWriter::new()
-            .write_with_options(&batch, &path, &options)
+            .write_with_options(&batch, &path, options)
             .await
             .expect("write with max_rows_per_file");
 

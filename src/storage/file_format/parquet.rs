@@ -14,7 +14,6 @@ use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::{AsyncArrowWriter, AsyncFileWriter};
 use parquet::basic::Compression;
-use parquet::errors::ParquetError;
 use parquet::file::properties::{BloomFilterPosition, WriterProperties, WriterPropertiesBuilder, WriterVersion};
 use serde_json::Value;
 use std::str::FromStr;
@@ -145,10 +144,14 @@ impl ParquetWriter {
         &self,
         batch: &RecordBatch,
         path: &Path,
-        options: &WriterProperties,
+        options: WriterProperties,
     ) -> Result<()> {
         let file = File::create(path).await?;
-        let mut writer = AsyncArrowWriter::try_new(TokioAsyncWriter::new(file), batch.schema(), Some(options.clone()))?;
+        let mut writer = AsyncArrowWriter::try_new(
+            TokioAsyncWriter::new(file),
+            batch.schema(),
+            Some(options),
+        )?;
         writer.write(batch).await?;
         writer.close().await?;
         Ok(())
@@ -159,7 +162,7 @@ impl ParquetWriter {
         &self,
         mut stream: RecordBatchStream,
         path: &Path,
-        options: &WriterProperties,
+        options: WriterProperties,
     ) -> Result<()> {
         let file = File::create(path).await?;
         let first = match stream.next().await {
@@ -174,7 +177,7 @@ impl ParquetWriter {
         let mut writer = AsyncArrowWriter::try_new(
             TokioAsyncWriter::new(file),
             expected_schema.clone(),
-            Some(options.clone()),
+            Some(options),
         )?;
 
         writer.write(&first).await?;
@@ -302,7 +305,7 @@ fn parse_bloom_filter_position(value: &str) -> Result<BloomFilterPosition> {
 #[async_trait]
 impl Writer for ParquetWriter {
     async fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()> {
-        self.write_with_options(batch, path, &WriterProperties::builder().build())
+        self.write_with_options(batch, path, WriterProperties::builder().build())
             .await
     }
 }
@@ -370,7 +373,7 @@ mod tests {
         ));
 
         ParquetWriter::new()
-            .write_with_options(&batch, &path, &WriterProperties::builder().build())
+            .write_with_options(&batch, &path, WriterProperties::builder().build())
             .await
             .expect("write parquet");
 
@@ -404,7 +407,7 @@ mod tests {
             "boom".to_string(),
         ))]));
         let err = ParquetWriter::new()
-            .write_stream(stream, &path, &WriterProperties::builder().build())
+            .write_stream(stream, &path, WriterProperties::builder().build())
             .await
             .expect_err("stream error should surface");
         assert!(err.to_string().contains("boom"));
@@ -431,7 +434,7 @@ mod tests {
         ));
         let stream = Box::pin(stream::iter(vec![Ok(batch_a), Ok(batch_b)]));
         let err = ParquetWriter::new()
-            .write_stream(stream, &path, &WriterProperties::builder().build())
+            .write_stream(stream, &path, WriterProperties::builder().build())
             .await
             .expect_err("schema mismatch should error");
         assert!(err.to_string().contains("Schema mismatch"));
@@ -453,7 +456,7 @@ mod tests {
             .set_created_by("planar-test".to_string())
             .build();
         ParquetWriter::new()
-            .write_with_options(&batch, &path, &props)
+            .write_with_options(&batch, &path, props)
             .await
             .expect("write parquet");
 
@@ -484,7 +487,7 @@ mod tests {
             .build();
         let stream = Box::pin(stream::iter(vec![Ok(batch)]));
         ParquetWriter::new()
-            .write_stream(stream, &path, &props)
+            .write_stream(stream, &path, props)
             .await
             .expect("write parquet stream");
 
@@ -514,7 +517,7 @@ mod tests {
             .set_compression(Compression::GZIP(Default::default()))
             .build();
         ParquetWriter::new()
-            .write_with_options(&batch, &path, &props)
+            .write_with_options(&batch, &path, props)
             .await
             .expect("write parquet");
 

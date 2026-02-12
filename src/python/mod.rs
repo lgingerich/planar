@@ -965,7 +965,7 @@ fn write_parquet_ipc(
         let writer = ParquetWriter::new();
         let props = parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
-            .write_with_options(first, Path::new(&path), &props)
+            .write_with_options(first, Path::new(&path), props)
             .await
             .map_err(storage_error_to_py)?;
         Ok(())
@@ -995,7 +995,7 @@ fn write_parquet_stream_ipc(
         let writer = ParquetWriter::new();
         let props = parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
-            .write_stream(stream, Path::new(&path), &props)
+            .write_stream(stream, Path::new(&path), props)
             .await
             .map_err(storage_error_to_py)?;
         Ok(())
@@ -1089,7 +1089,7 @@ fn write_lance_ipc(
         let writer = crate::storage::file_format::lance::LanceWriter::new();
         let params = parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
-            .write_with_options(first, Path::new(&path), &params)
+            .write_with_options(first, Path::new(&path), params)
             .await
             .map_err(storage_error_to_py)?;
         Ok(())
@@ -1119,7 +1119,7 @@ fn write_lance_stream_ipc(
         let writer = crate::storage::file_format::lance::LanceWriter::new();
         let params = parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
-            .write_stream(stream, Path::new(&path), &params)
+            .write_stream(stream, Path::new(&path), params)
             .await
             .map_err(storage_error_to_py)?;
         Ok(())
@@ -1193,7 +1193,7 @@ fn write_vortex_ipc(
         let writer = VortexWriter::new();
         let opts = parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
-            .write_with_options(first, Path::new(&path), &opts)
+            .write_with_options(first, Path::new(&path), opts)
             .await
             .map_err(storage_error_to_py)?;
         Ok(())
@@ -1223,7 +1223,7 @@ fn write_vortex_stream_ipc(
         let writer = VortexWriter::new();
         let opts = parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
-            .write_stream(stream, Path::new(&path), &opts)
+            .write_stream(stream, Path::new(&path), opts)
             .await
             .map_err(storage_error_to_py)?;
         Ok(())

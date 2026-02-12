@@ -140,14 +140,13 @@ impl VortexWriter {
         &self,
         batch: &RecordBatch,
         path: &Path,
-        options: &VortexWriteOptions,
+        options: VortexWriteOptions,
     ) -> Result<()> {
         let vortex_array = ArrayRef::from_arrow(batch.clone(), false);
         let stream = vortex_array.to_array_stream();
 
         let mut file = tokio::fs::File::create(path).await?;
-        let write_opts = options.clone();
-        let _summary = write_opts.write(&mut file, stream).await?;
+        let _summary = options.write(&mut file, stream).await?;
 
         Ok(())
     }
@@ -157,7 +156,7 @@ impl VortexWriter {
         &self,
         stream: RecordBatchStream,
         path: &Path,
-        options: &VortexWriteOptions,
+        options: VortexWriteOptions,
     ) -> Result<()> {
         let mut source = stream;
         let first = match source.next().await {
@@ -189,8 +188,7 @@ impl VortexWriter {
         let array_stream = RecordBatchArrayStream::new(dtype, Box::pin(stream));
 
         let mut file = tokio::fs::File::create(path).await?;
-        let write_opts = options.clone();
-        let _summary = write_opts.write(&mut file, array_stream).await?;
+        let _summary = options.write(&mut file, array_stream).await?;
         Ok(())
     }
 }
@@ -233,7 +231,7 @@ impl Writer for VortexWriter {
         self.write_with_options(
             batch,
             path,
-            &VortexWriteOptions::new(VortexSession::default()),
+            VortexWriteOptions::new(VortexSession::default()),
         )
         .await
     }
@@ -325,7 +323,7 @@ mod tests {
         let stream = Box::pin(stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]));
         let options = VortexWriteOptions::new(VortexSession::default());
         VortexWriter::new()
-            .write_stream(stream, &path, &options)
+            .write_stream(stream, &path, options)
             .await
             .expect("write stream");
 
@@ -348,7 +346,7 @@ mod tests {
         let stream = Box::pin(stream::empty());
         let options = VortexWriteOptions::new(VortexSession::default());
         let err = VortexWriter::new()
-            .write_stream(stream, &path, &options)
+            .write_stream(stream, &path, options)
             .await
             .expect_err("empty stream should error");
         assert!(err.to_string().contains("write_stream requires at least one RecordBatch"));
@@ -365,7 +363,7 @@ mod tests {
         ))]));
         let options = VortexWriteOptions::new(VortexSession::default());
         let err = VortexWriter::new()
-            .write_stream(stream, &path, &options)
+            .write_stream(stream, &path, options)
             .await
             .expect_err("stream error should surface");
         assert!(err.to_string().contains("boom"));
@@ -393,7 +391,7 @@ mod tests {
         let stream = Box::pin(stream::iter(vec![Ok(batch_a), Ok(batch_b)]));
         let options = VortexWriteOptions::new(VortexSession::default());
         let err = VortexWriter::new()
-            .write_stream(stream, &path, &options)
+            .write_stream(stream, &path, options)
             .await
             .expect_err("dtype mismatch should error");
         assert!(err.to_string().contains("dtype mismatch"));
@@ -421,7 +419,7 @@ mod tests {
 
         let options = VortexWriteOptions::new(VortexSession::default()).exclude_dtype();
         VortexWriter::new()
-            .write_with_options(&batch, &path, &options)
+            .write_with_options(&batch, &path, options)
             .await
             .expect("write with options");
 
@@ -458,7 +456,7 @@ mod tests {
         let options = VortexWriteOptions::new(VortexSession::default()).exclude_dtype();
         let stream = Box::pin(stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]));
         VortexWriter::new()
-            .write_stream(stream, &path, &options)
+            .write_stream(stream, &path, options)
             .await
             .expect("write stream with options");
 
@@ -511,13 +509,13 @@ mod tests {
 
         let default_opts = VortexWriteOptions::new(VortexSession::default());
         VortexWriter::new()
-            .write_with_options(&batch, &path_default, &default_opts)
+            .write_with_options(&batch, &path_default, default_opts)
             .await
             .expect("write default");
 
         let exclude_opts = VortexWriteOptions::new(VortexSession::default()).exclude_dtype();
         VortexWriter::new()
-            .write_with_options(&batch, &path_exclude, &exclude_opts)
+            .write_with_options(&batch, &path_exclude, exclude_opts)
             .await
             .expect("write exclude_dtype");
 
