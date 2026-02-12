@@ -1138,6 +1138,7 @@ fn read_vortex_ipc(
         let options = VortexReadOptions {
             initial_read_size,
             segment_cache,
+            dtype: None,
         };
         let batch = reader
             .read_with_options(Path::new(&path), &options)
@@ -1160,6 +1161,7 @@ fn read_vortex_stream_ipc(
         let options = VortexReadOptions {
             initial_read_size,
             segment_cache,
+            dtype: None,
         };
         let stream = reader
             .read_stream(Path::new(&path), &options)

@@ -42,6 +42,8 @@ pub struct VortexReadOptions {
     pub initial_read_size: Option<usize>,
     /// Optional segment cache toggle.
     pub segment_cache: Option<bool>,
+    /// Optional externally supplied dtype (required for files written with `exclude_dtype`).
+    pub dtype: Option<DType>,
 }
 
 impl VortexReader {
@@ -248,6 +250,9 @@ fn apply_read_options(options: &VortexReadOptions) -> VortexOpenOptions {
             open_options = open_options.without_segment_cache();
         }
     }
+    if let Some(dtype) = options.dtype.clone() {
+        open_options = open_options.with_dtype(dtype);
+    }
     open_options
 }
 
@@ -294,11 +299,14 @@ mod tests {
     use super::{VortexReadOptions, VortexReader, VortexWriter};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use crate::storage::StorageError;
     use futures::stream;
     use std::sync::Arc;
+    use vortex::ArrayRef;
+    use vortex::arrow::FromArrowArray;
     use vortex::file::VortexWriteOptions;
     use vortex::session::VortexSession;
-    use crate::storage::StorageError;
+    use vortex::VortexSessionDefault;
 
     #[tokio::test]
     async fn write_stream_round_trip() {
@@ -423,9 +431,13 @@ mod tests {
             .await
             .expect("write with options");
 
+        let read_options = VortexReadOptions {
+            dtype: Some(ArrayRef::from_arrow(batch.clone(), false).dtype().clone()),
+            ..VortexReadOptions::default()
+        };
         let reader = VortexReader::new();
         let read = reader
-            .read_with_options(&path, &VortexReadOptions::default())
+            .read_with_options(&path, &read_options)
             .await
             .expect("read");
 
@@ -460,9 +472,13 @@ mod tests {
             .await
             .expect("write stream with options");
 
+        let read_options = VortexReadOptions {
+            dtype: Some(ArrayRef::from_arrow(batch.clone(), false).dtype().clone()),
+            ..VortexReadOptions::default()
+        };
         let reader = VortexReader::new();
         let read = reader
-            .read_with_options(&path, &VortexReadOptions::default())
+            .read_with_options(&path, &read_options)
             .await
             .expect("read");
 

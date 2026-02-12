@@ -358,10 +358,10 @@ mod tests {
     use super::{LanceReadOptions, LanceReader, LanceWriter};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use crate::storage::{StorageError, Writer};
     use futures::stream;
     use lance::dataset::{Dataset, WriteMode, WriteParams};
     use std::sync::Arc;
-    use crate::storage::StorageError;
 
     #[tokio::test]
     async fn write_stream_round_trip() {

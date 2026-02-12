@@ -18,6 +18,7 @@ use planar::storage::file_format::{
 use planar::storage::RecordBatchStream;
 use vortex::file::VortexWriteOptions;
 use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let lance_path = out_dir.join("data.lance");
     LanceWriter::new()
-        .write_with_options(&batch, &lance_path, &Default::default())
+        .write_with_options(&batch, &lance_path, Default::default())
         .await?;
     println!("Wrote {}", lance_path.display());
 
@@ -51,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_compression(Compression::SNAPPY)
         .build();
     ParquetWriter::new()
-        .write_with_options(&batch, &parquet_path, &parquet_options)
+        .write_with_options(&batch, &parquet_path, parquet_options.clone())
         .await?;
     println!("Wrote {}", parquet_path.display());
 
@@ -59,14 +60,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream: RecordBatchStream =
         Box::pin(stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]));
     ParquetWriter::new()
-        .write_stream(stream, &parquet_stream_path, &parquet_options)
+        .write_stream(stream, &parquet_stream_path, parquet_options)
         .await?;
     println!("Wrote {}", parquet_stream_path.display());
 
     let vortex_path = out_dir.join("data.vortex");
     let vortex_options = VortexWriteOptions::new(VortexSession::default());
     VortexWriter::new()
-        .write_with_options(&batch, &vortex_path, &vortex_options)
+        .write_with_options(&batch, &vortex_path, vortex_options)
         .await?;
     println!("Wrote {}", vortex_path.display());
 

@@ -2,7 +2,7 @@ use planar::catalog::database;
 use sqlx::Sqlite;
 
 /// Test that all tables are created by migrations.
-#[sqlx::test(migrations = "db/migrations", pool_type = "sqlite")]
+#[sqlx::test(migrations = "db/migrations")]
 async fn test_schema_tables_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs (foreign keys, etc.)
     database::sqlite::configure_pool(&pool).await?;
@@ -37,7 +37,7 @@ async fn test_schema_tables_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::
 }
 
 /// Test that all indexes are created by migrations.
-#[sqlx::test(migrations = "db/migrations", pool_type = "sqlite")]
+#[sqlx::test(migrations = "db/migrations")]
 async fn test_schema_indexes_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs
     database::sqlite::configure_pool(&pool).await?;
@@ -71,7 +71,7 @@ async fn test_schema_indexes_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx:
 }
 
 /// Test that foreign keys are enforced when PRAGMA foreign_keys is enabled.
-#[sqlx::test(migrations = "db/migrations", pool_type = "sqlite")]
+#[sqlx::test(migrations = "db/migrations")]
 async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs - this is critical for foreign key enforcement
     database::sqlite::configure_pool(&pool).await?;
@@ -130,30 +130,108 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sq
 /// This test uses the database schema as the source of truth - if we can successfully
 /// query each table into its corresponding Rust struct, the struct matches the database.
 /// If types or column names don't match, sqlx will fail at runtime.
-#[sqlx::test(migrations = "db/migrations", pool_type = "sqlite")]
+#[sqlx::test(migrations = "db/migrations")]
 async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
-    use planar::catalog::schema;
+    use arrow::datatypes::DataType;
+    use planar::catalog::{
+        Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, schema,
+    };
+    use std::sync::Arc;
+    use uuid::Uuid;
 
     // Configure SQLite PRAGMAs
     database::sqlite::configure_pool(&pool).await?;
 
-    // Test that we can query each table into its corresponding Rust struct
-    // This verifies that column names and types match between SQL and Rust
+    // Seed one end-to-end table so decode checks run against real rows.
+    let catalog = Arc::new(SqlCatalog::new(pool.clone()));
+    let ident = TableIdent::new("test", "schema_sync");
+    let table = catalog
+        .clone()
+        .create_table(
+            ident.clone(),
+            "/tmp/schema_sync".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            Some(serde_json::json!({})),
+        )
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+    table
+        .append_file(FileSpec::new("parquet", "/tmp/schema_sync/part-0.parquet", 1, 128))
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let table_uuid: Uuid = sqlx::query_scalar(
+        "SELECT table_uuid FROM tables WHERE namespace = ?1 AND table_name = ?2 LIMIT 1",
+    )
+    .bind("test")
+    .bind("schema_sync")
+    .fetch_one(&pool)
+    .await?;
+
+    let transaction_id: Uuid = sqlx::query_scalar(
+        "SELECT transaction_id FROM transactions WHERE table_uuid = ?1 LIMIT 1",
+    )
+    .bind(table_uuid)
+    .fetch_one(&pool)
+    .await?;
+
+    let schema_uuid: Uuid = sqlx::query_scalar("SELECT schema_uuid FROM schemas WHERE table_uuid = ?1 LIMIT 1")
+        .bind(table_uuid)
+        .fetch_one(&pool)
+        .await?;
+
+    let file_uuid: Uuid = sqlx::query_scalar("SELECT file_uuid FROM files WHERE table_uuid = ?1 LIMIT 1")
+        .bind(table_uuid)
+        .fetch_one(&pool)
+        .await?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO table_stats
+            (table_uuid, transaction_id, record_count, file_size_bytes, file_count, last_updated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(table_uuid)
+    .bind(transaction_id)
+    .bind(1_i64)
+    .bind(128_i64)
+    .bind(1_i32)
+    .bind(chrono::Utc::now())
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO file_column_stats
+            (file_uuid, column_name, null_count, nan_count, min_value, max_value, distinct_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(file_uuid)
+    .bind("id")
+    .bind(0_i64)
+    .bind(0_i64)
+    .bind(Some(vec![1_u8]))
+    .bind(Some(vec![1_u8]))
+    .bind(Some(1_i64))
+    .execute(&pool)
+    .await?;
 
     // Test tables -> schema::Table
     let _ = sqlx::query_as::<_, schema::Table>(
         "SELECT table_uuid, table_name, namespace, location, 
                 current_schema_uuid, current_transaction_id, created_at, properties 
-         FROM tables LIMIT 0",
+         FROM tables
+         WHERE table_uuid = ?1",
     )
+    .bind(table_uuid)
     .fetch_optional(&pool)
     .await?;
 
     // Test transactions -> schema::Transaction
     let _ = sqlx::query_as::<_, schema::Transaction>(
         "SELECT transaction_id, table_uuid, transaction_timestamp, parent_transaction_id 
-         FROM transactions LIMIT 0",
+         FROM transactions
+         WHERE transaction_id = ?1",
     )
+    .bind(transaction_id)
     .fetch_optional(&pool)
     .await?;
 
@@ -162,26 +240,50 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
     let _ = sqlx::query(
         "SELECT schema_uuid, table_uuid, schema_version, 
                 valid_from_transaction_id, valid_to_transaction_id, created_at 
-         FROM schemas LIMIT 0",
+         FROM schemas
+         WHERE schema_uuid = ?1",
     )
+    .bind(schema_uuid)
     .fetch_optional(&pool)
     .await?;
 
-    // Test columns -> schema::Column
-    let _ = sqlx::query_as::<_, schema::Column>(
+    #[derive(sqlx::FromRow)]
+    struct ColumnRow {
+        column_uuid: Uuid,
+        schema_uuid: Uuid,
+        column_name: String,
+        column_type: Vec<u8>,
+        ordinal_position: i32,
+        is_nullable: bool,
+    }
+
+    // Test columns table shape and decode the encoded Arrow type payload.
+    let column = sqlx::query_as::<_, ColumnRow>(
         "SELECT column_uuid, schema_uuid, column_name, column_type, 
                 ordinal_position, is_nullable 
-         FROM columns LIMIT 0",
+         FROM columns
+         WHERE schema_uuid = ?1",
     )
-    .fetch_optional(&pool)
+    .bind(schema_uuid)
+    .fetch_one(&pool)
     .await?;
+    assert_eq!(column.schema_uuid, schema_uuid);
+    assert_eq!(column.column_name, "id");
+    assert_eq!(column.ordinal_position, 1);
+    assert!(!column.is_nullable);
+    assert!(!column.column_uuid.is_nil());
+    let decoded_type = planar::catalog::data_type::decode_data_type(&column.column_type)
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+    assert_eq!(decoded_type, DataType::Int64);
 
     // Test files -> schema::File
     let _ = sqlx::query_as::<_, schema::File>(
         "SELECT file_uuid, table_uuid, file_format, file_path, record_count, 
-                file_size_bytes, added_in_transaction_id, removed_in_transaction_id, partition_values 
-         FROM files LIMIT 0",
+                file_size_bytes, added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
+         FROM files
+         WHERE file_uuid = ?1",
     )
+    .bind(file_uuid)
     .fetch_optional(&pool)
     .await?;
 
@@ -189,8 +291,10 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
     let _ = sqlx::query_as::<_, schema::TableStats>(
         "SELECT table_uuid, transaction_id, record_count, 
                 file_size_bytes, file_count, last_updated 
-         FROM table_stats LIMIT 0",
+         FROM table_stats
+         WHERE table_uuid = ?1",
     )
+    .bind(table_uuid)
     .fetch_optional(&pool)
     .await?;
 
@@ -198,8 +302,10 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
     let _ = sqlx::query_as::<_, schema::FileColumnStats>(
         "SELECT file_uuid, column_name, null_count, nan_count, 
                 min_value, max_value, distinct_count 
-         FROM file_column_stats LIMIT 0",
+         FROM file_column_stats
+         WHERE file_uuid = ?1",
     )
+    .bind(file_uuid)
     .fetch_optional(&pool)
     .await?;
 

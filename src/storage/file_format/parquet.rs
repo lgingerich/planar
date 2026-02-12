@@ -343,14 +343,14 @@ mod tests {
     use super::{ParquetReadOptions, ParquetReader, ParquetWriter};
     use arrow::compute::concat_batches;
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use crate::storage::{Reader, StorageError};
     use futures::TryStreamExt;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
-    use parquet::file::reader::SerializedFileReader;
-    use std::sync::Arc;
     use futures::stream;
-    use crate::storage::StorageError;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn read_matches_stream_read() {
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(direct.num_rows(), streamed.num_rows());
         assert_eq!(direct.num_columns(), streamed.num_columns());
         for idx in 0..direct.num_columns() {
-            assert!(direct.column(idx).equals(streamed.column(idx).as_ref()));
+            assert_eq!(direct.column(idx).to_data(), streamed.column(idx).to_data());
         }
     }
 
