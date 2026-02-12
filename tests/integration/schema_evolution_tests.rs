@@ -44,7 +44,10 @@ async fn test_safe_type_widening() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify time travel still works - old schema at old transaction
     let view_at_old_txn = table.read_at(view_before.transaction_id).await?;
-    assert_eq!(view_at_old_txn.schema.columns[0].column_type, DataType::Int32);
+    assert_eq!(
+        view_at_old_txn.schema.columns[0].column_type,
+        DataType::Int32
+    );
     assert_eq!(view_at_old_txn.schema.schema_version, 1);
 
     Ok(())
@@ -57,8 +60,7 @@ async fn test_unsafe_type_narrowing_rejected() -> Result<(), Box<dyn std::error:
 
     // Create table with Int64 column
     let table_ident = TableIdent::new("test", "metrics");
-    let initial_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("value", DataType::Int64));
+    let initial_schema = SchemaSpec::new().with_column(ColumnSpec::new("value", DataType::Int64));
 
     let table = catalog
         .clone()
@@ -75,15 +77,20 @@ async fn test_unsafe_type_narrowing_rejected() -> Result<(), Box<dyn std::error:
     table.append_file(file).await?;
 
     // Attempt to narrow Int64 -> Int32 (unsafe)
-    let new_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("value", DataType::Int32));
+    let new_schema = SchemaSpec::new().with_column(ColumnSpec::new("value", DataType::Int32));
 
     let result = table.update_schema(new_schema).await;
     assert!(result.is_err(), "Int64 -> Int32 should be rejected");
-    
+
     let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.contains("cannot evolve"), "Error should mention evolution failure");
-    assert!(error_msg.contains("value"), "Error should mention column name");
+    assert!(
+        error_msg.contains("cannot evolve"),
+        "Error should mention evolution failure"
+    );
+    assert!(
+        error_msg.contains("value"),
+        "Error should mention column name"
+    );
 
     Ok(())
 }
@@ -96,11 +103,10 @@ async fn test_timestamp_precision_increase() -> Result<(), Box<dyn std::error::E
     let catalog = SqlCatalog::in_memory().await?;
 
     let table_ident = TableIdent::new("test", "events");
-    let initial_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-        ));
+    let initial_schema = SchemaSpec::new().with_column(ColumnSpec::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+    ));
 
     let table = catalog
         .clone()
@@ -113,14 +119,16 @@ async fn test_timestamp_precision_increase() -> Result<(), Box<dyn std::error::E
         .await?;
 
     // Evolve Millisecond -> Microsecond (safe)
-    let new_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        ));
+    let new_schema = SchemaSpec::new().with_column(ColumnSpec::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    ));
 
     let result = table.update_schema(new_schema).await;
-    assert!(result.is_ok(), "Timestamp precision increase should be allowed");
+    assert!(
+        result.is_ok(),
+        "Timestamp precision increase should be allowed"
+    );
 
     // Verify new precision
     let view = table.read().await?;
@@ -141,11 +149,10 @@ async fn test_timestamp_precision_decrease_rejected() -> Result<(), Box<dyn std:
     let catalog = SqlCatalog::in_memory().await?;
 
     let table_ident = TableIdent::new("test", "events");
-    let initial_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        ));
+    let initial_schema = SchemaSpec::new().with_column(ColumnSpec::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    ));
 
     let table = catalog
         .clone()
@@ -158,14 +165,16 @@ async fn test_timestamp_precision_decrease_rejected() -> Result<(), Box<dyn std:
         .await?;
 
     // Attempt to decrease precision Microsecond -> Millisecond (unsafe)
-    let new_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-        ));
+    let new_schema = SchemaSpec::new().with_column(ColumnSpec::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+    ));
 
     let result = table.update_schema(new_schema).await;
-    assert!(result.is_err(), "Timestamp precision decrease should be rejected");
+    assert!(
+        result.is_err(),
+        "Timestamp precision decrease should be rejected"
+    );
 
     Ok(())
 }
@@ -178,11 +187,10 @@ async fn test_timestamp_timezone_change_rejected() -> Result<(), Box<dyn std::er
     let catalog = SqlCatalog::in_memory().await?;
 
     let table_ident = TableIdent::new("test", "events");
-    let initial_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        ));
+    let initial_schema = SchemaSpec::new().with_column(ColumnSpec::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    ));
 
     let table = catalog
         .clone()
@@ -195,11 +203,10 @@ async fn test_timestamp_timezone_change_rejected() -> Result<(), Box<dyn std::er
         .await?;
 
     // Attempt to change timezone
-    let new_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
-        ));
+    let new_schema = SchemaSpec::new().with_column(ColumnSpec::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
+    ));
 
     let result = table.update_schema(new_schema).await;
     assert!(result.is_err(), "Timezone change should be rejected");
@@ -270,8 +277,11 @@ async fn test_making_column_non_nullable_rejected() -> Result<(), Box<dyn std::e
         .with_column(ColumnSpec::new("name", DataType::Utf8));
 
     let result = table.update_schema(new_schema).await;
-    assert!(result.is_err(), "Making nullable column non-nullable should be rejected");
-    
+    assert!(
+        result.is_err(),
+        "Making nullable column non-nullable should be rejected"
+    );
+
     let error_msg = result.unwrap_err().to_string();
     assert!(error_msg.contains("nullable") || error_msg.contains("non-nullable"));
 
@@ -284,8 +294,7 @@ async fn test_adding_new_columns() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = SqlCatalog::in_memory().await?;
 
     let table_ident = TableIdent::new("test", "users");
-    let initial_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("id", DataType::Int64));
+    let initial_schema = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64));
 
     let table = catalog
         .clone()
@@ -323,8 +332,7 @@ async fn test_incompatible_type_change_rejected() -> Result<(), Box<dyn std::err
     let catalog = SqlCatalog::in_memory().await?;
 
     let table_ident = TableIdent::new("test", "data");
-    let initial_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("value", DataType::Utf8));
+    let initial_schema = SchemaSpec::new().with_column(ColumnSpec::new("value", DataType::Utf8));
 
     let table = catalog
         .clone()
@@ -337,11 +345,13 @@ async fn test_incompatible_type_change_rejected() -> Result<(), Box<dyn std::err
         .await?;
 
     // Attempt to change Utf8 -> Int64 (incompatible)
-    let new_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("value", DataType::Int64));
+    let new_schema = SchemaSpec::new().with_column(ColumnSpec::new("value", DataType::Int64));
 
     let result = table.update_schema(new_schema).await;
-    assert!(result.is_err(), "Incompatible type change should be rejected");
+    assert!(
+        result.is_err(),
+        "Incompatible type change should be rejected"
+    );
 
     Ok(())
 }
@@ -352,8 +362,8 @@ async fn test_float_widening() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = SqlCatalog::in_memory().await?;
 
     let table_ident = TableIdent::new("test", "measurements");
-    let initial_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("temperature", DataType::Float32));
+    let initial_schema =
+        SchemaSpec::new().with_column(ColumnSpec::new("temperature", DataType::Float32));
 
     let table = catalog
         .clone()
@@ -366,8 +376,8 @@ async fn test_float_widening() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Evolve Float32 -> Float64 (safe)
-    let new_schema = SchemaSpec::new()
-        .with_column(ColumnSpec::new("temperature", DataType::Float64));
+    let new_schema =
+        SchemaSpec::new().with_column(ColumnSpec::new("temperature", DataType::Float64));
 
     let result = table.update_schema(new_schema).await;
     assert!(result.is_ok(), "Float32 -> Float64 should be allowed");
@@ -384,8 +394,7 @@ async fn test_multiple_schema_evolutions() -> Result<(), Box<dyn std::error::Err
     let catalog = SqlCatalog::in_memory().await?;
 
     let table_ident = TableIdent::new("test", "evolving");
-    let schema_v1 = SchemaSpec::new()
-        .with_column(ColumnSpec::new("id", DataType::Int8));
+    let schema_v1 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int8));
 
     let table = catalog
         .clone()
@@ -402,8 +411,7 @@ async fn test_multiple_schema_evolutions() -> Result<(), Box<dyn std::error::Err
     assert_eq!(v1.schema.columns[0].column_type, DataType::Int8);
 
     // Evolution 1: Int8 -> Int16
-    let schema_v2 = SchemaSpec::new()
-        .with_column(ColumnSpec::new("id", DataType::Int16));
+    let schema_v2 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int16));
     table.update_schema(schema_v2).await?;
 
     let v2 = table.read().await?;
@@ -411,8 +419,7 @@ async fn test_multiple_schema_evolutions() -> Result<(), Box<dyn std::error::Err
     assert_eq!(v2.schema.columns[0].column_type, DataType::Int16);
 
     // Evolution 2: Int16 -> Int32
-    let schema_v3 = SchemaSpec::new()
-        .with_column(ColumnSpec::new("id", DataType::Int32));
+    let schema_v3 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int32));
     table.update_schema(schema_v3).await?;
 
     let v3 = table.read().await?;
@@ -420,8 +427,7 @@ async fn test_multiple_schema_evolutions() -> Result<(), Box<dyn std::error::Err
     assert_eq!(v3.schema.columns[0].column_type, DataType::Int32);
 
     // Evolution 3: Int32 -> Int64
-    let schema_v4 = SchemaSpec::new()
-        .with_column(ColumnSpec::new("id", DataType::Int64));
+    let schema_v4 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64));
     table.update_schema(schema_v4).await?;
 
     let v4 = table.read().await?;

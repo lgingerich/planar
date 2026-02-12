@@ -1,10 +1,10 @@
 //! Parquet file format implementation
 //!
 //! Provides readers and writers for Apache Parquet files using Arrow RecordBatches.
-//! Use the trait methods for simple cases, or the `_with_options`/`_with_properties` 
+//! Use the trait methods for simple cases, or the `_with_options`/`_with_properties`
 //! methods for format-specific configuration like compression and encoding.
 
-use std::path::Path;
+use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,12 +14,14 @@ use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_writer::{AsyncArrowWriter, AsyncFileWriter};
 use parquet::basic::Compression;
-use parquet::file::properties::{BloomFilterPosition, WriterProperties, WriterPropertiesBuilder, WriterVersion};
+use parquet::file::properties::{
+    BloomFilterPosition, WriterProperties, WriterPropertiesBuilder, WriterVersion,
+};
 use serde_json::Value;
+use std::path::Path;
 use std::str::FromStr;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
 
 /// Parquet file reader
 ///
@@ -63,11 +65,9 @@ impl ParquetReader {
         options: &ParquetReadOptions,
     ) -> Result<RecordBatch> {
         let file = File::open(path).await?;
-        let builder = ParquetRecordBatchStreamBuilder::new_with_options(
-            file,
-            options.arrow_options.clone(),
-        )
-        .await?;
+        let builder =
+            ParquetRecordBatchStreamBuilder::new_with_options(file, options.arrow_options.clone())
+                .await?;
         let builder = apply_read_options(builder, options);
 
         let schema = builder.schema().clone();
@@ -91,11 +91,9 @@ impl ParquetReader {
         options: &ParquetReadOptions,
     ) -> Result<RecordBatchStream> {
         let file = File::open(path).await?;
-        let builder = ParquetRecordBatchStreamBuilder::new_with_options(
-            file,
-            options.arrow_options.clone(),
-        )
-        .await?;
+        let builder =
+            ParquetRecordBatchStreamBuilder::new_with_options(file, options.arrow_options.clone())
+                .await?;
         let builder = apply_read_options(builder, options);
 
         let stream = builder.build()?;
@@ -147,11 +145,8 @@ impl ParquetWriter {
         options: WriterProperties,
     ) -> Result<()> {
         let file = File::create(path).await?;
-        let mut writer = AsyncArrowWriter::try_new(
-            TokioAsyncWriter::new(file),
-            batch.schema(),
-            Some(options),
-        )?;
+        let mut writer =
+            AsyncArrowWriter::try_new(TokioAsyncWriter::new(file), batch.schema(), Some(options))?;
         writer.write(batch).await?;
         writer.close().await?;
         Ok(())
@@ -170,7 +165,7 @@ impl ParquetWriter {
             None => {
                 return Err(StorageError::Unsupported(
                     "write_stream requires at least one RecordBatch".to_string(),
-                ))
+                ));
             }
         };
         let expected_schema = first.schema();
@@ -211,9 +206,9 @@ pub fn parse_write_options(options: Option<&Value>) -> Result<WriterProperties> 
     for (key, value) in object {
         match key.as_str() {
             "compression" => {
-                let val = value
-                    .as_str()
-                    .ok_or_else(|| StorageError::Unsupported("compression must be a string".to_string()))?;
+                let val = value.as_str().ok_or_else(|| {
+                    StorageError::Unsupported("compression must be a string".to_string())
+                })?;
                 builder = builder.set_compression(parse_compression(val)?);
             }
             "max_row_group_size" => {
@@ -229,34 +224,34 @@ pub fn parse_write_options(options: Option<&Value>) -> Result<WriterProperties> 
                 builder = builder.set_write_batch_size(parse_usize(key, value)?);
             }
             "writer_version" => {
-                let val = value
-                    .as_str()
-                    .ok_or_else(|| StorageError::Unsupported("writer_version must be a string".to_string()))?;
+                let val = value.as_str().ok_or_else(|| {
+                    StorageError::Unsupported("writer_version must be a string".to_string())
+                })?;
                 builder = builder.set_writer_version(parse_writer_version(val)?);
             }
             "bloom_filter_position" => {
-                let val = value
-                    .as_str()
-                    .ok_or_else(|| StorageError::Unsupported("bloom_filter_position must be a string".to_string()))?;
+                let val = value.as_str().ok_or_else(|| {
+                    StorageError::Unsupported("bloom_filter_position must be a string".to_string())
+                })?;
                 builder = builder.set_bloom_filter_position(parse_bloom_filter_position(val)?);
             }
             "created_by" => {
-                let val = value
-                    .as_str()
-                    .ok_or_else(|| StorageError::Unsupported("created_by must be a string".to_string()))?;
+                let val = value.as_str().ok_or_else(|| {
+                    StorageError::Unsupported("created_by must be a string".to_string())
+                })?;
                 builder = builder.set_created_by(val.to_string());
             }
             "offset_index_disabled" => {
-                let val = value
-                    .as_bool()
-                    .ok_or_else(|| StorageError::Unsupported("offset_index_disabled must be a bool".to_string()))?;
+                let val = value.as_bool().ok_or_else(|| {
+                    StorageError::Unsupported("offset_index_disabled must be a bool".to_string())
+                })?;
                 builder = builder.set_offset_index_disabled(val);
             }
             _ => {
                 return Err(StorageError::Unsupported(format!(
                     "Unsupported option '{}' for format 'parquet'",
                     key
-                )))
+                )));
             }
         }
     }
@@ -287,8 +282,7 @@ fn parse_compression(value: &str) -> Result<Compression> {
 }
 
 fn parse_writer_version(value: &str) -> Result<WriterVersion> {
-    WriterVersion::from_str(value)
-        .map_err(|err| StorageError::Unsupported(err.to_string()))
+    WriterVersion::from_str(value).map_err(|err| StorageError::Unsupported(err.to_string()))
 }
 
 fn parse_bloom_filter_position(value: &str) -> Result<BloomFilterPosition> {
@@ -341,14 +335,14 @@ impl AsyncFileWriter for TokioAsyncWriter {
 #[cfg(test)]
 mod tests {
     use super::{ParquetReadOptions, ParquetReader, ParquetWriter};
+    use crate::storage::{Reader, StorageError};
     use arrow::compute::concat_batches;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use crate::storage::{Reader, StorageError};
     use futures::TryStreamExt;
+    use futures::stream;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
-    use futures::stream;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
 
@@ -417,11 +411,9 @@ mod tests {
     async fn write_stream_schema_mismatch_is_error() {
         let schema_a = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let schema_b = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let batch_a = RecordBatch::try_new(
-            schema_a,
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .expect("batch a");
+        let batch_a =
+            RecordBatch::try_new(schema_a, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("batch a");
         let batch_b = RecordBatch::try_new(
             schema_b,
             vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
@@ -443,9 +435,11 @@ mod tests {
     #[tokio::test]
     async fn write_with_options_sets_created_by() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
-                .expect("record batch");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("record batch");
 
         let path = std::env::temp_dir().join(format!(
             "planar_parquet_created_by_{}.parquet",
@@ -473,9 +467,11 @@ mod tests {
     #[tokio::test]
     async fn write_stream_with_options_sets_created_by() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
-                .expect("record batch");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("record batch");
 
         let path = std::env::temp_dir().join(format!(
             "planar_parquet_stream_created_by_{}.parquet",
@@ -504,9 +500,11 @@ mod tests {
     #[tokio::test]
     async fn write_with_options_sets_compression() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
-                .expect("record batch");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("record batch");
 
         let path = std::env::temp_dir().join(format!(
             "planar_parquet_compression_{}.parquet",

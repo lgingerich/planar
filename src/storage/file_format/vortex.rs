@@ -8,24 +8,24 @@
 //! Use [`read_with_options`](VortexReader::read_with_options) and
 //! [`write_with_options`](VortexWriter::write_with_options) for format-specific configuration.
 
-use std::path::Path;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
+use serde_json::Value;
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use vortex::ArrayRef;
+use vortex::VortexSessionDefault;
 use vortex::arrow::FromArrowArray;
 use vortex::dtype::DType;
 use vortex::error::VortexError;
-use vortex::stream::ArrayStreamExt;
-use vortex::ArrayRef;
-use vortex::file::{VortexOpenOptions, OpenOptionsSessionExt, VortexWriteOptions};
+use vortex::file::{OpenOptionsSessionExt, VortexOpenOptions, VortexWriteOptions};
 use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
-use serde_json::Value;
+use vortex::stream::ArrayStreamExt;
 
-use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
 use crate::storage::file_format::path_to_utf8;
+use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
 
 /// Vortex file reader
 ///
@@ -96,16 +96,18 @@ impl VortexReader {
         let path_str = path_to_utf8(path)?;
         let open_options = apply_read_options(options);
 
-        let stream = ArrayStreamExt::boxed(open_options
-            .open(path_str)
-            .await?
-            .scan()?
-            .into_array_stream()?);
+        let stream = ArrayStreamExt::boxed(
+            open_options
+                .open(path_str)
+                .await?
+                .scan()?
+                .into_array_stream()?,
+        );
 
         let stream = stream.map(|result: std::result::Result<ArrayRef, VortexError>| {
-            result
-                .map_err(Into::into)
-                .and_then(|array: ArrayRef| RecordBatch::try_from(array.as_ref()).map_err(Into::into))
+            result.map_err(Into::into).and_then(|array: ArrayRef| {
+                RecordBatch::try_from(array.as_ref()).map_err(Into::into)
+            })
         });
 
         Ok(Box::pin(stream))
@@ -166,7 +168,7 @@ impl VortexWriter {
             None => {
                 return Err(StorageError::Unsupported(
                     "write_stream requires at least one RecordBatch".to_string(),
-                ))
+                ));
             }
         };
         let first_array = ArrayRef::from_arrow(first, false);
@@ -208,9 +210,9 @@ pub fn parse_write_options(options: Option<&Value>) -> Result<VortexWriteOptions
     for (key, value) in object {
         match key.as_str() {
             "exclude_dtype" => {
-                let val = value
-                    .as_bool()
-                    .ok_or_else(|| StorageError::Unsupported("exclude_dtype must be a bool".to_string()))?;
+                let val = value.as_bool().ok_or_else(|| {
+                    StorageError::Unsupported("exclude_dtype must be a bool".to_string())
+                })?;
                 if val {
                     parsed = parsed.exclude_dtype();
                 }
@@ -219,7 +221,7 @@ pub fn parse_write_options(options: Option<&Value>) -> Result<VortexWriteOptions
                 return Err(StorageError::Unsupported(format!(
                     "Unsupported option '{}' for format 'vortex'",
                     key
-                )))
+                )));
             }
         }
     }
@@ -297,16 +299,16 @@ fn vortex_dtype_mismatch_error(expected: &DType, actual: &DType) -> VortexError 
 #[cfg(test)]
 mod tests {
     use super::{VortexReadOptions, VortexReader, VortexWriter};
+    use crate::storage::StorageError;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use crate::storage::StorageError;
     use futures::stream;
     use std::sync::Arc;
     use vortex::ArrayRef;
+    use vortex::VortexSessionDefault;
     use vortex::arrow::FromArrowArray;
     use vortex::file::VortexWriteOptions;
     use vortex::session::VortexSession;
-    use vortex::VortexSessionDefault;
 
     #[tokio::test]
     async fn write_stream_round_trip() {
@@ -357,15 +359,16 @@ mod tests {
             .write_stream(stream, &path, options)
             .await
             .expect_err("empty stream should error");
-        assert!(err.to_string().contains("write_stream requires at least one RecordBatch"));
+        assert!(
+            err.to_string()
+                .contains("write_stream requires at least one RecordBatch")
+        );
     }
 
     #[tokio::test]
     async fn write_stream_propagates_stream_error() {
-        let path = std::env::temp_dir().join(format!(
-            "planar_vortex_err_{}.vortex",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("planar_vortex_err_{}.vortex", uuid::Uuid::new_v4()));
         let stream = Box::pin(stream::iter(vec![Err(StorageError::Unsupported(
             "boom".to_string(),
         ))]));
@@ -381,11 +384,9 @@ mod tests {
     async fn write_stream_dtype_mismatch_is_error() {
         let schema_a = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let schema_b = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let batch_a = RecordBatch::try_new(
-            schema_a,
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .expect("batch a");
+        let batch_a =
+            RecordBatch::try_new(schema_a, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .expect("batch a");
         let batch_b = RecordBatch::try_new(
             schema_b,
             vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],

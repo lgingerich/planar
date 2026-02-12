@@ -25,7 +25,7 @@ pub use error::{CatalogError, Result};
 /// Transaction identifier
 pub type TxnId = uuid::Uuid;
 
-/// Table identifier consisting of namespace and name
+/// Logical table identifier as `{namespace}.{name}`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableIdent {
     /// Table namespace
@@ -44,7 +44,7 @@ impl TableIdent {
     }
 }
 
-/// Snapshot of a table at a specific transaction
+/// Immutable table snapshot at a specific transaction.
 #[derive(Debug, Clone)]
 pub struct TableView {
     /// Table identifier
@@ -63,7 +63,7 @@ pub struct TableView {
     pub stats: Option<schema::TableStats>,
 }
 
-/// Difference between two table versions
+/// Difference between two table snapshots.
 #[derive(Debug, Clone)]
 pub struct TableDelta {
     /// Starting transaction ID
@@ -80,7 +80,7 @@ pub struct TableDelta {
     pub new_properties: Option<serde_json::Value>,
 }
 
-/// Result of committing a mutation
+/// Result returned by a successful commit.
 #[derive(Debug, Clone)]
 pub struct CommitResult {
     /// Transaction ID of the commit
@@ -117,7 +117,7 @@ impl ColumnSpec {
     }
 }
 
-/// Schema specification for table creation
+/// Schema specification used when creating or evolving a table.
 #[derive(Debug, Clone)]
 pub struct SchemaSpec {
     /// Column specifications
@@ -127,7 +127,9 @@ pub struct SchemaSpec {
 impl SchemaSpec {
     /// Create an empty schema specification
     pub fn new() -> Self {
-        Self { columns: Vec::new() }
+        Self {
+            columns: Vec::new(),
+        }
     }
 
     /// Add a column to the schema
@@ -149,7 +151,7 @@ impl Default for SchemaSpec {
     }
 }
 
-/// File specification for mutations
+/// File metadata supplied by mutation operations.
 #[derive(Debug, Clone)]
 pub struct FileSpec {
     /// Optional file UUID (generated if not provided)
@@ -214,7 +216,7 @@ impl FileSpec {
     }
 }
 
-/// Mutation operation type
+/// Atomic table mutation operation.
 #[derive(Debug, Clone)]
 pub enum MutationOp {
     /// Append files to the table
@@ -229,14 +231,14 @@ pub enum MutationOp {
     RemoveProperties(Vec<String>),
 }
 
-/// Collection of mutation operations to apply atomically
+/// Collection of operations applied atomically in one commit.
 #[derive(Debug, Clone, Default)]
 pub struct Mutation {
     /// Operations to apply
     pub operations: Vec<MutationOp>,
 }
 
-/// Builder for constructing table mutations
+/// Builder for constructing and committing table mutations.
 pub struct MutationBuilder {
     /// Catalog instance for committing mutations
     catalog: Arc<dyn Catalog>,
@@ -261,13 +263,17 @@ impl MutationBuilder {
 
     /// Append multiple files to the table
     pub fn append_files(mut self, files: Vec<FileSpec>) -> Self {
-        self.mutation.operations.push(MutationOp::AppendFiles(files));
+        self.mutation
+            .operations
+            .push(MutationOp::AppendFiles(files));
         self
     }
 
     /// Append a single file to the table
     pub fn append_file(mut self, file: FileSpec) -> Self {
-        self.mutation.operations.push(MutationOp::AppendFiles(vec![file]));
+        self.mutation
+            .operations
+            .push(MutationOp::AppendFiles(vec![file]));
         self
     }
 
@@ -281,7 +287,9 @@ impl MutationBuilder {
 
     /// Update the table schema
     pub fn update_schema(mut self, schema: SchemaSpec) -> Self {
-        self.mutation.operations.push(MutationOp::UpdateSchema(schema));
+        self.mutation
+            .operations
+            .push(MutationOp::UpdateSchema(schema));
         self
     }
 
@@ -342,13 +350,21 @@ impl TableHandle {
     }
 
     /// Compute the difference between two transaction versions
-    pub async fn diff(&self, from_transaction_id: TxnId, to_transaction_id: TxnId) -> Result<TableDelta> {
+    pub async fn diff(
+        &self,
+        from_transaction_id: TxnId,
+        to_transaction_id: TxnId,
+    ) -> Result<TableDelta> {
         self.catalog
             .diff_table(&self.ident, from_transaction_id, to_transaction_id)
             .await
     }
 
-    /// Get a mutation builder. If `base_transaction_id` is `None`, uses the current transaction ID.
+    /// Creates a mutation builder pinned to a base transaction.
+    ///
+    /// If `base_transaction_id` is `None`, the current table transaction is used.
+    /// Commits will fail with [`CatalogError::Conflict`] when the table advances
+    /// before commit.
     pub async fn write(&self, base_transaction_id: Option<TxnId>) -> Result<MutationBuilder> {
         let txn_id = match base_transaction_id {
             Some(id) => id,
@@ -357,25 +373,21 @@ impl TableHandle {
                 view.transaction_id
             }
         };
-        Ok(MutationBuilder::new(self.catalog.clone(), self.ident.clone(), txn_id))
+        Ok(MutationBuilder::new(
+            self.catalog.clone(),
+            self.ident.clone(),
+            txn_id,
+        ))
     }
 
     /// Append a single file using the current transaction ID
     pub async fn append_file(&self, file: FileSpec) -> Result<CommitResult> {
-        self.write(None)
-            .await?
-            .append_file(file)
-            .commit()
-            .await
+        self.write(None).await?.append_file(file).commit().await
     }
 
     /// Append multiple files using the current transaction ID
     pub async fn append_files(&self, files: Vec<FileSpec>) -> Result<CommitResult> {
-        self.write(None)
-            .await?
-            .append_files(files)
-            .commit()
-            .await
+        self.write(None).await?.append_files(files).commit().await
     }
 
     /// Delete files using the current transaction ID
@@ -389,11 +401,7 @@ impl TableHandle {
 
     /// Update schema using the current transaction ID
     pub async fn update_schema(&self, schema: SchemaSpec) -> Result<CommitResult> {
-        self.write(None)
-            .await?
-            .update_schema(schema)
-            .commit()
-            .await
+        self.write(None).await?.update_schema(schema).commit().await
     }
 
     /// Set properties using the current transaction ID
@@ -406,10 +414,10 @@ impl TableHandle {
     }
 }
 
-/// Catalog trait for managing table metadata
+/// Transactional catalog API for table metadata.
 #[async_trait]
 pub trait Catalog: Send + Sync {
-    /// Create a new table
+    /// Creates a table and returns an attached [`TableHandle`].
     async fn create_table(
         self: Arc<Self>,
         ident: TableIdent,
@@ -418,20 +426,23 @@ pub trait Catalog: Send + Sync {
         properties: Option<serde_json::Value>,
     ) -> Result<TableHandle>;
 
-    /// Load a table handle if it exists
+    /// Loads a table handle if the table exists.
     async fn load_table(self: Arc<Self>, ident: TableIdent) -> Result<Option<TableHandle>>;
 
-    /// List tables, optionally filtered by namespace
+    /// Lists tables, optionally filtered by namespace.
     async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>>;
 
-    /// Drop a table
+    /// Drops a table and its metadata.
     async fn drop_table(&self, ident: &TableIdent) -> Result<()>;
 
-    /// Read a table view at a specific transaction (or current if None)
-    async fn read_table(&self, ident: &TableIdent, at_transaction_id: Option<TxnId>)
-        -> Result<TableView>;
+    /// Reads a table snapshot at a transaction (or current when `None`).
+    async fn read_table(
+        &self,
+        ident: &TableIdent,
+        at_transaction_id: Option<TxnId>,
+    ) -> Result<TableView>;
 
-    /// Compute the difference between two transaction versions
+    /// Computes metadata delta between two transactions.
     async fn diff_table(
         &self,
         ident: &TableIdent,
@@ -439,7 +450,10 @@ pub trait Catalog: Send + Sync {
         to_transaction_id: TxnId,
     ) -> Result<TableDelta>;
 
-    /// Commit a mutation to a table
+    /// Commits a mutation using optimistic concurrency control.
+    ///
+    /// Implementations should reject commits when `base_transaction_id` does not
+    /// match the current table transaction.
     async fn commit(
         &self,
         ident: &TableIdent,
@@ -473,7 +487,6 @@ where
         migrator.run(&self.pool).await?;
         Ok(())
     }
-
 }
 
 impl SqlCatalog<sqlx::Sqlite> {
@@ -497,7 +510,6 @@ impl SqlCatalog<sqlx::Sqlite> {
     }
 
     /// Create an in-memory SQLite catalog
-    /// This is a convenience method for testing and examples
     pub async fn in_memory() -> std::result::Result<Arc<Self>, sqlx::Error> {
         Self::from_connection_string("sqlite::memory:").await
     }
@@ -689,12 +701,10 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query::<sqlx::Sqlite>(
-                "SELECT namespace, table_name FROM tables LIMIT ?1",
-            )
-            .bind(limits::MAX_TABLES_PER_LIST as i64)
-            .fetch_all(&self.pool)
-            .await?
+            sqlx::query::<sqlx::Sqlite>("SELECT namespace, table_name FROM tables LIMIT ?1")
+                .bind(limits::MAX_TABLES_PER_LIST as i64)
+                .fetch_all(&self.pool)
+                .await?
         };
 
         if rows.len() as u32 >= limits::MAX_TABLES_PER_LIST {
@@ -716,12 +726,14 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
     }
 
     async fn drop_table(&self, ident: &TableIdent) -> Result<()> {
-        let affected = sqlx::query::<sqlx::Sqlite>("DELETE FROM tables WHERE namespace = ?1 AND table_name = ?2")
-            .bind(ident.namespace.as_str())
-            .bind(ident.name.as_str())
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        let affected = sqlx::query::<sqlx::Sqlite>(
+            "DELETE FROM tables WHERE namespace = ?1 AND table_name = ?2",
+        )
+        .bind(ident.namespace.as_str())
+        .bind(ident.name.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
 
         if affected == 0 {
             return Err(CatalogError::NotFound(format!(
@@ -753,7 +765,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                 return Err(CatalogError::NotFound(format!(
                     "{}.{}",
                     ident.namespace, ident.name
-                )))
+                )));
             }
         };
 
@@ -816,7 +828,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         for row in column_rows {
             let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
             let column_type = decode_data_type(&column_type_bytes)?;
-            
+
             let column = schema::Column {
                 column_uuid: uuid_from_row(&row, "column_uuid")?,
                 schema_uuid: uuid_from_row(&row, "schema_uuid")?,
@@ -833,7 +845,10 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             table_uuid: uuid_from_row(&schema_row, "table_uuid")?,
             schema_version: schema_row.try_get("schema_version")?,
             valid_from_transaction_id: uuid_from_row(&schema_row, "valid_from_transaction_id")?,
-            valid_to_transaction_id: uuid_from_row_optional(&schema_row, "valid_to_transaction_id")?,
+            valid_to_transaction_id: uuid_from_row_optional(
+                &schema_row,
+                "valid_to_transaction_id",
+            )?,
             created_at: schema_row.try_get("created_at")?,
             columns,
         };
@@ -873,7 +888,10 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                 record_count: row.try_get("record_count")?,
                 file_size_bytes: row.try_get("file_size_bytes")?,
                 added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
-                removed_in_transaction_id: uuid_from_row_optional(&row, "removed_in_transaction_id")?,
+                removed_in_transaction_id: uuid_from_row_optional(
+                    &row,
+                    "removed_in_transaction_id",
+                )?,
                 partition_values: parse_json_optional(partition_values)?,
                 format_options: parse_json_optional(format_options)?,
             };
@@ -924,8 +942,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         let from_ids: HashSet<uuid::Uuid> =
             from_view.files.iter().map(|file| file.file_uuid).collect();
-        let to_ids: HashSet<uuid::Uuid> =
-            to_view.files.iter().map(|file| file.file_uuid).collect();
+        let to_ids: HashSet<uuid::Uuid> = to_view.files.iter().map(|file| file.file_uuid).collect();
 
         let added_files = to_view
             .files
@@ -1000,7 +1017,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                 return Err(CatalogError::NotFound(format!(
                     "{}.{}",
                     ident.namespace, ident.name
-                )))
+                )));
             }
         };
 
@@ -1047,13 +1064,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                         )));
                     }
                     let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
-                    let mut row_data =
-                        Vec::with_capacity(chunk_size as usize);
+                    let mut row_data = Vec::with_capacity(chunk_size as usize);
                     for chunk in files.chunks(chunk_size as usize) {
                         row_data.clear();
                         for f in chunk {
                             let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
-                            let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                            let partition_text =
+                                serialize_json_optional(f.partition_values.as_ref())?;
                             let format_text = serialize_json_optional(f.format_options.as_ref())?;
                             row_data.push((
                                 file_uuid,
@@ -1166,9 +1183,11 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
                     // Validate schema evolution for each column in new schema
                     for new_column in &schema_spec.columns {
-                        if let Some((old_type, old_nullable)) = current_columns.get(&new_column.name) {
+                        if let Some((old_type, old_nullable)) =
+                            current_columns.get(&new_column.name)
+                        {
                             // Column exists - validate evolution
-                            
+
                             // Check type evolution
                             if !can_evolve_to(old_type, &new_column.column_type) {
                                 return Err(CatalogError::InvalidArgument(format!(
@@ -1213,9 +1232,12 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     .await?;
 
                     let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
-                    let mut row_data =
-                        Vec::with_capacity(col_chunk_size as usize);
-                    for (chunk_index, col_chunk) in schema_spec.columns.chunks(col_chunk_size as usize).enumerate() {
+                    let mut row_data = Vec::with_capacity(col_chunk_size as usize);
+                    for (chunk_index, col_chunk) in schema_spec
+                        .columns
+                        .chunks(col_chunk_size as usize)
+                        .enumerate()
+                    {
                         row_data.clear();
                         for (i, column) in col_chunk.iter().enumerate() {
                             let ordinal_position =
@@ -1239,7 +1261,9 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             row_placeholders
                         );
                         let mut query = sqlx::query::<sqlx::Sqlite>(&sql);
-                        for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in &row_data {
+                        for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in
+                            &row_data
+                        {
                             query = query
                                 .bind(column_uuid.as_bytes().as_slice())
                                 .bind(schema_uuid.as_bytes().as_slice())
@@ -1267,9 +1291,9 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             limits::MAX_PROPERTY_KEYS_TO_REMOVE
                         )));
                     }
-                    let map = properties_value
-                        .as_object_mut()
-                        .ok_or_else(|| CatalogError::InvalidArgument("properties must be an object".to_string()))?;
+                    let map = properties_value.as_object_mut().ok_or_else(|| {
+                        CatalogError::InvalidArgument("properties must be an object".to_string())
+                    })?;
                     for key in keys {
                         map.remove(&key);
                     }
@@ -1479,12 +1503,10 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query::<sqlx::Postgres>(
-                "SELECT namespace, table_name FROM tables LIMIT $1",
-            )
-            .bind(limits::MAX_TABLES_PER_LIST as i64)
-            .fetch_all(&self.pool)
-            .await?
+            sqlx::query::<sqlx::Postgres>("SELECT namespace, table_name FROM tables LIMIT $1")
+                .bind(limits::MAX_TABLES_PER_LIST as i64)
+                .fetch_all(&self.pool)
+                .await?
         };
 
         if rows.len() as u32 >= limits::MAX_TABLES_PER_LIST {
@@ -1506,12 +1528,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
     }
 
     async fn drop_table(&self, ident: &TableIdent) -> Result<()> {
-        let affected = sqlx::query::<sqlx::Postgres>("DELETE FROM tables WHERE namespace = $1 AND table_name = $2")
-            .bind(ident.namespace.as_str())
-            .bind(ident.name.as_str())
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        let affected = sqlx::query::<sqlx::Postgres>(
+            "DELETE FROM tables WHERE namespace = $1 AND table_name = $2",
+        )
+        .bind(ident.namespace.as_str())
+        .bind(ident.name.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
 
         if affected == 0 {
             return Err(CatalogError::NotFound(format!(
@@ -1543,7 +1567,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                 return Err(CatalogError::NotFound(format!(
                     "{}.{}",
                     ident.namespace, ident.name
-                )))
+                )));
             }
         };
 
@@ -1606,7 +1630,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         for row in column_rows {
             let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
             let column_type = decode_data_type(&column_type_bytes)?;
-            
+
             let column = schema::Column {
                 column_uuid: uuid_from_row(&row, "column_uuid")?,
                 schema_uuid: uuid_from_row(&row, "schema_uuid")?,
@@ -1623,7 +1647,10 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             table_uuid: uuid_from_row(&schema_row, "table_uuid")?,
             schema_version: schema_row.try_get("schema_version")?,
             valid_from_transaction_id: uuid_from_row(&schema_row, "valid_from_transaction_id")?,
-            valid_to_transaction_id: uuid_from_row_optional(&schema_row, "valid_to_transaction_id")?,
+            valid_to_transaction_id: uuid_from_row_optional(
+                &schema_row,
+                "valid_to_transaction_id",
+            )?,
             created_at: schema_row.try_get("created_at")?,
             columns,
         };
@@ -1663,7 +1690,10 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                 record_count: row.try_get("record_count")?,
                 file_size_bytes: row.try_get("file_size_bytes")?,
                 added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
-                removed_in_transaction_id: uuid_from_row_optional(&row, "removed_in_transaction_id")?,
+                removed_in_transaction_id: uuid_from_row_optional(
+                    &row,
+                    "removed_in_transaction_id",
+                )?,
                 partition_values: parse_json_optional(partition_values)?,
                 format_options: parse_json_optional(format_options)?,
             };
@@ -1714,8 +1744,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         let from_ids: HashSet<uuid::Uuid> =
             from_view.files.iter().map(|file| file.file_uuid).collect();
-        let to_ids: HashSet<uuid::Uuid> =
-            to_view.files.iter().map(|file| file.file_uuid).collect();
+        let to_ids: HashSet<uuid::Uuid> = to_view.files.iter().map(|file| file.file_uuid).collect();
 
         let added_files = to_view
             .files
@@ -1790,7 +1819,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                 return Err(CatalogError::NotFound(format!(
                     "{}.{}",
                     ident.namespace, ident.name
-                )))
+                )));
             }
         };
 
@@ -1837,13 +1866,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                         )));
                     }
                     let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
-                    let mut row_data =
-                        Vec::with_capacity(chunk_size as usize);
+                    let mut row_data = Vec::with_capacity(chunk_size as usize);
                     for chunk in files.chunks(chunk_size as usize) {
                         row_data.clear();
                         for f in chunk {
                             let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
-                            let partition_text = serialize_json_optional(f.partition_values.as_ref())?;
+                            let partition_text =
+                                serialize_json_optional(f.partition_values.as_ref())?;
                             let format_text = serialize_json_optional(f.format_options.as_ref())?;
                             row_data.push((
                                 file_uuid,
@@ -1972,9 +2001,11 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
                     // Validate schema evolution for each column in new schema
                     for new_column in &schema_spec.columns {
-                        if let Some((old_type, old_nullable)) = current_columns.get(&new_column.name) {
+                        if let Some((old_type, old_nullable)) =
+                            current_columns.get(&new_column.name)
+                        {
                             // Column exists - validate evolution
-                            
+
                             // Check type evolution
                             if !can_evolve_to(old_type, &new_column.column_type) {
                                 return Err(CatalogError::InvalidArgument(format!(
@@ -2019,9 +2050,12 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     .await?;
 
                     let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
-                    let mut row_data =
-                        Vec::with_capacity(col_chunk_size as usize);
-                    for (chunk_index, col_chunk) in schema_spec.columns.chunks(col_chunk_size as usize).enumerate() {
+                    let mut row_data = Vec::with_capacity(col_chunk_size as usize);
+                    for (chunk_index, col_chunk) in schema_spec
+                        .columns
+                        .chunks(col_chunk_size as usize)
+                        .enumerate()
+                    {
                         row_data.clear();
                         for (i, column) in col_chunk.iter().enumerate() {
                             let ordinal_position =
@@ -2058,7 +2092,9 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             row_placeholders
                         );
                         let mut query = sqlx::query::<sqlx::Postgres>(&sql);
-                        for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in &row_data {
+                        for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in
+                            &row_data
+                        {
                             query = query
                                 .bind(column_uuid.as_bytes().as_slice())
                                 .bind(schema_uuid.as_bytes().as_slice())
@@ -2086,9 +2122,9 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             limits::MAX_PROPERTY_KEYS_TO_REMOVE
                         )));
                     }
-                    let map = properties_value
-                        .as_object_mut()
-                        .ok_or_else(|| CatalogError::InvalidArgument("properties must be an object".to_string()))?;
+                    let map = properties_value.as_object_mut().ok_or_else(|| {
+                        CatalogError::InvalidArgument("properties must be an object".to_string())
+                    })?;
                     for key in keys {
                         map.remove(&key);
                     }
@@ -2127,9 +2163,7 @@ where
     for<'r> Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'c> &'c str: sqlx::ColumnIndex<R>,
 {
-    let bytes: Vec<u8> = row
-        .try_get(column)
-        .map_err(CatalogError::Storage)?;
+    let bytes: Vec<u8> = row.try_get(column).map_err(CatalogError::Storage)?;
     uuid::Uuid::from_slice(&bytes)
         .map_err(|error| CatalogError::InvalidArgument(format!("invalid uuid: {error}")))
 }
@@ -2141,9 +2175,7 @@ where
     for<'r> Option<Vec<u8>>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'c> &'c str: sqlx::ColumnIndex<R>,
 {
-    let bytes: Option<Vec<u8>> = row
-        .try_get(column)
-        .map_err(CatalogError::Storage)?;
+    let bytes: Option<Vec<u8>> = row.try_get(column).map_err(CatalogError::Storage)?;
     match bytes {
         Some(bytes) => uuid::Uuid::from_slice(&bytes)
             .map(Some)
@@ -2212,7 +2244,7 @@ fn serialize_json_optional(value: Option<&serde_json::Value>) -> Result<Option<S
 }
 
 /// Generate a new transaction ID using UUIDv7
-/// 
+///
 /// UUIDv7 is time-ordered and can be generated without database coordination,
 /// enabling distributed transaction ID generation.
 fn next_transaction_id() -> TxnId {

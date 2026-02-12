@@ -7,18 +7,18 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
-use futures::{stream, TryStreamExt};
+use futures::{TryStreamExt, stream};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use planar::storage::RecordBatchStream;
 use planar::storage::file_format::{
     lance::LanceWriter,
     parquet::{ParquetReadOptions, ParquetReader, ParquetWriter},
     vortex::VortexWriter,
 };
-use planar::storage::RecordBatchStream;
+use vortex::VortexSessionDefault;
 use vortex::file::VortexWriteOptions;
 use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,7 +76,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .read_stream(&parquet_path, &ParquetReadOptions::default())
         .await?;
     let batches: Vec<RecordBatch> = read_stream.try_collect().await?;
-    println!("Read {} batches from {}", batches.len(), parquet_path.display());
+    println!(
+        "Read {} batches from {}",
+        batches.len(),
+        parquet_path.display()
+    );
 
     println!("Done.");
     Ok(())

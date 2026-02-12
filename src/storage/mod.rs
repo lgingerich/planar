@@ -1,18 +1,18 @@
-//! Storage module for file format operations
+//! Storage abstractions and format dispatch for Arrow `RecordBatch` I/O.
 
-/// Error types for storage operations
+/// Error types returned by storage operations.
 pub mod error;
-/// File format implementations
+/// Format-specific readers, writers, and option parsing.
 pub mod file_format;
 
-use std::path::Path;
-use std::pin::Pin;
-use std::str::FromStr;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use futures::stream::Stream;
 use lance::dataset::WriteParams;
 use parquet::file::properties::WriterProperties;
+use std::path::Path;
+use std::pin::Pin;
+use std::str::FromStr;
 use vortex::file::VortexWriteOptions;
 
 pub use error::{Result, StorageError};
@@ -21,24 +21,24 @@ use file_format::lance::{LanceReadOptions, LanceReader, LanceWriter};
 use file_format::parquet::{ParquetReadOptions, ParquetReader, ParquetWriter};
 use file_format::vortex::{VortexReadOptions, VortexReader, VortexWriter};
 
-/// Stream of Arrow RecordBatches
+/// Async stream of Arrow `RecordBatch` values.
 pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
 
-/// Trait for reading file formats into Arrow RecordBatches
+/// Reads a file format into Arrow batches.
 #[async_trait]
 pub trait Reader: Send + Sync {
-    /// Read a file and return an Arrow RecordBatch
+    /// Reads `path` and returns all rows as one batch.
     async fn read(&self, path: &Path) -> Result<RecordBatch>;
 }
 
-/// Trait for writing Arrow RecordBatches to file formats
+/// Writes Arrow batches to a file format.
 #[async_trait]
 pub trait Writer: Send + Sync {
-    /// Write a RecordBatch to a file
+    /// Writes `batch` to `path`.
     async fn write(&self, batch: &RecordBatch, path: &Path) -> Result<()>;
 }
 
-/// Format-specific read options for dispatch
+/// Format-specific read options used by [`ReaderEnum`].
 #[derive(Debug)]
 pub enum FormatReadOptions {
     /// Parquet reader options
@@ -49,7 +49,7 @@ pub enum FormatReadOptions {
     Vortex(VortexReadOptions),
 }
 
-/// Format-specific write options for dispatch
+/// Format-specific write options used by [`WriterEnum`].
 pub enum FormatWriteOptions {
     /// Parquet writer properties
     Parquet(WriterProperties),
@@ -69,7 +69,7 @@ impl std::fmt::Debug for FormatWriteOptions {
     }
 }
 
-/// Supported file formats
+/// Supported on-disk file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
     /// Parquet format.
@@ -97,7 +97,7 @@ impl FromStr for Format {
 }
 
 impl Format {
-    /// Get format as string.
+    /// Returns the canonical lowercase format name.
     pub fn as_str(&self) -> &'static str {
         match self {
             Format::Parquet => "parquet",
@@ -107,7 +107,7 @@ impl Format {
     }
 }
 
-/// Reader enum for type-safe dispatch
+/// Type-safe reader dispatch over supported formats.
 #[derive(Debug)]
 pub enum ReaderEnum {
     /// Parquet reader
@@ -119,7 +119,7 @@ pub enum ReaderEnum {
 }
 
 impl ReaderEnum {
-    /// Create a reader for the given format
+    /// Creates a reader for `format`.
     pub fn new(format: Format) -> Self {
         match format {
             Format::Parquet => ReaderEnum::Parquet(ParquetReader::new()),
@@ -128,7 +128,7 @@ impl ReaderEnum {
         }
     }
 
-    /// Read a file with format-specific options
+    /// Reads a file using options matching the active format variant.
     pub async fn read_with_options(
         &self,
         path: &Path,
@@ -150,7 +150,7 @@ impl ReaderEnum {
         }
     }
 
-    /// Stream a file as RecordBatches with format-specific options
+    /// Streams a file with options matching the active format variant.
     pub async fn read_stream(
         &self,
         path: &Path,
@@ -193,7 +193,7 @@ impl Reader for ReaderEnum {
     }
 }
 
-/// Writer enum for type-safe dispatch
+/// Type-safe writer dispatch over supported formats.
 #[derive(Debug)]
 pub enum WriterEnum {
     /// Parquet writer.
@@ -205,7 +205,7 @@ pub enum WriterEnum {
 }
 
 impl WriterEnum {
-    /// Create a writer for the given format
+    /// Creates a writer for `format`.
     pub fn new(format: Format) -> Self {
         match format {
             Format::Parquet => WriterEnum::Parquet(ParquetWriter::new()),
@@ -214,7 +214,7 @@ impl WriterEnum {
         }
     }
 
-    /// Write a RecordBatch with format-specific options
+    /// Writes one batch with options matching the active format variant.
     pub async fn write_with_options(
         &self,
         batch: &RecordBatch,
@@ -237,7 +237,7 @@ impl WriterEnum {
         }
     }
 
-    /// Write a stream of RecordBatches with format-specific options
+    /// Writes a stream with options matching the active format variant.
     pub async fn write_stream(
         &self,
         stream: RecordBatchStream,

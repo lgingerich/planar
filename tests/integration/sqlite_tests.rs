@@ -126,7 +126,7 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sq
 }
 
 /// Test that Rust schema structs match the SQL schema definitions.
-/// 
+///
 /// This test uses the database schema as the source of truth - if we can successfully
 /// query each table into its corresponding Rust struct, the struct matches the database.
 /// If types or column names don't match, sqlx will fail at runtime.
@@ -156,7 +156,12 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
         .await
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
     table
-        .append_file(FileSpec::new("parquet", "/tmp/schema_sync/part-0.parquet", 1, 128))
+        .append_file(FileSpec::new(
+            "parquet",
+            "/tmp/schema_sync/part-0.parquet",
+            1,
+            128,
+        ))
         .await
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
 
@@ -168,22 +173,23 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
     .fetch_one(&pool)
     .await?;
 
-    let transaction_id: Uuid = sqlx::query_scalar(
-        "SELECT transaction_id FROM transactions WHERE table_uuid = ?1 LIMIT 1",
-    )
-    .bind(table_uuid)
-    .fetch_one(&pool)
-    .await?;
+    let transaction_id: Uuid =
+        sqlx::query_scalar("SELECT transaction_id FROM transactions WHERE table_uuid = ?1 LIMIT 1")
+            .bind(table_uuid)
+            .fetch_one(&pool)
+            .await?;
 
-    let schema_uuid: Uuid = sqlx::query_scalar("SELECT schema_uuid FROM schemas WHERE table_uuid = ?1 LIMIT 1")
-        .bind(table_uuid)
-        .fetch_one(&pool)
-        .await?;
+    let schema_uuid: Uuid =
+        sqlx::query_scalar("SELECT schema_uuid FROM schemas WHERE table_uuid = ?1 LIMIT 1")
+            .bind(table_uuid)
+            .fetch_one(&pool)
+            .await?;
 
-    let file_uuid: Uuid = sqlx::query_scalar("SELECT file_uuid FROM files WHERE table_uuid = ?1 LIMIT 1")
-        .bind(table_uuid)
-        .fetch_one(&pool)
-        .await?;
+    let file_uuid: Uuid =
+        sqlx::query_scalar("SELECT file_uuid FROM files WHERE table_uuid = ?1 LIMIT 1")
+            .bind(table_uuid)
+            .fetch_one(&pool)
+            .await?;
 
     sqlx::query(
         "INSERT OR IGNORE INTO table_stats
@@ -311,4 +317,3 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 
     Ok(())
 }
-

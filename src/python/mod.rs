@@ -2,33 +2,33 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
-use futures::{stream, TryStreamExt};
+use futures::{TryStreamExt, stream};
+use once_cell::sync::Lazy;
+use pyo3::IntoPyObjectExt;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyType};
-use pyo3::IntoPyObjectExt;
-use once_cell::sync::Lazy;
+use std::future::Future;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use std::future::Future;
 use tokio::runtime::{Builder, Runtime};
 
 use crate::catalog::{
     Catalog, CatalogError as CoreCatalogError, ColumnSpec, CommitResult, FileSpec, SchemaSpec,
     TableDelta, TableHandle, TableIdent, TableView,
 };
+use crate::storage::StorageError as CoreStorageError;
 use crate::storage::{
+    RecordBatchStream,
     file_format::lance::LanceReadOptions,
     file_format::lance::parse_write_options as parse_lance_write_options,
-    file_format::parquet::{ParquetReadOptions, ParquetReader, ParquetWriter},
     file_format::parquet::parse_write_options as parse_parquet_write_options,
-    file_format::vortex::{VortexReadOptions, VortexReader, VortexWriter},
+    file_format::parquet::{ParquetReadOptions, ParquetReader, ParquetWriter},
     file_format::vortex::parse_write_options as parse_vortex_write_options,
-    RecordBatchStream,
+    file_format::vortex::{VortexReadOptions, VortexReader, VortexWriter},
 };
-use crate::storage::StorageError as CoreStorageError;
 
 create_exception!(planar, PlanarError, PyException);
 create_exception!(planar, CatalogError, PlanarError);
@@ -69,9 +69,8 @@ fn py_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         return Ok(serde_json::Value::Number(val.into()));
     }
     if let Ok(val) = value.extract::<f64>() {
-        let number = serde_json::Number::from_f64(val).ok_or_else(|| {
-            PyErr::new::<PyValueError, _>("Invalid floating point value")
-        })?;
+        let number = serde_json::Number::from_f64(val)
+            .ok_or_else(|| PyErr::new::<PyValueError, _>("Invalid floating point value"))?;
         return Ok(serde_json::Value::Number(number));
     }
     if let Ok(val) = value.extract::<String>() {
@@ -93,9 +92,7 @@ fn py_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         return Ok(serde_json::Value::Object(map));
     }
 
-    Err(PyErr::new::<PyValueError, _>(
-        "Unsupported JSON value type",
-    ))
+    Err(PyErr::new::<PyValueError, _>("Unsupported JSON value type"))
 }
 
 fn json_value_to_py(py: Python, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
@@ -129,7 +126,9 @@ fn json_value_to_py(py: Python, value: &serde_json::Value) -> PyResult<Py<PyAny>
     }
 }
 
-fn record_batches_to_ipc(batches: Vec<RecordBatch>) -> std::result::Result<Vec<u8>, CoreStorageError> {
+fn record_batches_to_ipc(
+    batches: Vec<RecordBatch>,
+) -> std::result::Result<Vec<u8>, CoreStorageError> {
     let Some(first) = batches.first() else {
         return Err(CoreStorageError::Unsupported(
             "expected at least one RecordBatch".to_string(),
@@ -287,7 +286,7 @@ fn data_type_to_spec(py: Python, data_type: &DataType) -> PyResult<Py<PyAny>> {
             return Err(PyErr::new::<PyValueError, _>(format!(
                 "Unsupported DataType for Python bindings: {:?}",
                 other
-            )))
+            )));
         }
     }
     dict.into_py_any(py)
@@ -394,7 +393,10 @@ fn data_type_from_spec(py: Python, spec: &Bound<'_, PyAny>) -> PyResult<DataType
             let field_spec = dict
                 .get_item("field")?
                 .ok_or_else(|| PyErr::new::<PyValueError, _>("Missing list field"))?;
-            Ok(DataType::LargeList(Arc::new(field_from_spec(py, &field_spec)?)))
+            Ok(DataType::LargeList(Arc::new(field_from_spec(
+                py,
+                &field_spec,
+            )?)))
         }
         "fixed_size_list" => {
             let field_spec = dict
@@ -490,7 +492,9 @@ pub struct PySchemaSpec {
 impl PySchemaSpec {
     #[new]
     fn new() -> Self {
-        Self { columns: Vec::new() }
+        Self {
+            columns: Vec::new(),
+        }
     }
 
     fn with_column(&mut self, column: PyRef<PyColumnSpec>) -> PyResult<()> {
@@ -578,9 +582,11 @@ impl PyCatalog {
                 .await
                 .map_err(|err| catalog_error_to_py(err.into()))?
             } else {
-                crate::catalog::SqlCatalog::<sqlx::Sqlite>::from_connection_string(&connection_string)
-                    .await
-                    .map_err(|err| catalog_error_to_py(err.into()))?
+                crate::catalog::SqlCatalog::<sqlx::Sqlite>::from_connection_string(
+                    &connection_string,
+                )
+                .await
+                .map_err(|err| catalog_error_to_py(err.into()))?
             };
 
             Ok(PyCatalog { inner: catalog })
@@ -613,7 +619,11 @@ impl PyCatalog {
         })
     }
 
-    fn load_table(&self, py: Python, ident: PyRef<PyTableIdent>) -> PyResult<Option<PyTableHandle>> {
+    fn load_table(
+        &self,
+        py: Python,
+        ident: PyRef<PyTableIdent>,
+    ) -> PyResult<Option<PyTableHandle>> {
         let catalog = self.inner.clone();
         let ident = ident.to_core();
         block_on_py(py, async move {
@@ -647,7 +657,10 @@ impl PyCatalog {
         let catalog = self.inner.clone();
         let ident = ident.to_core();
         block_on_py(py, async move {
-            catalog.drop_table(&ident).await.map_err(catalog_error_to_py)?;
+            catalog
+                .drop_table(&ident)
+                .await
+                .map_err(catalog_error_to_py)?;
             Ok(())
         })
     }
@@ -707,7 +720,10 @@ impl PyTableHandle {
         let handle = self.inner.clone();
         let file = file.inner.clone();
         block_on_py(py, async move {
-            let result = handle.append_file(file).await.map_err(catalog_error_to_py)?;
+            let result = handle
+                .append_file(file)
+                .await
+                .map_err(catalog_error_to_py)?;
             Python::attach(|py| commit_result_to_py(py, &result))
         })
     }
@@ -771,7 +787,10 @@ fn file_to_py(py: Python, file: &crate::catalog::schema::File) -> PyResult<Py<Py
     dict.set_item("file_path", file.file_path.as_str())?;
     dict.set_item("record_count", file.record_count)?;
     dict.set_item("file_size_bytes", file.file_size_bytes)?;
-    dict.set_item("added_in_transaction_id", file.added_in_transaction_id.to_string())?;
+    dict.set_item(
+        "added_in_transaction_id",
+        file.added_in_transaction_id.to_string(),
+    )?;
     dict.set_item(
         "removed_in_transaction_id",
         file.removed_in_transaction_id.map(|id| id.to_string()),
@@ -901,11 +920,7 @@ fn batches_to_stream(batches: Vec<RecordBatch>) -> RecordBatchStream {
 }
 
 #[pyfunction]
-fn read_parquet_ipc(
-    py: Python,
-    path: String,
-    batch_size: Option<usize>,
-) -> PyResult<Py<PyAny>> {
+fn read_parquet_ipc(py: Python, path: String, batch_size: Option<usize>) -> PyResult<Py<PyAny>> {
     block_on_py(py, async move {
         let reader = ParquetReader::new();
         let options = ParquetReadOptions {
@@ -963,7 +978,8 @@ fn write_parquet_ipc(
             )));
         };
         let writer = ParquetWriter::new();
-        let props = parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        let props =
+            parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
             .write_with_options(first, Path::new(&path), props)
             .await
@@ -993,7 +1009,8 @@ fn write_parquet_stream_ipc(
         }
         let stream = batches_to_stream(batches);
         let writer = ParquetWriter::new();
-        let props = parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        let props =
+            parse_parquet_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
             .write_stream(stream, Path::new(&path), props)
             .await
@@ -1087,7 +1104,8 @@ fn write_lance_ipc(
             )));
         };
         let writer = crate::storage::file_format::lance::LanceWriter::new();
-        let params = parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        let params =
+            parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
             .write_with_options(first, Path::new(&path), params)
             .await
@@ -1117,7 +1135,8 @@ fn write_lance_stream_ipc(
         }
         let stream = batches_to_stream(batches);
         let writer = crate::storage::file_format::lance::LanceWriter::new();
-        let params = parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        let params =
+            parse_lance_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
             .write_stream(stream, Path::new(&path), params)
             .await
@@ -1193,7 +1212,8 @@ fn write_vortex_ipc(
             )));
         };
         let writer = VortexWriter::new();
-        let opts = parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        let opts =
+            parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
             .write_with_options(first, Path::new(&path), opts)
             .await
@@ -1223,7 +1243,8 @@ fn write_vortex_stream_ipc(
         }
         let stream = batches_to_stream(batches);
         let writer = VortexWriter::new();
-        let opts = parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
+        let opts =
+            parse_vortex_write_options(options_value.as_ref()).map_err(storage_error_to_py)?;
         writer
             .write_stream(stream, Path::new(&path), opts)
             .await

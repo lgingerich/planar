@@ -1,29 +1,31 @@
+//! Utilities for encoding Arrow types and validating schema evolution rules.
+
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;
-use arrow_ipc::convert::{fb_to_schema, IpcSchemaEncoder};
+use arrow_ipc::convert::{IpcSchemaEncoder, fb_to_schema};
 use arrow_ipc::root_as_schema;
 
 use crate::catalog::{CatalogError, Result};
 
-/// Encode a DataType to bytes using Arrow IPC format
+/// Encodes an Arrow [`DataType`] into bytes using Arrow IPC schema encoding.
 pub fn encode_data_type(data_type: &DataType) -> Result<Vec<u8>> {
     // Wrap in a placeholder Field+Schema for IPC encoding
     // The field name "_" indicates it's just a wrapper and will be discarded
     let field = Field::new("_", data_type.clone(), true);
     let schema = Schema::new(vec![field]);
-    
+
     // Encode to IPC format using FlatBuffers
     let fbb = IpcSchemaEncoder::new().schema_to_fb(&schema);
     Ok(fbb.finished_data().to_vec())
 }
 
-/// Decode a DataType from bytes using Arrow IPC format
+/// Decodes an Arrow [`DataType`] from bytes created by [`encode_data_type`].
 pub fn decode_data_type(bytes: &[u8]) -> Result<DataType> {
     // Deserialize from FlatBuffer format
     let ipc_schema = root_as_schema(bytes)
         .map_err(|e| ArrowError::IpcError(format!("Invalid FlatBuffer schema: {}", e)))?;
     let schema = fb_to_schema(ipc_schema);
-    
+
     // Extract the DataType from the first (and only) field
     let fields = schema.fields();
     match fields.len() {
@@ -31,9 +33,10 @@ pub fn decode_data_type(bytes: &[u8]) -> Result<DataType> {
             "Invalid encoded DataType: schema has no fields".into(),
         )),
         1 => Ok(fields[0].data_type().clone()),
-        n => Err(CatalogError::InvalidArgument(
-            format!("Invalid encoded DataType: expected 1 field, found {}", n),
-        )),
+        n => Err(CatalogError::InvalidArgument(format!(
+            "Invalid encoded DataType: expected 1 field, found {}",
+            n
+        ))),
     }
 }
 
@@ -91,20 +94,26 @@ pub fn can_evolve_to(from_type: &DataType, to_type: &DataType) -> bool {
             // Check if precision is increasing
             matches!(
                 (from_unit, to_unit),
-                (TimeUnit::Second, TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond)
-                    | (TimeUnit::Millisecond, TimeUnit::Microsecond | TimeUnit::Nanosecond)
-                    | (TimeUnit::Microsecond, TimeUnit::Nanosecond)
+                (
+                    TimeUnit::Second,
+                    TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
+                ) | (
+                    TimeUnit::Millisecond,
+                    TimeUnit::Microsecond | TimeUnit::Nanosecond
+                ) | (TimeUnit::Microsecond, TimeUnit::Nanosecond)
             )
         }
 
         // Decimal precision increase (scale must stay the same)
-        (DataType::Decimal128(from_precision, from_scale), DataType::Decimal128(to_precision, to_scale)) => {
-            from_scale == to_scale && to_precision > from_precision
-        }
+        (
+            DataType::Decimal128(from_precision, from_scale),
+            DataType::Decimal128(to_precision, to_scale),
+        ) => from_scale == to_scale && to_precision > from_precision,
 
-        (DataType::Decimal256(from_precision, from_scale), DataType::Decimal256(to_precision, to_scale)) => {
-            from_scale == to_scale && to_precision > from_precision
-        }
+        (
+            DataType::Decimal256(from_precision, from_scale),
+            DataType::Decimal256(to_precision, to_scale),
+        ) => from_scale == to_scale && to_precision > from_precision,
 
         // No other evolutions are safe
         _ => false,
@@ -167,11 +176,20 @@ mod tests {
         roundtrip(DataType::Timestamp(TimeUnit::Millisecond, None));
         roundtrip(DataType::Timestamp(TimeUnit::Microsecond, None));
         roundtrip(DataType::Timestamp(TimeUnit::Nanosecond, None));
-        
+
         // With timezone
-        roundtrip(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
-        roundtrip(DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())));
-        roundtrip(DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())));
+        roundtrip(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        roundtrip(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("America/New_York".into()),
+        ));
+        roundtrip(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("+00:00".into()),
+        ));
     }
 
     #[test]
@@ -183,9 +201,20 @@ mod tests {
 
     #[test]
     fn test_list_types() {
-        roundtrip(DataType::List(Arc::new(Field::new("item", DataType::Int32, true))));
-        roundtrip(DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, false))));
-        roundtrip(DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 5));
+        roundtrip(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        ))));
+        roundtrip(DataType::LargeList(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            false,
+        ))));
+        roundtrip(DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float64, true)),
+            5,
+        ));
     }
 
     #[test]
@@ -193,7 +222,11 @@ mod tests {
         let fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
-            Field::new("created_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ];
         roundtrip(DataType::Struct(fields.into()));
     }
@@ -201,12 +234,19 @@ mod tests {
     #[test]
     fn test_nested_types() {
         // List of structs
-        let struct_type = DataType::Struct(vec![
-            Field::new("x", DataType::Float64, false),
-            Field::new("y", DataType::Float64, false),
-        ].into());
-        roundtrip(DataType::List(Arc::new(Field::new("point", struct_type, true))));
-        
+        let struct_type = DataType::Struct(
+            vec![
+                Field::new("x", DataType::Float64, false),
+                Field::new("y", DataType::Float64, false),
+            ]
+            .into(),
+        );
+        roundtrip(DataType::List(Arc::new(Field::new(
+            "point",
+            struct_type,
+            true,
+        ))));
+
         // Struct with list
         let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
         let fields = vec![
@@ -235,12 +275,20 @@ mod tests {
     fn test_encoded_size() {
         // Basic types should be relatively small
         let int32_encoded = encode_data_type(&DataType::Int32).unwrap();
-        assert!(int32_encoded.len() < 200, "Int32 encoding should be compact");
-        
-        let timestamp_encoded = encode_data_type(
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        ).unwrap();
-        assert!(timestamp_encoded.len() < 300, "Timestamp with timezone should be reasonably compact");
+        assert!(
+            int32_encoded.len() < 200,
+            "Int32 encoding should be compact"
+        );
+
+        let timestamp_encoded = encode_data_type(&DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ))
+        .unwrap();
+        assert!(
+            timestamp_encoded.len() < 300,
+            "Timestamp with timezone should be reasonably compact"
+        );
     }
 }
 
@@ -576,11 +624,20 @@ mod evolution_tests {
         assert!(!can_evolve_to(&DataType::Int32, &DataType::Boolean));
 
         // Date to timestamp
-        assert!(!can_evolve_to(&DataType::Date32, &DataType::Timestamp(TimeUnit::Millisecond, None)));
-        assert!(!can_evolve_to(&DataType::Date64, &DataType::Timestamp(TimeUnit::Millisecond, None)));
+        assert!(!can_evolve_to(
+            &DataType::Date32,
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        ));
+        assert!(!can_evolve_to(
+            &DataType::Date64,
+            &DataType::Timestamp(TimeUnit::Millisecond, None)
+        ));
 
         // Timestamp to date
-        assert!(!can_evolve_to(&DataType::Timestamp(TimeUnit::Millisecond, None), &DataType::Date64));
+        assert!(!can_evolve_to(
+            &DataType::Timestamp(TimeUnit::Millisecond, None),
+            &DataType::Date64
+        ));
     }
 
     #[test]
@@ -593,12 +650,8 @@ mod evolution_tests {
         assert!(!can_evolve_to(&list_int32, &list_int64));
 
         // Struct types
-        let struct1 = DataType::Struct(vec![
-            Field::new("id", DataType::Int32, false),
-        ].into());
-        let struct2 = DataType::Struct(vec![
-            Field::new("id", DataType::Int64, false),
-        ].into());
+        let struct1 = DataType::Struct(vec![Field::new("id", DataType::Int32, false)].into());
+        let struct2 = DataType::Struct(vec![Field::new("id", DataType::Int64, false)].into());
         assert!(!can_evolve_to(&struct1, &struct2));
     }
 }

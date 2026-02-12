@@ -1,6 +1,8 @@
+//! Error types for catalog metadata operations.
+
 use thiserror::Error;
 
-/// Catalog operation errors
+/// Errors returned by catalog operations.
 #[derive(Debug, Error)]
 pub enum CatalogError {
     /// Table not found
@@ -26,5 +28,5 @@ pub enum CatalogError {
     Arrow(#[from] arrow::error::ArrowError),
 }
 
-/// Result type for catalog operations
+/// Convenient result alias for catalog operations.
 pub type Result<T> = std::result::Result<T, CatalogError>;

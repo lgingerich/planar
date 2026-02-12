@@ -1,3 +1,5 @@
+//! Row types that map catalog database records to Rust structs.
+
 use arrow::datatypes::DataType;
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;

@@ -1,10 +1,10 @@
-//! File format implementations
+//! Format-specific reader/writer implementations and option validation.
 
-/// Parquet format implementation
-pub mod parquet;
-/// Lance format implementation
+/// Lance format implementation.
 pub mod lance;
-/// Vortex format implementation
+/// Parquet format implementation.
+pub mod parquet;
+/// Vortex format implementation.
 pub mod vortex;
 
 use serde_json::Value;
@@ -12,7 +12,10 @@ use serde_json::Value;
 use crate::storage::{Result, StorageError};
 use std::path::Path;
 
-/// Validates JSON writer options for a specific file format.
+/// Validates writer `format_options` for a file format.
+///
+/// This function parses the JSON object with the same per-format parsers used by
+/// write calls, so successful validation means the options are acceptable.
 pub fn validate_format_options(file_format: &str, options: &Value) -> Result<()> {
     match file_format.to_lowercase().as_str() {
         "parquet" => {
