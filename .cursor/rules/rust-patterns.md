@@ -41,10 +41,12 @@ API DESIGN
 - Prefer `AsRef<Path>` for path-like inputs and `IntoIterator` for iterable inputs when it helps ergonomics.
 - Prefer returning iterators only when it’s genuinely useful; otherwise return collections or slices.
 - Prefer concrete option types over JSON for core APIs; keep JSON only at persistence boundaries.
+- For known constrained domains (formats, states, operation kinds), prefer enums over strings.
 - Keep read/write/stream APIs aligned across formats so sync/async behavior matches at the core layer.
 - Align helper naming across format implementations (e.g., `apply_read_options`).
 - Use consistent path handling (validate UTF-8 once, share helper), avoid silent lossy conversions.
 - Keep small helpers inline unless it prevents substantial duplication.
+- Reject permissive JSON shapes in core metadata/spec inputs; require object shape where keys are expected.
 
 ITERATORS & COLLECTIONS
 - Prefer iterators over indexing when possible.

@@ -21,6 +21,7 @@ use crate::catalog::{
 };
 use crate::storage::StorageError as CoreStorageError;
 use crate::storage::{
+    Format,
     RecordBatchStream,
     file_format::lance::LanceReadOptions,
     file_format::lance::parse_write_options as parse_lance_write_options,
@@ -527,6 +528,9 @@ impl PyFileSpec {
         file_size_bytes: i64,
         format_options: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let file_format = file_format
+            .parse::<Format>()
+            .map_err(storage_error_to_py)?;
         let mut inner = FileSpec::new(file_format, file_path, record_count, file_size_bytes);
         if let Some(options) = format_options {
             if !options.is_none() {
@@ -765,7 +769,11 @@ impl PyTableHandle {
         let file = file.inner.clone();
         block_on_py(py, async move {
             let result = handle
+                .write(None)
+                .await
+                .map_err(catalog_error_to_py)?
                 .append_file(file)
+                .commit()
                 .await
                 .map_err(catalog_error_to_py)?;
             Python::attach(|py| commit_result_to_py(py, &result))
@@ -785,7 +793,11 @@ impl PyTableHandle {
 
         block_on_py(py, async move {
             let result = handle
+                .write(None)
+                .await
+                .map_err(catalog_error_to_py)?
                 .append_files(core_files)
+                .commit()
                 .await
                 .map_err(catalog_error_to_py)?;
             Python::attach(|py| commit_result_to_py(py, &result))
@@ -803,7 +815,11 @@ impl PyTableHandle {
 
         block_on_py(py, async move {
             let result = handle
+                .write(None)
+                .await
+                .map_err(catalog_error_to_py)?
                 .delete_files(uuids)
+                .commit()
                 .await
                 .map_err(catalog_error_to_py)?;
             Python::attach(|py| commit_result_to_py(py, &result))
@@ -816,7 +832,11 @@ impl PyTableHandle {
             TableProperties::from_json(py_to_json_value(properties)?).map_err(catalog_error_to_py)?;
         block_on_py(py, async move {
             let result = handle
+                .write(None)
+                .await
+                .map_err(catalog_error_to_py)?
                 .set_properties(typed_properties)
+                .commit()
                 .await
                 .map_err(catalog_error_to_py)?;
             Python::attach(|py| commit_result_to_py(py, &result))

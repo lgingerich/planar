@@ -126,6 +126,7 @@ async fn test_schema_structs_match_sql_tables(
         Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, TableProperties,
         schema,
     };
+    use planar::storage::Format;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -143,12 +144,16 @@ async fn test_schema_structs_match_sql_tables(
         .await
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
     table
+        .write(None)
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?
         .append_file(FileSpec::new(
-            "parquet",
+            Format::Parquet,
             "/tmp/schema_sync/part-0.parquet",
             1,
             128,
         ))
+        .commit()
         .await
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
 

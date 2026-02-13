@@ -137,6 +137,7 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
         Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, TableProperties,
         schema,
     };
+    use planar::storage::Format;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -157,12 +158,16 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
         .await
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
     table
+        .write(None)
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?
         .append_file(FileSpec::new(
-            "parquet",
+            Format::Parquet,
             "/tmp/schema_sync/part-0.parquet",
             1,
             128,
         ))
+        .commit()
         .await
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
 
@@ -324,6 +329,7 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 async fn test_transaction_event_range_projection(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     use arrow::datatypes::DataType;
     use planar::catalog::{Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent};
+    use planar::storage::Format;
     use std::sync::Arc;
 
     database::sqlite::configure_pool(&pool).await?;
@@ -350,13 +356,17 @@ async fn test_transaction_event_range_projection(pool: sqlx::Pool<Sqlite>) -> Re
     let total_files = 400;
     for i in 0..total_files {
         let file = FileSpec::new(
-            "parquet",
+            Format::Parquet,
             format!("/tmp/scale_event_log/part-{i:05}.parquet"),
             1,
             128,
         );
         table
+            .write(None)
+            .await
+            .map_err(|err| sqlx::Error::Protocol(err.to_string()))?
             .append_file(file)
+            .commit()
             .await
             .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
     }

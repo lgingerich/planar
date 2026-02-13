@@ -6,11 +6,7 @@
 //! - **Simplified catalog initialization**: `SqlCatalog::in_memory()` for easy setup
 //! - **Builder pattern for schemas**: `SchemaSpec::new().with_column(...)`
 //! - **Builder pattern for files**: `FileSpec::new(...).with_partition_values(...)`
-//! - **Convenience methods**: No manual transaction ID tracking needed
-//!   - `table_handle.append_file()` - automatically uses current transaction ID
-//!   - `table_handle.append_files()` - same for multiple files
-//!   - `table_handle.delete_files()` - convenience wrapper
-//!   - `table_handle.set_properties()` - convenience wrapper
+//! - **Single write path**: `table_handle.write(None)?.<ops>.commit()`
 //! - **Time travel queries**: Read table state at any transaction ID
 //! - **Transaction deltas**: Compute changes between two transaction IDs
 //! - **Table listing**: List all tables or filter by namespace
@@ -21,6 +17,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use planar::catalog::{
     Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, TableProperties,
 };
+use planar::storage::Format;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Using builder pattern for file specification
     let file1 = FileSpec::new(
-        "parquet",
+        Format::Parquet,
         "/data/sales/transactions/part-00000.parquet",
         1000,
         245760,
@@ -96,15 +93,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_partition_values(serde_json::json!({"date": "2024-01-01"}));
 
     let file2 = FileSpec::new(
-        "parquet",
+        Format::Parquet,
         "/data/sales/transactions/part-00001.parquet",
         1500,
         368640,
     )
     .with_partition_values(serde_json::json!({"date": "2024-01-02"}));
 
-    // Convenience method automatically uses current transaction ID
-    let commit_result = table_handle.append_files(vec![file1, file2]).await?;
+    // Single write path: build mutation and commit.
+    let commit_result = table_handle
+        .write(None)
+        .await?
+        .append_files(vec![file1, file2])
+        .commit()
+        .await?;
 
     println!("✅ Committed transaction {}", commit_result.transaction_id);
 
@@ -126,15 +128,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📁 Step 4: Adding a single file...");
 
     let file3 = FileSpec::new(
-        "parquet",
+        Format::Parquet,
         "/data/sales/transactions/part-00002.parquet",
         2000,
         491520,
     )
     .with_partition_values(serde_json::json!({"date": "2024-01-03"}));
 
-    // Convenience method for single file
-    let commit_result = table_handle.append_file(file3).await?;
+    let commit_result = table_handle
+        .write(None)
+        .await?
+        .append_file(file3)
+        .commit()
+        .await?;
 
     println!("✅ Committed transaction {}", commit_result.transaction_id);
 
@@ -206,8 +212,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let file_to_delete = view_after_txn2.files[0].file_uuid;
 
-    // Convenience method automatically uses current transaction ID
-    let commit_result = table_handle.delete_files(vec![file_to_delete]).await?;
+    let commit_result = table_handle
+        .write(None)
+        .await?
+        .delete_files(vec![file_to_delete])
+        .commit()
+        .await?;
 
     println!("✅ Committed transaction {}", commit_result.transaction_id);
 
@@ -236,8 +246,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "retention_days": 365
     }))?;
 
-    // Convenience method automatically uses current transaction ID
-    let commit_result = table_handle.set_properties(updated_properties).await?;
+    let commit_result = table_handle
+        .write(None)
+        .await?
+        .set_properties(updated_properties)
+        .commit()
+        .await?;
 
     println!("✅ Committed transaction {}", commit_result.transaction_id);
 

@@ -6,7 +6,7 @@ use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use sqlx::{Database, Pool, Row};
 
-use crate::storage::file_format;
+use crate::storage::{Format, file_format};
 /// Database-specific configuration
 pub mod database;
 
@@ -119,6 +119,36 @@ impl std::fmt::Display for TableProperties {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let json = serde_json::to_string(&self.values).map_err(|_| std::fmt::Error)?;
         f.write_str(&json)
+    }
+}
+
+/// Strongly-typed table property key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PropertyKey(String);
+
+impl PropertyKey {
+    /// Create a validated property key.
+    pub fn new(key: impl Into<String>) -> Result<Self> {
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(CatalogError::InvalidArgument(
+                "property key cannot be empty".to_string(),
+            ));
+        }
+        Ok(Self(key))
+    }
+
+    /// Borrow the property key string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for PropertyKey {
+    type Error = CatalogError;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
     }
 }
 
@@ -274,6 +304,39 @@ impl SchemaSpec {
         self.columns.extend(columns);
         self
     }
+
+    /// Validate schema shape and column naming constraints.
+    pub fn validate(&self) -> Result<()> {
+        if self.columns.is_empty() {
+            return Err(CatalogError::InvalidArgument(
+                "schema must include at least one column".to_string(),
+            ));
+        }
+        if self.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
+            return Err(CatalogError::LimitExceeded(format!(
+                "schema has {} columns, exceeds limit of {}",
+                self.columns.len(),
+                limits::MAX_COLUMNS_PER_SCHEMA
+            )));
+        }
+
+        let mut seen = std::collections::HashSet::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let trimmed = column.name.trim();
+            if trimmed.is_empty() {
+                return Err(CatalogError::InvalidArgument(
+                    "column name cannot be empty".to_string(),
+                ));
+            }
+            if !seen.insert(column.name.as_str()) {
+                return Err(CatalogError::InvalidArgument(format!(
+                    "duplicate column name: '{}'",
+                    column.name
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for SchemaSpec {
@@ -287,8 +350,8 @@ impl Default for SchemaSpec {
 pub struct FileSpec {
     /// Optional file UUID (generated if not provided)
     pub file_uuid: Option<uuid::Uuid>,
-    /// File format (e.g., "parquet", "lance", "vortex")
-    pub file_format: String,
+    /// File format
+    pub file_format: Format,
     /// File path
     pub file_path: String,
     /// Number of records in the file
@@ -304,14 +367,14 @@ pub struct FileSpec {
 impl FileSpec {
     /// Create a new file specification
     pub fn new(
-        file_format: impl Into<String>,
+        file_format: Format,
         file_path: impl Into<String>,
         record_count: i64,
         file_size_bytes: i64,
     ) -> Self {
         Self {
             file_uuid: None,
-            file_format: file_format.into(),
+            file_format,
             file_path: file_path.into(),
             record_count,
             file_size_bytes,
@@ -340,10 +403,46 @@ impl FileSpec {
 
     /// Set format-specific options from JSON with validation
     pub fn with_format_options_checked(mut self, options: serde_json::Value) -> Result<Self> {
-        file_format::validate_format_options(&self.file_format, &options)
+        file_format::validate_format_options(self.file_format.as_str(), &options)
             .map_err(|err| CatalogError::InvalidArgument(err.to_string()))?;
         self.format_options = Some(options);
         Ok(self)
+    }
+
+    /// Validate file metadata shape and bounds.
+    pub fn validate(&self) -> Result<()> {
+        if self.file_path.trim().is_empty() {
+            return Err(CatalogError::InvalidArgument(
+                "file path cannot be empty".to_string(),
+            ));
+        }
+        if self.record_count < 0 {
+            return Err(CatalogError::InvalidArgument(
+                "record_count cannot be negative".to_string(),
+            ));
+        }
+        if self.file_size_bytes < 0 {
+            return Err(CatalogError::InvalidArgument(
+                "file_size_bytes cannot be negative".to_string(),
+            ));
+        }
+        if let Some(partition_values) = &self.partition_values {
+            if !partition_values.is_object() {
+                return Err(CatalogError::InvalidArgument(
+                    "partition_values must be a JSON object".to_string(),
+                ));
+            }
+        }
+        if let Some(format_options) = &self.format_options {
+            if !format_options.is_object() {
+                return Err(CatalogError::InvalidArgument(
+                    "format_options must be a JSON object".to_string(),
+                ));
+            }
+            file_format::validate_format_options(self.file_format.as_str(), format_options)
+                .map_err(|err| CatalogError::InvalidArgument(err.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -359,7 +458,7 @@ pub enum MutationOp {
     /// Set table properties (replaces existing)
     SetProperties(TableProperties),
     /// Remove properties by key
-    RemoveProperties(Vec<String>),
+    RemoveProperties(Vec<PropertyKey>),
 }
 
 /// Collection of operations applied atomically in one commit.
@@ -367,6 +466,60 @@ pub enum MutationOp {
 pub struct Mutation {
     /// Operations to apply
     pub operations: Vec<MutationOp>,
+}
+
+impl Mutation {
+    /// Validate mutation semantics before persistence.
+    pub fn validate(&self) -> Result<()> {
+        let mut update_schema_ops = 0_u32;
+        let mut set_properties_ops = 0_u32;
+
+        for op in &self.operations {
+            match op {
+                MutationOp::UpdateSchema(_) => {
+                    update_schema_ops += 1;
+                    if update_schema_ops > 1 {
+                        return Err(CatalogError::InvalidArgument(
+                            "mutation can include at most one UpdateSchema operation".to_string(),
+                        ));
+                    }
+                }
+                MutationOp::SetProperties(_) => {
+                    set_properties_ops += 1;
+                    if set_properties_ops > 1 {
+                        return Err(CatalogError::InvalidArgument(
+                            "mutation can include at most one SetProperties operation".to_string(),
+                        ));
+                    }
+                }
+                MutationOp::DeleteFiles(file_uuids) => {
+                    let mut seen = std::collections::HashSet::with_capacity(file_uuids.len());
+                    for file_uuid in file_uuids {
+                        if !seen.insert(*file_uuid) {
+                            return Err(CatalogError::InvalidArgument(format!(
+                                "duplicate file UUID in DeleteFiles: {}",
+                                file_uuid
+                            )));
+                        }
+                    }
+                }
+                MutationOp::RemoveProperties(keys) => {
+                    let mut seen = std::collections::HashSet::with_capacity(keys.len());
+                    for key in keys {
+                        if !seen.insert(key.as_str()) {
+                            return Err(CatalogError::InvalidArgument(format!(
+                                "duplicate property key in RemoveProperties: {}",
+                                key.as_str()
+                            )));
+                        }
+                    }
+                }
+                MutationOp::AppendFiles(_) => {}
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Builder for constructing and committing table mutations.
@@ -433,7 +586,7 @@ impl MutationBuilder {
     }
 
     /// Remove properties by key
-    pub fn remove_properties(mut self, keys: Vec<String>) -> Self {
+    pub fn remove_properties(mut self, keys: Vec<PropertyKey>) -> Self {
         self.mutation
             .operations
             .push(MutationOp::RemoveProperties(keys));
@@ -530,38 +683,6 @@ impl TableHandle {
         ))
     }
 
-    /// Append a single file using the current transaction ID
-    pub async fn append_file(&self, file: FileSpec) -> Result<CommitResult> {
-        self.write(None).await?.append_file(file).commit().await
-    }
-
-    /// Append multiple files using the current transaction ID
-    pub async fn append_files(&self, files: Vec<FileSpec>) -> Result<CommitResult> {
-        self.write(None).await?.append_files(files).commit().await
-    }
-
-    /// Delete files using the current transaction ID
-    pub async fn delete_files(&self, file_uuids: Vec<uuid::Uuid>) -> Result<CommitResult> {
-        self.write(None)
-            .await?
-            .delete_files(file_uuids)
-            .commit()
-            .await
-    }
-
-    /// Update schema using the current transaction ID
-    pub async fn update_schema(&self, schema: SchemaSpec) -> Result<CommitResult> {
-        self.write(None).await?.update_schema(schema).commit().await
-    }
-
-    /// Set properties using the current transaction ID
-    pub async fn set_properties(&self, properties: TableProperties) -> Result<CommitResult> {
-        self.write(None)
-            .await?
-            .set_properties(properties)
-            .commit()
-            .await
-    }
 }
 
 /// Transactional catalog API for table metadata.
@@ -705,19 +826,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         schema: SchemaSpec,
         properties: Option<TableProperties>,
     ) -> Result<TableHandle> {
-        if schema.columns.is_empty() {
-            return Err(CatalogError::InvalidArgument(
-                "schema must include at least one column".to_string(),
-            ));
-        }
-
-        if schema.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
-            return Err(CatalogError::LimitExceeded(format!(
-                "schema has {} columns, exceeds limit of {}",
-                schema.columns.len(),
-                limits::MAX_COLUMNS_PER_SCHEMA
-            )));
-        }
+        schema.validate()?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -1448,6 +1557,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                 limits::MAX_OPERATIONS_PER_MUTATION
             )));
         }
+        mutation.validate()?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -1517,13 +1627,14 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     for chunk in files.chunks(chunk_size as usize) {
                         row_data.clear();
                         for f in chunk {
+                            f.validate()?;
                             let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
                             let partition_text =
                                 serialize_json_optional(f.partition_values.as_ref())?;
                             let format_text = serialize_json_optional(f.format_options.as_ref())?;
                             row_data.push((
                                 file_uuid,
-                                f.file_format.clone(),
+                                f.file_format.as_str(),
                                 f.file_path.clone(),
                                 f.record_count,
                                 f.file_size_bytes,
@@ -1546,7 +1657,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             query = query
                                 .bind(file_uuid.as_bytes().as_slice())
                                 .bind(table_uuid.as_bytes().as_slice())
-                                .bind(format.as_str())
+                                .bind(*format)
                                 .bind(path.as_str())
                                 .bind(*rc)
                                 .bind(*size)
@@ -1586,18 +1697,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     }
                 }
                 MutationOp::UpdateSchema(schema_spec) => {
-                    if schema_spec.columns.is_empty() {
-                        return Err(CatalogError::InvalidArgument(
-                            "schema must have at least one column".to_string(),
-                        ));
-                    }
-                    if schema_spec.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
-                        return Err(CatalogError::LimitExceeded(format!(
-                            "schema has {} columns, exceeds limit of {}",
-                            schema_spec.columns.len(),
-                            limits::MAX_COLUMNS_PER_SCHEMA
-                        )));
-                    }
+                    schema_spec.validate()?;
 
                     let current_schema_uuid = current_schema_uuid.ok_or_else(|| {
                         CatalogError::InvalidArgument(
@@ -1741,7 +1841,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                         )));
                     }
                     for key in keys {
-                        properties_value.remove(&key);
+                        properties_value.remove(key.as_str());
                     }
                 }
             }
@@ -1780,19 +1880,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         schema: SchemaSpec,
         properties: Option<TableProperties>,
     ) -> Result<TableHandle> {
-        if schema.columns.is_empty() {
-            return Err(CatalogError::InvalidArgument(
-                "schema must include at least one column".to_string(),
-            ));
-        }
-
-        if schema.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
-            return Err(CatalogError::LimitExceeded(format!(
-                "schema has {} columns, exceeds limit of {}",
-                schema.columns.len(),
-                limits::MAX_COLUMNS_PER_SCHEMA
-            )));
-        }
+        schema.validate()?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -2536,6 +2624,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                 limits::MAX_OPERATIONS_PER_MUTATION
             )));
         }
+        mutation.validate()?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -2605,13 +2694,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     for chunk in files.chunks(chunk_size as usize) {
                         row_data.clear();
                         for f in chunk {
+                            f.validate()?;
                             let file_uuid = f.file_uuid.unwrap_or_else(uuid::Uuid::new_v4);
                             let partition_text =
                                 serialize_json_optional(f.partition_values.as_ref())?;
                             let format_text = serialize_json_optional(f.format_options.as_ref())?;
                             row_data.push((
                                 file_uuid,
-                                f.file_format.clone(),
+                                f.file_format.as_str(),
                                 f.file_path.clone(),
                                 f.record_count,
                                 f.file_size_bytes,
@@ -2650,7 +2740,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             query = query
                                 .bind(file_uuid.as_bytes().as_slice())
                                 .bind(table_uuid.as_bytes().as_slice())
-                                .bind(format.as_str())
+                                .bind(*format)
                                 .bind(path.as_str())
                                 .bind(*rc)
                                 .bind(*size)
@@ -2690,18 +2780,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     }
                 }
                 MutationOp::UpdateSchema(schema_spec) => {
-                    if schema_spec.columns.is_empty() {
-                        return Err(CatalogError::InvalidArgument(
-                            "schema must have at least one column".to_string(),
-                        ));
-                    }
-                    if schema_spec.columns.len() as u32 > limits::MAX_COLUMNS_PER_SCHEMA {
-                        return Err(CatalogError::LimitExceeded(format!(
-                            "schema has {} columns, exceeds limit of {}",
-                            schema_spec.columns.len(),
-                            limits::MAX_COLUMNS_PER_SCHEMA
-                        )));
-                    }
+                    schema_spec.validate()?;
 
                     let current_schema_uuid = current_schema_uuid.ok_or_else(|| {
                         CatalogError::InvalidArgument(
@@ -2858,7 +2937,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                         )));
                     }
                     for key in keys {
-                        properties_value.remove(&key);
+                        properties_value.remove(key.as_str());
                     }
                 }
             }
@@ -3018,6 +3097,105 @@ fn project_delta_range(
         removed_files: removed_by_uuid.into_values().collect(),
         new_schema,
         new_properties,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_spec_validate_rejects_duplicate_column_names() {
+        let schema = SchemaSpec::new()
+            .with_column(ColumnSpec::new("id", DataType::Int64))
+            .with_column(ColumnSpec::new("id", DataType::Int64));
+        let err = schema.validate().expect_err("schema should be invalid");
+        assert!(err.to_string().contains("duplicate column name"));
+    }
+
+    #[test]
+    fn schema_spec_validate_rejects_empty_column_name() {
+        let schema = SchemaSpec::new().with_column(ColumnSpec::new("   ", DataType::Int64));
+        let err = schema.validate().expect_err("schema should be invalid");
+        assert!(err.to_string().contains("column name cannot be empty"));
+    }
+
+    #[test]
+    fn schema_spec_validate_accepts_valid_schema() {
+        let schema = SchemaSpec::new()
+            .with_column(ColumnSpec::new("id", DataType::Int64))
+            .with_column(ColumnSpec::new("value", DataType::Utf8).nullable());
+        schema.validate().expect("schema should be valid");
+    }
+
+    #[test]
+    fn file_spec_validate_rejects_non_object_partition_values() {
+        let file = FileSpec::new(Format::Parquet, "/tmp/part-0.parquet", 1, 1)
+            .with_partition_values(serde_json::json!(["not-object"]));
+        let err = file.validate().expect_err("file spec should be invalid");
+        assert!(err.to_string().contains("partition_values must be a JSON object"));
+    }
+
+    #[test]
+    fn file_spec_validate_rejects_non_object_format_options() {
+        let file =
+            FileSpec::new(Format::Parquet, "/tmp/part-0.parquet", 1, 1).with_format_options(
+                serde_json::json!(["not-object"]),
+            );
+        let err = file.validate().expect_err("file spec should be invalid");
+        assert!(err.to_string().contains("format_options must be a JSON object"));
+    }
+
+    #[test]
+    fn file_spec_validate_accepts_valid_payload() {
+        let file = FileSpec::new(Format::Parquet, "/tmp/part-0.parquet", 1, 1)
+            .with_partition_values(serde_json::json!({"date": "2026-02-12"}))
+            .with_format_options(serde_json::json!({"compression": "zstd"}));
+        file.validate().expect("file spec should be valid");
+    }
+
+    #[test]
+    fn property_key_rejects_empty_value() {
+        let err = PropertyKey::new("   ").expect_err("key should be invalid");
+        assert!(err.to_string().contains("property key cannot be empty"));
+    }
+
+    #[test]
+    fn property_key_accepts_non_empty_value() {
+        let key = PropertyKey::new("owner").expect("key should be valid");
+        assert_eq!(key.as_str(), "owner");
+    }
+
+    #[test]
+    fn mutation_validate_rejects_duplicate_file_deletes() {
+        let file_uuid = uuid::Uuid::new_v4();
+        let mutation = Mutation {
+            operations: vec![MutationOp::DeleteFiles(vec![file_uuid, file_uuid])],
+        };
+        let err = mutation.validate().expect_err("mutation should be invalid");
+        assert!(err.to_string().contains("duplicate file UUID"));
+    }
+
+    #[test]
+    fn mutation_validate_rejects_duplicate_property_keys() {
+        let key1 = PropertyKey::new("owner").expect("valid");
+        let key2 = PropertyKey::new("owner").expect("valid");
+        let mutation = Mutation {
+            operations: vec![MutationOp::RemoveProperties(vec![key1, key2])],
+        };
+        let err = mutation.validate().expect_err("mutation should be invalid");
+        assert!(err.to_string().contains("duplicate property key"));
+    }
+
+    #[test]
+    fn mutation_validate_rejects_multiple_schema_updates() {
+        let s1 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64));
+        let s2 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64));
+        let mutation = Mutation {
+            operations: vec![MutationOp::UpdateSchema(s1), MutationOp::UpdateSchema(s2)],
+        };
+        let err = mutation.validate().expect_err("mutation should be invalid");
+        assert!(err.to_string().contains("at most one UpdateSchema"));
     }
 }
 

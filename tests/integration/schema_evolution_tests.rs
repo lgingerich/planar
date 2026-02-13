@@ -1,5 +1,20 @@
 use arrow::datatypes::DataType;
 use planar::catalog::{Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent};
+use planar::storage::Format;
+
+async fn commit_append_file(
+    table: &planar::catalog::TableHandle,
+    file: FileSpec,
+) -> planar::catalog::Result<planar::catalog::CommitResult> {
+    table.write(None).await?.append_file(file).commit().await
+}
+
+async fn commit_update_schema(
+    table: &planar::catalog::TableHandle,
+    schema: SchemaSpec,
+) -> planar::catalog::Result<planar::catalog::CommitResult> {
+    table.write(None).await?.update_schema(schema).commit().await
+}
 
 /// Test successful schema evolution with safe type widening
 #[tokio::test]
@@ -23,8 +38,8 @@ async fn test_safe_type_widening() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Add a file
-    let file = FileSpec::new("parquet", "/test/users/part-0.parquet", 100, 1024);
-    table.append_file(file).await?;
+    let file = FileSpec::new(Format::Parquet, "/test/users/part-0.parquet", 100, 1024);
+    commit_append_file(&table, file).await?;
 
     let view_before = table.read().await?;
     assert_eq!(view_before.schema.columns[0].column_type, DataType::Int32);
@@ -34,7 +49,7 @@ async fn test_safe_type_widening() -> Result<(), Box<dyn std::error::Error>> {
         .with_column(ColumnSpec::new("id", DataType::Int64))
         .with_column(ColumnSpec::new("name", DataType::Utf8));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(result.is_ok(), "Int32 -> Int64 should be allowed");
 
     // Verify new schema is in effect
@@ -73,13 +88,13 @@ async fn test_unsafe_type_narrowing_rejected() -> Result<(), Box<dyn std::error:
         .await?;
 
     // Add a file
-    let file = FileSpec::new("parquet", "/test/metrics/part-0.parquet", 100, 1024);
-    table.append_file(file).await?;
+    let file = FileSpec::new(Format::Parquet, "/test/metrics/part-0.parquet", 100, 1024);
+    commit_append_file(&table, file).await?;
 
     // Attempt to narrow Int64 -> Int32 (unsafe)
     let new_schema = SchemaSpec::new().with_column(ColumnSpec::new("value", DataType::Int32));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(result.is_err(), "Int64 -> Int32 should be rejected");
 
     let error_msg = result.unwrap_err().to_string();
@@ -124,7 +139,7 @@ async fn test_timestamp_precision_increase() -> Result<(), Box<dyn std::error::E
         DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
     ));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(
         result.is_ok(),
         "Timestamp precision increase should be allowed"
@@ -170,7 +185,7 @@ async fn test_timestamp_precision_decrease_rejected() -> Result<(), Box<dyn std:
         DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
     ));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(
         result.is_err(),
         "Timestamp precision decrease should be rejected"
@@ -208,7 +223,7 @@ async fn test_timestamp_timezone_change_rejected() -> Result<(), Box<dyn std::er
         DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
     ));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(result.is_err(), "Timezone change should be rejected");
 
     Ok(())
@@ -242,7 +257,7 @@ async fn test_making_column_nullable() -> Result<(), Box<dyn std::error::Error>>
         .with_column(ColumnSpec::new("id", DataType::Int64).nullable())
         .with_column(ColumnSpec::new("name", DataType::Utf8));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(result.is_ok(), "Making column nullable should be allowed");
 
     let view_after = table.read().await?;
@@ -276,7 +291,7 @@ async fn test_making_column_non_nullable_rejected() -> Result<(), Box<dyn std::e
         .with_column(ColumnSpec::new("id", DataType::Int64)) // non-nullable
         .with_column(ColumnSpec::new("name", DataType::Utf8));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(
         result.is_err(),
         "Making nullable column non-nullable should be rejected"
@@ -315,7 +330,7 @@ async fn test_adding_new_columns() -> Result<(), Box<dyn std::error::Error>> {
         .with_column(ColumnSpec::new("email", DataType::Utf8).nullable())
         .with_column(ColumnSpec::new("age", DataType::Int32).nullable());
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(result.is_ok(), "Adding new columns should be allowed");
 
     let view_after = table.read().await?;
@@ -347,7 +362,7 @@ async fn test_incompatible_type_change_rejected() -> Result<(), Box<dyn std::err
     // Attempt to change Utf8 -> Int64 (incompatible)
     let new_schema = SchemaSpec::new().with_column(ColumnSpec::new("value", DataType::Int64));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(
         result.is_err(),
         "Incompatible type change should be rejected"
@@ -379,7 +394,7 @@ async fn test_float_widening() -> Result<(), Box<dyn std::error::Error>> {
     let new_schema =
         SchemaSpec::new().with_column(ColumnSpec::new("temperature", DataType::Float64));
 
-    let result = table.update_schema(new_schema).await;
+    let result = commit_update_schema(&table, new_schema).await;
     assert!(result.is_ok(), "Float32 -> Float64 should be allowed");
 
     let view = table.read().await?;
@@ -412,7 +427,7 @@ async fn test_multiple_schema_evolutions() -> Result<(), Box<dyn std::error::Err
 
     // Evolution 1: Int8 -> Int16
     let schema_v2 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int16));
-    table.update_schema(schema_v2).await?;
+    commit_update_schema(&table, schema_v2).await?;
 
     let v2 = table.read().await?;
     assert_eq!(v2.schema.schema_version, 2);
@@ -420,7 +435,7 @@ async fn test_multiple_schema_evolutions() -> Result<(), Box<dyn std::error::Err
 
     // Evolution 2: Int16 -> Int32
     let schema_v3 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int32));
-    table.update_schema(schema_v3).await?;
+    commit_update_schema(&table, schema_v3).await?;
 
     let v3 = table.read().await?;
     assert_eq!(v3.schema.schema_version, 3);
@@ -428,7 +443,7 @@ async fn test_multiple_schema_evolutions() -> Result<(), Box<dyn std::error::Err
 
     // Evolution 3: Int32 -> Int64
     let schema_v4 = SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64));
-    table.update_schema(schema_v4).await?;
+    commit_update_schema(&table, schema_v4).await?;
 
     let v4 = table.read().await?;
     assert_eq!(v4.schema.schema_version, 4);
