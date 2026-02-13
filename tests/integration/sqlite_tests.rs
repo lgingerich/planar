@@ -134,7 +134,8 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sq
 async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     use arrow::datatypes::DataType;
     use planar::catalog::{
-        Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, schema,
+        Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, TableProperties,
+        schema,
     };
     use std::sync::Arc;
     use uuid::Uuid;
@@ -151,7 +152,7 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
             ident.clone(),
             "/tmp/schema_sync".to_string(),
             SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
-            Some(serde_json::json!({})),
+            Some(TableProperties::new()),
         )
         .await
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;

@@ -44,7 +44,87 @@ impl TableIdent {
     }
 }
 
+impl std::fmt::Display for TableIdent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.namespace, self.name)
+    }
+}
+
+/// Typed table properties wrapper.
+///
+/// Properties must always be a JSON object to avoid stringly-typed drift and
+/// to centralize validation at catalog boundaries.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TableProperties {
+    values: serde_json::Map<String, serde_json::Value>,
+}
+
+impl TableProperties {
+    /// Create empty table properties.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse table properties from JSON, requiring an object.
+    pub fn from_json(value: serde_json::Value) -> Result<Self> {
+        match value {
+            serde_json::Value::Object(values) => Ok(Self { values }),
+            _ => Err(CatalogError::InvalidArgument(
+                "table properties must be a JSON object".to_string(),
+            )),
+        }
+    }
+
+    /// Borrow table properties as a JSON object map.
+    pub fn as_map(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.values
+    }
+
+    /// Convert table properties into a JSON object value.
+    pub fn into_json(self) -> serde_json::Value {
+        serde_json::Value::Object(self.values)
+    }
+
+    /// Clone table properties into a JSON object value.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::Value::Object(self.values.clone())
+    }
+
+    /// Replace or insert a property value.
+    pub fn insert(&mut self, key: String, value: serde_json::Value) {
+        self.values.insert(key, value);
+    }
+
+    /// Remove a property key if present.
+    pub fn remove(&mut self, key: &str) {
+        self.values.remove(key);
+    }
+}
+
+impl TryFrom<serde_json::Value> for TableProperties {
+    type Error = CatalogError;
+
+    fn try_from(value: serde_json::Value) -> Result<Self> {
+        Self::from_json(value)
+    }
+}
+
+impl From<TableProperties> for serde_json::Value {
+    fn from(value: TableProperties) -> Self {
+        value.into_json()
+    }
+}
+
+impl std::fmt::Display for TableProperties {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let json = serde_json::to_string(&self.values).map_err(|_| std::fmt::Error)?;
+        f.write_str(&json)
+    }
+}
+
 /// Immutable table snapshot at a specific transaction.
+// NOTE: If TableView clones become hot-path expensive, revisit `Arc`-backed
+// shared ownership for heavy fields (`schema`, `files`, `properties`).
 #[derive(Debug, Clone)]
 pub struct TableView {
     /// Table identifier
@@ -57,9 +137,11 @@ pub struct TableView {
     pub schema: schema::Schema,
     /// Files in this table version
     pub files: Vec<schema::File>,
-    /// Table properties
-    pub properties: serde_json::Value,
+    /// Typed table properties
+    pub properties: TableProperties,
     /// Optional table statistics
+    // TODO: Make stats required once all write paths guarantee stats generation;
+    // this should include complete per-file stats coverage for every table snapshot.
     pub stats: Option<schema::TableStats>,
 }
 
@@ -77,7 +159,7 @@ pub struct TableDelta {
     /// New schema if changed
     pub new_schema: Option<schema::Schema>,
     /// New properties if changed
-    pub new_properties: Option<serde_json::Value>,
+    pub new_properties: Option<TableProperties>,
 }
 
 /// Result returned by a successful commit.
@@ -226,7 +308,7 @@ pub enum MutationOp {
     /// Update the table schema
     UpdateSchema(SchemaSpec),
     /// Set table properties (replaces existing)
-    SetProperties(serde_json::Value),
+    SetProperties(TableProperties),
     /// Remove properties by key
     RemoveProperties(Vec<String>),
 }
@@ -294,7 +376,7 @@ impl MutationBuilder {
     }
 
     /// Set table properties (replaces existing)
-    pub fn set_properties(mut self, properties: serde_json::Value) -> Self {
+    pub fn set_properties(mut self, properties: TableProperties) -> Self {
         self.mutation
             .operations
             .push(MutationOp::SetProperties(properties));
@@ -405,7 +487,7 @@ impl TableHandle {
     }
 
     /// Set properties using the current transaction ID
-    pub async fn set_properties(&self, properties: serde_json::Value) -> Result<CommitResult> {
+    pub async fn set_properties(&self, properties: TableProperties) -> Result<CommitResult> {
         self.write(None)
             .await?
             .set_properties(properties)
@@ -423,7 +505,7 @@ pub trait Catalog: Send + Sync {
         ident: TableIdent,
         location: String,
         schema: SchemaSpec,
-        properties: Option<serde_json::Value>,
+        properties: Option<TableProperties>,
     ) -> Result<TableHandle>;
 
     /// Loads a table handle if the table exists.
@@ -543,7 +625,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         ident: TableIdent,
         location: String,
         schema: SchemaSpec,
-        properties: Option<serde_json::Value>,
+        properties: Option<TableProperties>,
     ) -> Result<TableHandle> {
         if schema.columns.is_empty() {
             return Err(CatalogError::InvalidArgument(
@@ -579,8 +661,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         let table_uuid = uuid::Uuid::new_v4();
         let created_at = chrono::Utc::now();
-        let properties_value = properties.unwrap_or_else(|| serde_json::json!({}));
-        let properties_text = serialize_json(&properties_value)?;
+        let properties_value = properties.unwrap_or_default();
+        let properties_text = serialize_json(&properties_value.to_json())?;
 
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO tables (table_uuid, table_name, namespace, location, created_at, properties)
@@ -772,7 +854,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let _current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
-        let properties = parse_json(table_row.try_get("properties")?)?;
+        let properties = parse_table_properties(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -1024,7 +1106,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
-        let mut properties_value = parse_json(table_row.try_get("properties")?)?;
+        let mut properties_value = parse_table_properties(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -1291,18 +1373,15 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             limits::MAX_PROPERTY_KEYS_TO_REMOVE
                         )));
                     }
-                    let map = properties_value.as_object_mut().ok_or_else(|| {
-                        CatalogError::InvalidArgument("properties must be an object".to_string())
-                    })?;
                     for key in keys {
-                        map.remove(&key);
+                        properties_value.remove(&key);
                     }
                 }
             }
         }
 
         let schema_uuid_to_set = new_schema_uuid.or(current_schema_uuid);
-        let properties_text = serialize_json(&properties_value)?;
+        let properties_text = serialize_json(&properties_value.to_json())?;
 
         sqlx::query::<sqlx::Sqlite>(
             "UPDATE tables
@@ -1332,7 +1411,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         ident: TableIdent,
         location: String,
         schema: SchemaSpec,
-        properties: Option<serde_json::Value>,
+        properties: Option<TableProperties>,
     ) -> Result<TableHandle> {
         if schema.columns.is_empty() {
             return Err(CatalogError::InvalidArgument(
@@ -1368,8 +1447,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         let table_uuid = uuid::Uuid::new_v4();
         let created_at = chrono::Utc::now();
-        let properties_value = properties.unwrap_or_else(|| serde_json::json!({}));
-        let properties_text = serialize_json(&properties_value)?;
+        let properties_value = properties.unwrap_or_default();
+        let properties_text = serialize_json(&properties_value.to_json())?;
 
         sqlx::query::<sqlx::Postgres>(
             "INSERT INTO tables (table_uuid, table_name, namespace, location, created_at, properties)
@@ -1574,7 +1653,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let _current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
-        let properties = parse_json(table_row.try_get("properties")?)?;
+        let properties = parse_table_properties(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -1826,7 +1905,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
-        let mut properties_value = parse_json(table_row.try_get("properties")?)?;
+        let mut properties_value = parse_table_properties(table_row.try_get("properties")?)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -2122,18 +2201,15 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             limits::MAX_PROPERTY_KEYS_TO_REMOVE
                         )));
                     }
-                    let map = properties_value.as_object_mut().ok_or_else(|| {
-                        CatalogError::InvalidArgument("properties must be an object".to_string())
-                    })?;
                     for key in keys {
-                        map.remove(&key);
+                        properties_value.remove(&key);
                     }
                 }
             }
         }
 
         let schema_uuid_to_set = new_schema_uuid.or(current_schema_uuid);
-        let properties_text = serialize_json(&properties_value)?;
+        let properties_text = serialize_json(&properties_value.to_json())?;
 
         sqlx::query::<sqlx::Postgres>(
             "UPDATE tables
@@ -2201,6 +2277,11 @@ fn parse_json(value: Option<String>) -> Result<serde_json::Value> {
         }
         None => Ok(serde_json::json!({})),
     }
+}
+
+/// Parse table properties from optional string (defaults to empty object).
+fn parse_table_properties(value: Option<String>) -> Result<TableProperties> {
+    TableProperties::from_json(parse_json(value)?)
 }
 
 /// Parse optional JSON from optional string.

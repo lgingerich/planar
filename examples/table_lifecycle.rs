@@ -18,7 +18,9 @@
 //! This example uses an in-memory SQLite database, making it easy to run without any external dependencies.
 
 use arrow::datatypes::{DataType, TimeUnit};
-use planar::catalog::{Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent};
+use planar::catalog::{
+    Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, TableProperties,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,11 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .nullable(),
         );
 
-    let properties = serde_json::json!({
+    let properties = TableProperties::from_json(serde_json::json!({
         "description": "Sales transactions table",
         "owner": "analytics-team",
         "format": "parquet"
-    });
+    }))?;
 
     let table_handle = catalog
         .clone()
@@ -219,13 +221,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================================
     println!("⚙️  Step 8: Updating table properties...");
 
-    let updated_properties = serde_json::json!({
+    let updated_properties = TableProperties::from_json(serde_json::json!({
         "description": "Sales transactions table",
         "owner": "analytics-team",
         "format": "parquet",
         "last_updated": "2024-01-15",
         "retention_days": 365
-    });
+    }))?;
 
     // Convenience method automatically uses current transaction ID
     let commit_result = table_handle.set_properties(updated_properties).await?;

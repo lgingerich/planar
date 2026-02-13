@@ -17,7 +17,7 @@ use tokio::runtime::{Builder, Runtime};
 
 use crate::catalog::{
     Catalog, CatalogError as CoreCatalogError, ColumnSpec, CommitResult, FileSpec, SchemaSpec,
-    TableDelta, TableHandle, TableIdent, TableView,
+    TableDelta, TableHandle, TableIdent, TableProperties, TableView,
 };
 use crate::storage::StorageError as CoreStorageError;
 use crate::storage::{
@@ -605,7 +605,9 @@ impl PyCatalog {
         let ident = ident.to_core();
         let schema = schema.to_core();
         let properties = match properties {
-            Some(value) => Some(py_to_json_value(value)?),
+            Some(value) => Some(
+                TableProperties::from_json(py_to_json_value(value)?).map_err(catalog_error_to_py)?,
+            ),
             None => None,
         };
 
@@ -768,10 +770,11 @@ impl PyTableHandle {
 
     fn set_properties(&self, py: Python, properties: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
-        let json = py_to_json_value(properties)?;
+        let typed_properties =
+            TableProperties::from_json(py_to_json_value(properties)?).map_err(catalog_error_to_py)?;
         block_on_py(py, async move {
             let result = handle
-                .set_properties(json)
+                .set_properties(typed_properties)
                 .await
                 .map_err(catalog_error_to_py)?;
             Python::attach(|py| commit_result_to_py(py, &result))
@@ -866,7 +869,7 @@ fn table_view_to_py(py: Python, view: &TableView) -> PyResult<Py<PyAny>> {
     }
     dict.set_item("files", files)?;
 
-    dict.set_item("properties", json_value_to_py(py, &view.properties)?)?;
+    dict.set_item("properties", json_value_to_py(py, &view.properties.to_json())?)?;
     match &view.stats {
         Some(stats) => dict.set_item("stats", table_stats_to_py(py, stats)?)?,
         None => dict.set_item("stats", py.None())?,
@@ -898,7 +901,7 @@ fn table_delta_to_py(py: Python, delta: &TableDelta) -> PyResult<Py<PyAny>> {
     };
 
     match &delta.new_properties {
-        Some(props) => dict.set_item("new_properties", json_value_to_py(py, props)?)?,
+        Some(props) => dict.set_item("new_properties", json_value_to_py(py, &props.to_json())?)?,
         None => dict.set_item("new_properties", py.None())?,
     };
 
