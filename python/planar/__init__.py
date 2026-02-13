@@ -1,4 +1,14 @@
-from .catalog import Catalog, CommitResult, TableDelta, TableHandle, TableIdent, TableView
+from .catalog import (
+    Catalog,
+    CommitResult,
+    TableDelta,
+    TableHandle,
+    TableIdent,
+    TableView,
+    TxnEvent,
+    TxnFileChange,
+    TxnSchemaChange,
+)
 from .errors import CatalogError, PlanarError, StorageError
 from .schema import ColumnSpec, FileSpec, SchemaSpec
 from .storage import (
@@ -25,6 +35,9 @@ __all__ = [
     "TableHandle",
     "TableIdent",
     "TableView",
+    "TxnEvent",
+    "TxnFileChange",
+    "TxnSchemaChange",
     "read",
     "read_async",
     "read_stream",

@@ -17,7 +17,7 @@ use tokio::runtime::{Builder, Runtime};
 
 use crate::catalog::{
     Catalog, CatalogError as CoreCatalogError, ColumnSpec, CommitResult, FileSpec, SchemaSpec,
-    TableDelta, TableHandle, TableIdent, TableProperties, TableView,
+    TableDelta, TableHandle, TableIdent, TableProperties, TableView, TxnEvent, TxnFileChangeKind,
 };
 use crate::storage::StorageError as CoreStorageError;
 use crate::storage::{
@@ -718,6 +718,48 @@ impl PyTableHandle {
         })
     }
 
+    fn current_transaction_id(&self, py: Python) -> PyResult<String> {
+        let handle = self.inner.clone();
+        block_on_py(py, async move {
+            let txn_id = handle
+                .current_transaction_id()
+                .await
+                .map_err(catalog_error_to_py)?;
+            Ok(txn_id.to_string())
+        })
+    }
+
+    fn list_transaction_events(
+        &self,
+        py: Python,
+        to_transaction_id: String,
+        from_transaction_id_exclusive: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let handle = self.inner.clone();
+        let to_txn = uuid::Uuid::parse_str(&to_transaction_id).map_err(|err| {
+            PyErr::new::<PyValueError, _>(format!("Invalid transaction id: {}", err))
+        })?;
+        let from_txn_exclusive = match from_transaction_id_exclusive {
+            Some(value) => Some(uuid::Uuid::parse_str(&value).map_err(|err| {
+                PyErr::new::<PyValueError, _>(format!("Invalid transaction id: {}", err))
+            })?),
+            None => None,
+        };
+        block_on_py(py, async move {
+            let events = handle
+                .list_transaction_events(from_txn_exclusive, to_txn)
+                .await
+                .map_err(catalog_error_to_py)?;
+            Python::attach(|py| {
+                let list = PyList::empty(py);
+                for event in &events {
+                    list.append(txn_event_to_py(py, event)?)?;
+                }
+                list.into_py_any(py)
+            })
+        })
+    }
+
     fn append_file(&self, py: Python, file: PyRef<PyFileSpec>) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
         let file = file.inner.clone();
@@ -904,6 +946,37 @@ fn table_delta_to_py(py: Python, delta: &TableDelta) -> PyResult<Py<PyAny>> {
         Some(props) => dict.set_item("new_properties", json_value_to_py(py, &props.to_json())?)?,
         None => dict.set_item("new_properties", py.None())?,
     };
+
+    dict.into_py_any(py)
+}
+
+fn txn_event_to_py(py: Python, event: &TxnEvent) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("transaction_id", event.transaction_id.to_string())?;
+
+    let file_changes = PyList::empty(py);
+    for change in &event.file_changes {
+        let change_dict = PyDict::new(py);
+        let kind = match change.kind {
+            TxnFileChangeKind::Added => "added",
+            TxnFileChangeKind::Removed => "removed",
+        };
+        change_dict.set_item("kind", kind)?;
+        change_dict.set_item("transaction_id", change.transaction_id.to_string())?;
+        change_dict.set_item("file", file_to_py(py, &change.file)?)?;
+        file_changes.append(change_dict)?;
+    }
+    dict.set_item("file_changes", file_changes)?;
+
+    match &event.schema_change {
+        Some(change) => {
+            let schema_change = PyDict::new(py);
+            schema_change.set_item("transaction_id", change.transaction_id.to_string())?;
+            schema_change.set_item("schema", schema_to_py(py, &change.schema)?)?;
+            dict.set_item("schema_change", schema_change)?;
+        }
+        None => dict.set_item("schema_change", py.None())?,
+    }
 
     dict.into_py_any(py)
 }

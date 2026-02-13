@@ -83,6 +83,26 @@ class TableDelta:
 
 
 @dataclass(frozen=True)
+class TxnFileChange:
+    kind: str
+    transaction_id: str
+    file: FileView
+
+
+@dataclass(frozen=True)
+class TxnSchemaChange:
+    transaction_id: str
+    schema: SchemaView
+
+
+@dataclass(frozen=True)
+class TxnEvent:
+    transaction_id: str
+    file_changes: List[TxnFileChange]
+    schema_change: Optional[TxnSchemaChange]
+
+
+@dataclass(frozen=True)
 class CommitResult:
     transaction_id: str
     table_view: Optional[TableView]
@@ -158,6 +178,30 @@ def _table_delta_from_dict(raw: Dict[str, Any]) -> TableDelta:
         removed_files=[_file_from_dict(item) for item in raw["removed_files"]],
         new_schema=_schema_from_dict(raw["new_schema"]) if raw["new_schema"] else None,
         new_properties=raw["new_properties"],
+    )
+
+
+def _txn_event_from_dict(raw: Dict[str, Any]) -> TxnEvent:
+    schema_change_raw = raw.get("schema_change")
+    schema_change = (
+        TxnSchemaChange(
+            transaction_id=schema_change_raw["transaction_id"],
+            schema=_schema_from_dict(schema_change_raw["schema"]),
+        )
+        if schema_change_raw
+        else None
+    )
+    return TxnEvent(
+        transaction_id=raw["transaction_id"],
+        file_changes=[
+            TxnFileChange(
+                kind=item["kind"],
+                transaction_id=item["transaction_id"],
+                file=_file_from_dict(item["file"]),
+            )
+            for item in raw["file_changes"]
+        ],
+        schema_change=schema_change,
     )
 
 
@@ -246,6 +290,17 @@ class TableHandle:
         raw = self._inner.read_at(transaction_id)
         return _table_view_from_dict(raw)
 
+    def current_transaction_id(self) -> str:
+        return self._inner.current_transaction_id()
+
+    def list_transaction_events(
+        self, to_transaction_id: str, from_transaction_id_exclusive: Optional[str] = None
+    ) -> List[TxnEvent]:
+        raw = self._inner.list_transaction_events(
+            to_transaction_id, from_transaction_id_exclusive
+        )
+        return [_txn_event_from_dict(item) for item in raw]
+
     def diff(self, from_transaction_id: str, to_transaction_id: str) -> TableDelta:
         raw = self._inner.diff(from_transaction_id, to_transaction_id)
         return _table_delta_from_dict(raw)
@@ -271,6 +326,18 @@ class TableHandle:
 
     async def read_at_async(self, transaction_id: str) -> TableView:
         return await asyncio.to_thread(self.read_at, transaction_id)
+
+    async def current_transaction_id_async(self) -> str:
+        return await asyncio.to_thread(self.current_transaction_id)
+
+    async def list_transaction_events_async(
+        self, to_transaction_id: str, from_transaction_id_exclusive: Optional[str] = None
+    ) -> List[TxnEvent]:
+        return await asyncio.to_thread(
+            self.list_transaction_events,
+            to_transaction_id,
+            from_transaction_id_exclusive,
+        )
 
     async def diff_async(
         self, from_transaction_id: str, to_transaction_id: str
@@ -300,4 +367,7 @@ __all__ = [
     "TableIdent",
     "TableStats",
     "TableView",
+    "TxnEvent",
+    "TxnFileChange",
+    "TxnSchemaChange",
 ]

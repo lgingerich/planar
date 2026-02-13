@@ -29,3 +29,9 @@ def test_catalog_table_lifecycle_smoke():
     )
     result = table.append_file(file_spec)
     assert result.transaction_id
+    assert table.current_transaction_id() == result.transaction_id
+
+    events = table.list_transaction_events(result.transaction_id, view.transaction_id)
+    assert len(events) == 1
+    assert len(events[0].file_changes) == 1
+    assert events[0].file_changes[0].kind == "added"

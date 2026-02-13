@@ -318,3 +318,68 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 
     Ok(())
 }
+
+/// Validate event-range projection behavior under larger file counts.
+#[sqlx::test(migrations = "db/migrations")]
+async fn test_transaction_event_range_projection(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    use arrow::datatypes::DataType;
+    use planar::catalog::{Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent};
+    use std::sync::Arc;
+
+    database::sqlite::configure_pool(&pool).await?;
+
+    let catalog = Arc::new(SqlCatalog::new(pool.clone()));
+    let ident = TableIdent::new("scale", "event_log");
+    let table = catalog
+        .clone()
+        .create_table(
+            ident.clone(),
+            "/tmp/scale_event_log".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            None,
+        )
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let initial_txn = table
+        .current_transaction_id()
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    // Simulate sustained incremental commits.
+    let total_files = 400;
+    for i in 0..total_files {
+        let file = FileSpec::new(
+            "parquet",
+            format!("/tmp/scale_event_log/part-{i:05}.parquet"),
+            1,
+            128,
+        );
+        table
+            .append_file(file)
+            .await
+            .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+    }
+
+    let head_txn = table
+        .current_transaction_id()
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+    let events = table
+        .list_transaction_events(Some(initial_txn), head_txn)
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    assert_eq!(events.len(), total_files as usize);
+    let change_count: usize = events.iter().map(|event| event.file_changes.len()).sum();
+    assert_eq!(change_count, total_files as usize);
+
+    let delta = table
+        .diff(initial_txn, head_txn)
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+    assert_eq!(delta.added_files.len(), total_files as usize);
+    assert!(delta.removed_files.is_empty());
+
+    Ok(())
+}
