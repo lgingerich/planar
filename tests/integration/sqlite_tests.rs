@@ -1,11 +1,17 @@
-use planar::catalog::database;
 use sqlx::Sqlite;
+
+async fn configure_sqlite_pool(pool: &sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
 /// Test that all tables are created by migrations.
 #[sqlx::test(migrations = "db/migrations")]
 async fn test_schema_tables_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs (foreign keys, etc.)
-    database::sqlite::configure_pool(&pool).await?;
+    configure_sqlite_pool(&pool).await?;
 
     // Verify migrations ran (tables exist)
     let tables = vec![
@@ -40,7 +46,7 @@ async fn test_schema_tables_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::
 #[sqlx::test(migrations = "db/migrations")]
 async fn test_schema_indexes_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs
-    database::sqlite::configure_pool(&pool).await?;
+    configure_sqlite_pool(&pool).await?;
 
     let indexes = vec![
         "idx_transactions_table",
@@ -74,7 +80,7 @@ async fn test_schema_indexes_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx:
 #[sqlx::test(migrations = "db/migrations")]
 async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs - this is critical for foreign key enforcement
-    database::sqlite::configure_pool(&pool).await?;
+    configure_sqlite_pool(&pool).await?;
 
     // Verify foreign keys are enabled
     let fk_enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
@@ -142,7 +148,7 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
     use uuid::Uuid;
 
     // Configure SQLite PRAGMAs
-    database::sqlite::configure_pool(&pool).await?;
+    configure_sqlite_pool(&pool).await?;
 
     // Seed one end-to-end table so decode checks run against real rows.
     let catalog = Arc::new(SqlCatalog::new(pool.clone()));
@@ -332,7 +338,7 @@ async fn test_transaction_event_range_projection(pool: sqlx::Pool<Sqlite>) -> Re
     use planar::storage::Format;
     use std::sync::Arc;
 
-    database::sqlite::configure_pool(&pool).await?;
+    configure_sqlite_pool(&pool).await?;
 
     let catalog = Arc::new(SqlCatalog::new(pool.clone()));
     let ident = TableIdent::new("scale", "event_log");

@@ -12,12 +12,10 @@ pub mod sqlite {
     ///
     /// Must be called after pool creation and before running migrations.
     /// SQLite does not enforce foreign keys unless explicitly enabled.
-    pub async fn configure_pool(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-        // SQLite doesn't enforce foreign keys by default - must enable via PRAGMA
+    pub async fn configure_pool(pool: &Pool<Sqlite>) -> std::result::Result<(), sqlx::Error> {
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(pool)
             .await?;
-
         Ok(())
     }
 }
@@ -29,10 +27,8 @@ pub mod postgres {
 
     /// Configures PostgreSQL settings for catalog usage.
     ///
-    /// PostgreSQL defaults are already appropriate here, so this is currently
-    /// a no-op extension point.
-    pub async fn configure_pool(_pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
-        // No configuration needed - PostgreSQL defaults are appropriate
+    /// PostgreSQL defaults are currently sufficient; this is a no-op extension point.
+    pub async fn configure_pool(_pool: &Pool<Postgres>) -> std::result::Result<(), sqlx::Error> {
         Ok(())
     }
 }
