@@ -306,7 +306,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .execute(tx.as_mut())
         .await?;
 
-        let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+        // Chunk columns per statement so total bind parameters stay under DB limits.
+        let col_chunk_size = limits::batch_insert_columns_chunk(database::DbKind::Sqlite);
+        debug_assert!(
+            limits::column_insert_bind_count(col_chunk_size)
+                <= limits::db_bind_limit(database::DbKind::Sqlite),
+            "column insert chunk exceeds SQLite bind parameter limit"
+        );
         let mut row_data = Vec::with_capacity(col_chunk_size as usize);
         for (chunk_index, col_chunk) in schema.columns.chunks(col_chunk_size as usize).enumerate() {
             row_data.clear();
@@ -1065,7 +1071,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             limits::MAX_FILES_PER_APPEND
                         )));
                     }
+                    // Chunk file inserts to keep per-statement bind count bounded.
                     let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
+                    debug_assert!(
+                        limits::file_insert_bind_count(chunk_size)
+                            <= limits::db_bind_limit(database::DbKind::Sqlite),
+                        "file insert chunk exceeds SQLite bind parameter limit"
+                    );
                     let mut row_data = Vec::with_capacity(chunk_size as usize);
                     for chunk in files.chunks(chunk_size as usize) {
                         row_data.clear();
@@ -1119,7 +1131,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                             limits::MAX_FILES_PER_DELETE
                         )));
                     }
+                    // Chunk deletes so `IN (...)` stays under DB bind parameter limits.
                     let chunk_size = limits::BATCH_DELETE_FILES_CHUNK;
+                    debug_assert!(
+                        limits::delete_files_bind_count(chunk_size)
+                            <= limits::db_bind_limit(database::DbKind::Sqlite),
+                        "file delete chunk exceeds SQLite bind parameter limit"
+                    );
                     for chunk in file_uuids.chunks(chunk_size as usize) {
                         let in_placeholders: String = (0..chunk.len())
                             .map(|i| format!("?{}", i + 3))
@@ -1223,7 +1241,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     .execute(tx.as_mut())
                     .await?;
 
-                    let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+                    let col_chunk_size =
+                        limits::batch_insert_columns_chunk(database::DbKind::Sqlite);
+                    debug_assert!(
+                        limits::column_insert_bind_count(col_chunk_size)
+                            <= limits::db_bind_limit(database::DbKind::Sqlite),
+                        "column insert chunk exceeds SQLite bind parameter limit"
+                    );
                     let mut row_data = Vec::with_capacity(col_chunk_size as usize);
                     for (chunk_index, col_chunk) in schema_spec
                         .columns
@@ -1391,7 +1415,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .execute(tx.as_mut())
         .await?;
 
-        let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+        // Chunk columns per statement so total bind parameters stay under DB limits.
+        let col_chunk_size = limits::batch_insert_columns_chunk(database::DbKind::Postgres);
+        debug_assert!(
+            limits::column_insert_bind_count(col_chunk_size)
+                <= limits::db_bind_limit(database::DbKind::Postgres),
+            "column insert chunk exceeds Postgres bind parameter limit"
+        );
         let mut row_data = Vec::with_capacity(col_chunk_size as usize);
         for (chunk_index, col_chunk) in schema.columns.chunks(col_chunk_size as usize).enumerate() {
             row_data.clear();
@@ -2163,7 +2193,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             limits::MAX_FILES_PER_APPEND
                         )));
                     }
+                    // Chunk file inserts to keep per-statement bind count bounded.
                     let chunk_size = limits::BATCH_INSERT_FILES_CHUNK;
+                    debug_assert!(
+                        limits::file_insert_bind_count(chunk_size)
+                            <= limits::db_bind_limit(database::DbKind::Postgres),
+                        "file insert chunk exceeds Postgres bind parameter limit"
+                    );
                     let mut row_data = Vec::with_capacity(chunk_size as usize);
                     for chunk in files.chunks(chunk_size as usize) {
                         row_data.clear();
@@ -2233,7 +2269,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                             limits::MAX_FILES_PER_DELETE
                         )));
                     }
+                    // Chunk deletes so `IN (...)` stays under DB bind parameter limits.
                     let chunk_size = limits::BATCH_DELETE_FILES_CHUNK;
+                    debug_assert!(
+                        limits::delete_files_bind_count(chunk_size)
+                            <= limits::db_bind_limit(database::DbKind::Postgres),
+                        "file delete chunk exceeds Postgres bind parameter limit"
+                    );
                     for chunk in file_uuids.chunks(chunk_size as usize) {
                         let in_placeholders: String = (1..=chunk.len())
                             .map(|i| format!("${}", i + 2))
@@ -2337,7 +2379,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     .execute(tx.as_mut())
                     .await?;
 
-                    let col_chunk_size = limits::BATCH_INSERT_COLUMNS_CHUNK;
+                    let col_chunk_size =
+                        limits::batch_insert_columns_chunk(database::DbKind::Postgres);
+                    debug_assert!(
+                        limits::column_insert_bind_count(col_chunk_size)
+                            <= limits::db_bind_limit(database::DbKind::Postgres),
+                        "column insert chunk exceeds Postgres bind parameter limit"
+                    );
                     let mut row_data = Vec::with_capacity(col_chunk_size as usize);
                     for (chunk_index, col_chunk) in schema_spec
                         .columns

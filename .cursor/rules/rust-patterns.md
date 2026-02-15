@@ -40,6 +40,7 @@ API DESIGN
   - Prefer `impl Trait` in arguments/returns for readability when appropriate.
 - Prefer `AsRef<Path>` for path-like inputs and `IntoIterator` for iterable inputs when it helps ergonomics.
 - Prefer returning iterators only when it’s genuinely useful; otherwise return collections or slices.
+- Prefer passing a small backend enum (for example, `DbKind`) into a single selector function for DB-specific limits/config, rather than creating many backend-specific tiny helper functions.
 - Prefer concrete option types over JSON for core APIs; keep JSON only at persistence boundaries.
 - For known constrained domains (formats, states, operation kinds), prefer enums over strings.
 - Keep read/write/stream APIs aligned across formats so sync/async behavior matches at the core layer.

@@ -3,6 +3,15 @@
 //! These helpers keep backend-specific setup (for example, SQLite PRAGMAs)
 //! separate from portable catalog logic.
 
+/// Supported catalog database backends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DbKind {
+    /// SQLite backend.
+    Sqlite,
+    /// PostgreSQL backend.
+    Postgres,
+}
+
 /// SQLite-specific catalog connection configuration.
 pub mod sqlite {
     use sqlx::Pool;
