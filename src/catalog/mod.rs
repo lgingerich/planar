@@ -27,6 +27,8 @@ use helpers::{
 };
 pub use models::*;
 
+const INITIAL_SCHEMA_VERSION: i32 = 1;
+
 /// Client protocol versions used for compatibility checks.
 #[derive(Clone, Copy, Debug)]
 pub struct ProtocolVersions {
@@ -298,7 +300,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         )
         .bind(schema_uuid.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(1_i32)
+        .bind(INITIAL_SCHEMA_VERSION)
         .bind(transaction_id.as_bytes().as_slice())
         .bind(created_at)
         .execute(tx.as_mut())
@@ -1383,7 +1385,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         )
         .bind(schema_uuid.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
-        .bind(1_i32)
+        .bind(INITIAL_SCHEMA_VERSION)
         .bind(transaction_id.as_bytes().as_slice())
         .bind(created_at)
         .execute(tx.as_mut())
