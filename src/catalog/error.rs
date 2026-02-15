@@ -17,6 +17,20 @@ pub enum CatalogError {
     /// Invalid argument provided
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// Client protocol is incompatible with table requirements
+    #[error(
+        "incompatible {operation} protocol for table {table}: client={client_version}, required_min={required_min_version}"
+    )]
+    ProtocolVersionIncompatible {
+        /// Operation being attempted (for example, read or write)
+        operation: &'static str,
+        /// Table identifier rendered as namespace.name
+        table: String,
+        /// Client protocol version used by this catalog instance
+        client_version: i32,
+        /// Minimum protocol version required by the table
+        required_min_version: i32,
+    },
     /// Feature not yet implemented
     #[error("feature not yet implemented: {0}")]
     NotYetImplemented(String),

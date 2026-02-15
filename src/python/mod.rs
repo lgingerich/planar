@@ -21,8 +21,7 @@ use crate::catalog::{
 };
 use crate::storage::StorageError as CoreStorageError;
 use crate::storage::{
-    Format,
-    RecordBatchStream,
+    Format, RecordBatchStream,
     file_format::lance::LanceReadOptions,
     file_format::lance::parse_write_options as parse_lance_write_options,
     file_format::parquet::parse_write_options as parse_parquet_write_options,
@@ -528,9 +527,7 @@ impl PyFileSpec {
         file_size_bytes: i64,
         format_options: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let file_format = file_format
-            .parse::<Format>()
-            .map_err(storage_error_to_py)?;
+        let file_format = file_format.parse::<Format>().map_err(storage_error_to_py)?;
         let mut inner = FileSpec::new(file_format, file_path, record_count, file_size_bytes);
         if let Some(options) = format_options {
             if !options.is_none() {
@@ -610,7 +607,8 @@ impl PyCatalog {
         let schema = schema.to_core();
         let properties = match properties {
             Some(value) => Some(
-                TableProperties::from_json(py_to_json_value(value)?).map_err(catalog_error_to_py)?,
+                TableProperties::from_json(py_to_json_value(value)?)
+                    .map_err(catalog_error_to_py)?,
             ),
             None => None,
         };
@@ -828,8 +826,8 @@ impl PyTableHandle {
 
     fn set_properties(&self, py: Python, properties: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let handle = self.inner.clone();
-        let typed_properties =
-            TableProperties::from_json(py_to_json_value(properties)?).map_err(catalog_error_to_py)?;
+        let typed_properties = TableProperties::from_json(py_to_json_value(properties)?)
+            .map_err(catalog_error_to_py)?;
         block_on_py(py, async move {
             let result = handle
                 .write(None)
@@ -931,7 +929,10 @@ fn table_view_to_py(py: Python, view: &TableView) -> PyResult<Py<PyAny>> {
     }
     dict.set_item("files", files)?;
 
-    dict.set_item("properties", json_value_to_py(py, &view.properties.to_json())?)?;
+    dict.set_item(
+        "properties",
+        json_value_to_py(py, &view.properties.to_json())?,
+    )?;
     match &view.stats {
         Some(stats) => dict.set_item("stats", table_stats_to_py(py, stats)?)?,
         None => dict.set_item("stats", py.None())?,

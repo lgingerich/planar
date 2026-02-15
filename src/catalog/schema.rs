@@ -24,6 +24,10 @@ pub struct Table {
     pub created_at: DateTime<Utc>,
     /// Table properties
     pub properties: serde_json::Value,
+    /// Minimum reader protocol version required to read table metadata.
+    pub min_reader_version: i32,
+    /// Minimum writer protocol version required to commit mutations.
+    pub min_writer_version: i32,
 }
 
 /// Transaction record

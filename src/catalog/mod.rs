@@ -21,12 +21,29 @@ pub mod schema;
 
 pub use data_type::{can_evolve_to, decode_data_type, encode_data_type};
 pub use error::{CatalogError, Result};
-pub use models::*;
 use helpers::{
     next_transaction_id, parse_json_optional, parse_table_properties, project_delta_range,
     serialize_json, serialize_json_optional, uuid_from_row, uuid_from_row_optional,
 };
+pub use models::*;
 
+/// Client protocol versions used for compatibility checks.
+#[derive(Clone, Copy, Debug)]
+pub struct ProtocolVersions {
+    /// Client reader protocol version.
+    pub reader: i32,
+    /// Client writer protocol version.
+    pub writer: i32,
+}
+
+impl Default for ProtocolVersions {
+    fn default() -> Self {
+        Self {
+            reader: 1,
+            writer: 1,
+        }
+    }
+}
 
 /// Transactional catalog API for table metadata.
 #[async_trait]
@@ -93,6 +110,8 @@ where
 {
     /// Database connection pool
     pool: Pool<DB>,
+    /// Client protocol versions bound to this catalog instance.
+    client_protocol: ProtocolVersions,
 }
 
 impl<DB> SqlCatalog<DB>
@@ -102,7 +121,15 @@ where
 {
     /// Create a new SQL catalog with a connection pool
     pub fn new(pool: Pool<DB>) -> Self {
-        Self { pool }
+        Self::new_with_protocol_versions(pool, ProtocolVersions::default())
+    }
+
+    /// Create a new SQL catalog with explicit client protocol versions.
+    pub fn new_with_protocol_versions(pool: Pool<DB>, client_protocol: ProtocolVersions) -> Self {
+        Self {
+            pool,
+            client_protocol,
+        }
     }
 
     /// Initialize the database schema by running migrations
@@ -110,6 +137,14 @@ where
         let migrator = sqlx::migrate!("db/migrations");
         migrator.run(&self.pool).await?;
         Ok(())
+    }
+
+    fn reader_version(&self) -> i32 {
+        self.client_protocol.reader
+    }
+
+    fn writer_version(&self) -> i32 {
+        self.client_protocol.writer
     }
 }
 
@@ -124,10 +159,22 @@ impl SqlCatalog<sqlx::Sqlite> {
     pub async fn from_connection_string(
         connection_string: &str,
     ) -> std::result::Result<Arc<Self>, sqlx::Error> {
+        Self::from_connection_string_with_protocol_versions(
+            connection_string,
+            ProtocolVersions::default(),
+        )
+        .await
+    }
+
+    /// Create and initialize a SQLite catalog with explicit protocol versions.
+    pub async fn from_connection_string_with_protocol_versions(
+        connection_string: &str,
+        client_protocol: ProtocolVersions,
+    ) -> std::result::Result<Arc<Self>, sqlx::Error> {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect(connection_string)
             .await?;
-        let catalog = Arc::new(Self::new(pool));
+        let catalog = Arc::new(Self::new_with_protocol_versions(pool, client_protocol));
         catalog.configure_database().await?;
         catalog.initialize_schema().await?;
         Ok(catalog)
@@ -135,7 +182,15 @@ impl SqlCatalog<sqlx::Sqlite> {
 
     /// Create an in-memory SQLite catalog
     pub async fn in_memory() -> std::result::Result<Arc<Self>, sqlx::Error> {
-        Self::from_connection_string("sqlite::memory:").await
+        Self::in_memory_with_protocol_versions(ProtocolVersions::default()).await
+    }
+
+    /// Create an in-memory SQLite catalog with explicit protocol versions.
+    pub async fn in_memory_with_protocol_versions(
+        client_protocol: ProtocolVersions,
+    ) -> std::result::Result<Arc<Self>, sqlx::Error> {
+        Self::from_connection_string_with_protocol_versions("sqlite::memory:", client_protocol)
+            .await
     }
 }
 
@@ -150,10 +205,22 @@ impl SqlCatalog<sqlx::Postgres> {
     pub async fn from_connection_string(
         connection_string: &str,
     ) -> std::result::Result<Arc<Self>, sqlx::Error> {
+        Self::from_connection_string_with_protocol_versions(
+            connection_string,
+            ProtocolVersions::default(),
+        )
+        .await
+    }
+
+    /// Create and initialize a PostgreSQL catalog with explicit protocol versions.
+    pub async fn from_connection_string_with_protocol_versions(
+        connection_string: &str,
+        client_protocol: ProtocolVersions,
+    ) -> std::result::Result<Arc<Self>, sqlx::Error> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect(connection_string)
             .await?;
-        let catalog = Arc::new(Self::new(pool));
+        let catalog = Arc::new(Self::new_with_protocol_versions(pool, client_protocol));
         catalog.configure_database().await?;
         catalog.initialize_schema().await?;
         Ok(catalog)
@@ -193,10 +260,14 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let created_at = chrono::Utc::now();
         let properties_value = properties.unwrap_or_default();
         let properties_text = serialize_json(&properties_value.to_json())?;
+        let min_reader_version = self.reader_version();
+        let min_writer_version = self.writer_version();
 
         sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO tables (table_uuid, table_name, namespace, location, created_at, properties)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO tables (
+                table_uuid, table_name, namespace, location, created_at, properties,
+                min_reader_version, min_writer_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(table_uuid.as_bytes().as_slice())
         .bind(ident.name.as_str())
@@ -204,6 +275,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .bind(location.as_str())
         .bind(created_at)
         .bind(properties_text.as_str())
+        .bind(min_reader_version)
+        .bind(min_writer_version)
         .execute(tx.as_mut())
         .await?;
 
@@ -367,11 +440,12 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .fetch_optional(&self.pool)
         .await?;
 
-        let table_row = table_row.ok_or_else(|| {
-            CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name))
-        })?;
+        let table_row = table_row
+            .ok_or_else(|| CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name)))?;
         let txn_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
-        txn_id.ok_or_else(|| CatalogError::InvalidArgument("table has no current transaction".to_string()))
+        txn_id.ok_or_else(|| {
+            CatalogError::InvalidArgument("table has no current transaction".to_string())
+        })
     }
 
     async fn list_transaction_events(
@@ -387,12 +461,13 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         .bind(ident.name.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        let table_row = table_row.ok_or_else(|| {
-            CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name))
-        })?;
+        let table_row = table_row
+            .ok_or_else(|| CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name)))?;
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?
-            .ok_or_else(|| CatalogError::InvalidArgument("table has no current transaction".to_string()))?;
+            .ok_or_else(|| {
+                CatalogError::InvalidArgument("table has no current transaction".to_string())
+            })?;
 
         if cursor.to_inclusive.as_u128() > current_transaction_id.as_u128() {
             return Err(CatalogError::InvalidArgument(
@@ -557,8 +632,10 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         for row in removed_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
             let format_options: Option<String> = row.try_get("format_options")?;
-            let removed_in_transaction_id = uuid_from_row_optional(&row, "removed_in_transaction_id")?
-                .ok_or_else(|| CatalogError::InvalidArgument("missing removed transaction id".to_string()))?;
+            let removed_in_transaction_id =
+                uuid_from_row_optional(&row, "removed_in_transaction_id")?.ok_or_else(|| {
+                    CatalogError::InvalidArgument("missing removed transaction id".to_string())
+                })?;
             if let Some(index) = index_by_txn.get(&removed_in_transaction_id) {
                 events[*index].file_changes.push(TxnFileChange {
                     transaction_id: removed_in_transaction_id,
@@ -611,7 +688,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
 
         for schema_row in schema_rows {
             let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
-            let valid_from_transaction_id = uuid_from_row(&schema_row, "valid_from_transaction_id")?;
+            let valid_from_transaction_id =
+                uuid_from_row(&schema_row, "valid_from_transaction_id")?;
             let column_rows = sqlx::query::<sqlx::Sqlite>(
                 "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
                  FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
@@ -663,7 +741,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         at_transaction_id: Option<TxnId>,
     ) -> Result<TableView> {
         let table_row = sqlx::query::<sqlx::Sqlite>(
-            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties
+            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties,
+                    min_reader_version, min_writer_version
              FROM tables WHERE namespace = ?1 AND table_name = ?2",
         )
         .bind(ident.namespace.as_str())
@@ -684,7 +763,16 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let _current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
+        let min_reader_version: i32 = table_row.try_get("min_reader_version")?;
         let properties = parse_table_properties(table_row.try_get("properties")?)?;
+        if self.reader_version() < min_reader_version {
+            return Err(CatalogError::ProtocolVersionIncompatible {
+                operation: "read",
+                table: ident.to_string(),
+                client_version: self.reader_version(),
+                required_min_version: min_reader_version,
+            });
+        }
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -905,7 +993,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let mut tx = self.pool.begin().await?;
 
         let table_row = sqlx::query::<sqlx::Sqlite>(
-            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties
+            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties,
+                    min_reader_version, min_writer_version
              FROM tables WHERE namespace = ?1 AND table_name = ?2",
         )
         .bind(ident.namespace.as_str())
@@ -926,7 +1015,16 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
+        let min_writer_version: i32 = table_row.try_get("min_writer_version")?;
         let mut properties_value = parse_table_properties(table_row.try_get("properties")?)?;
+        if self.writer_version() < min_writer_version {
+            return Err(CatalogError::ProtocolVersionIncompatible {
+                operation: "write",
+                table: ident.to_string(),
+                client_version: self.writer_version(),
+                required_min_version: min_writer_version,
+            });
+        }
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -1247,10 +1345,14 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let created_at = chrono::Utc::now();
         let properties_value = properties.unwrap_or_default();
         let properties_text = serialize_json(&properties_value.to_json())?;
+        let min_reader_version = self.reader_version();
+        let min_writer_version = self.writer_version();
 
         sqlx::query::<sqlx::Postgres>(
-            "INSERT INTO tables (table_uuid, table_name, namespace, location, created_at, properties)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO tables (
+                table_uuid, table_name, namespace, location, created_at, properties,
+                min_reader_version, min_writer_version
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(table_uuid.as_bytes().as_slice())
         .bind(ident.name.as_str())
@@ -1258,6 +1360,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .bind(location.as_str())
         .bind(created_at)
         .bind(properties_text.as_str())
+        .bind(min_reader_version)
+        .bind(min_writer_version)
         .execute(tx.as_mut())
         .await?;
 
@@ -1434,11 +1538,12 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .fetch_optional(&self.pool)
         .await?;
 
-        let table_row = table_row.ok_or_else(|| {
-            CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name))
-        })?;
+        let table_row = table_row
+            .ok_or_else(|| CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name)))?;
         let txn_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
-        txn_id.ok_or_else(|| CatalogError::InvalidArgument("table has no current transaction".to_string()))
+        txn_id.ok_or_else(|| {
+            CatalogError::InvalidArgument("table has no current transaction".to_string())
+        })
     }
 
     async fn list_transaction_events(
@@ -1454,12 +1559,13 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         .bind(ident.name.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        let table_row = table_row.ok_or_else(|| {
-            CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name))
-        })?;
+        let table_row = table_row
+            .ok_or_else(|| CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name)))?;
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?
-            .ok_or_else(|| CatalogError::InvalidArgument("table has no current transaction".to_string()))?;
+            .ok_or_else(|| {
+                CatalogError::InvalidArgument("table has no current transaction".to_string())
+            })?;
 
         if cursor.to_inclusive.as_u128() > current_transaction_id.as_u128() {
             return Err(CatalogError::InvalidArgument(
@@ -1624,8 +1730,10 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         for row in removed_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
             let format_options: Option<String> = row.try_get("format_options")?;
-            let removed_in_transaction_id = uuid_from_row_optional(&row, "removed_in_transaction_id")?
-                .ok_or_else(|| CatalogError::InvalidArgument("missing removed transaction id".to_string()))?;
+            let removed_in_transaction_id =
+                uuid_from_row_optional(&row, "removed_in_transaction_id")?.ok_or_else(|| {
+                    CatalogError::InvalidArgument("missing removed transaction id".to_string())
+                })?;
             if let Some(index) = index_by_txn.get(&removed_in_transaction_id) {
                 events[*index].file_changes.push(TxnFileChange {
                     transaction_id: removed_in_transaction_id,
@@ -1678,7 +1786,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
 
         for schema_row in schema_rows {
             let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
-            let valid_from_transaction_id = uuid_from_row(&schema_row, "valid_from_transaction_id")?;
+            let valid_from_transaction_id =
+                uuid_from_row(&schema_row, "valid_from_transaction_id")?;
             let column_rows = sqlx::query::<sqlx::Postgres>(
                 "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
                  FROM columns WHERE schema_uuid = $1 ORDER BY ordinal_position LIMIT $2",
@@ -1730,7 +1839,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         at_transaction_id: Option<TxnId>,
     ) -> Result<TableView> {
         let table_row = sqlx::query::<sqlx::Postgres>(
-            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties
+            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties,
+                    min_reader_version, min_writer_version
              FROM tables WHERE namespace = $1 AND table_name = $2",
         )
         .bind(ident.namespace.as_str())
@@ -1751,7 +1861,16 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let _current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
+        let min_reader_version: i32 = table_row.try_get("min_reader_version")?;
         let properties = parse_table_properties(table_row.try_get("properties")?)?;
+        if self.reader_version() < min_reader_version {
+            return Err(CatalogError::ProtocolVersionIncompatible {
+                operation: "read",
+                table: ident.to_string(),
+                client_version: self.reader_version(),
+                required_min_version: min_reader_version,
+            });
+        }
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -1972,7 +2091,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let mut tx = self.pool.begin().await?;
 
         let table_row = sqlx::query::<sqlx::Postgres>(
-            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties
+            "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties,
+                    min_reader_version, min_writer_version
              FROM tables WHERE namespace = $1 AND table_name = $2",
         )
         .bind(ident.namespace.as_str())
@@ -1993,7 +2113,16 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
+        let min_writer_version: i32 = table_row.try_get("min_writer_version")?;
         let mut properties_value = parse_table_properties(table_row.try_get("properties")?)?;
+        if self.writer_version() < min_writer_version {
+            return Err(CatalogError::ProtocolVersionIncompatible {
+                operation: "write",
+                table: ident.to_string(),
+                client_version: self.writer_version(),
+                required_min_version: min_writer_version,
+            });
+        }
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -2310,12 +2439,11 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
     use crate::storage::Format;
+    use arrow::datatypes::DataType;
 
     #[test]
     fn schema_spec_validate_rejects_duplicate_column_names() {
@@ -2346,17 +2474,21 @@ mod tests {
         let file = FileSpec::new(Format::Parquet, "/tmp/part-0.parquet", 1, 1)
             .with_partition_values(serde_json::json!(["not-object"]));
         let err = file.validate().expect_err("file spec should be invalid");
-        assert!(err.to_string().contains("partition_values must be a JSON object"));
+        assert!(
+            err.to_string()
+                .contains("partition_values must be a JSON object")
+        );
     }
 
     #[test]
     fn file_spec_validate_rejects_non_object_format_options() {
-        let file =
-            FileSpec::new(Format::Parquet, "/tmp/part-0.parquet", 1, 1).with_format_options(
-                serde_json::json!(["not-object"]),
-            );
+        let file = FileSpec::new(Format::Parquet, "/tmp/part-0.parquet", 1, 1)
+            .with_format_options(serde_json::json!(["not-object"]));
         let err = file.validate().expect_err("file spec should be invalid");
-        assert!(err.to_string().contains("format_options must be a JSON object"));
+        assert!(
+            err.to_string()
+                .contains("format_options must be a JSON object")
+        );
     }
 
     #[test]
@@ -2411,4 +2543,3 @@ mod tests {
         assert!(err.to_string().contains("at most one UpdateSchema"));
     }
 }
-

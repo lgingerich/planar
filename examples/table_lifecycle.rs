@@ -193,7 +193,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Files removed: {}", delta.removed_files.len());
 
     let events = table_handle
-        .list_transaction_events(Some(view_after_txn1.transaction_id), view_after_txn2.transaction_id)
+        .list_transaction_events(
+            Some(view_after_txn1.transaction_id),
+            view_after_txn2.transaction_id,
+        )
         .await?;
     println!("   Transactions scanned in range: {}", events.len());
 

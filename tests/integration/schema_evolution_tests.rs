@@ -13,7 +13,12 @@ async fn commit_update_schema(
     table: &planar::catalog::TableHandle,
     schema: SchemaSpec,
 ) -> planar::catalog::Result<planar::catalog::CommitResult> {
-    table.write(None).await?.update_schema(schema).commit().await
+    table
+        .write(None)
+        .await?
+        .update_schema(schema)
+        .commit()
+        .await
 }
 
 /// Test successful schema evolution with safe type widening

@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS tables (
     current_transaction_id BLOB,
     created_at TIMESTAMP NOT NULL,
     properties TEXT,
+    min_reader_version INTEGER NOT NULL DEFAULT 1,
+    min_writer_version INTEGER NOT NULL DEFAULT 1,
     UNIQUE(namespace, table_name)
 );
 

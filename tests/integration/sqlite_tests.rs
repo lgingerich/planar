@@ -140,8 +140,7 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sq
 async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     use arrow::datatypes::DataType;
     use planar::catalog::{
-        Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, TableProperties,
-        schema,
+        Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent, TableProperties, schema,
     };
     use planar::storage::Format;
     use std::sync::Arc;
@@ -235,7 +234,8 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
     // Test tables -> schema::Table
     let _ = sqlx::query_as::<_, schema::Table>(
         "SELECT table_uuid, table_name, namespace, location, 
-                current_schema_uuid, current_transaction_id, created_at, properties 
+                current_schema_uuid, current_transaction_id, created_at, properties,
+                min_reader_version, min_writer_version
          FROM tables
          WHERE table_uuid = ?1",
     )
@@ -332,7 +332,9 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 
 /// Validate event-range projection behavior under larger file counts.
 #[sqlx::test(migrations = "db/migrations")]
-async fn test_transaction_event_range_projection(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
+async fn test_transaction_event_range_projection(
+    pool: sqlx::Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
     use arrow::datatypes::DataType;
     use planar::catalog::{Catalog, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent};
     use planar::storage::Format;
@@ -396,6 +398,147 @@ async fn test_transaction_event_range_projection(pool: sqlx::Pool<Sqlite>) -> Re
         .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
     assert_eq!(delta.added_files.len(), total_files as usize);
     assert!(delta.removed_files.is_empty());
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "db/migrations")]
+async fn test_protocol_reader_incompatibility_fails_read(
+    pool: sqlx::Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    use arrow::datatypes::DataType;
+    use planar::catalog::{
+        Catalog, CatalogError, ColumnSpec, ProtocolVersions, SchemaSpec, SqlCatalog, TableIdent,
+    };
+    use std::sync::Arc;
+
+    configure_sqlite_pool(&pool).await?;
+
+    let strict_catalog = Arc::new(SqlCatalog::new_with_protocol_versions(
+        pool.clone(),
+        ProtocolVersions {
+            reader: 3,
+            writer: 3,
+        },
+    ));
+    let ident = TableIdent::new("compat", "reader_gate");
+    strict_catalog
+        .clone()
+        .create_table(
+            ident.clone(),
+            "/tmp/compat_reader_gate".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            None,
+        )
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let legacy_catalog = Arc::new(SqlCatalog::new_with_protocol_versions(
+        pool.clone(),
+        ProtocolVersions {
+            reader: 1,
+            writer: 3,
+        },
+    ));
+    let handle = legacy_catalog
+        .clone()
+        .load_table(ident)
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?
+        .expect("table should exist");
+
+    let err = handle.read().await.expect_err("read should fail");
+    match err {
+        CatalogError::ProtocolVersionIncompatible {
+            operation,
+            client_version,
+            required_min_version,
+            ..
+        } => {
+            assert_eq!(operation, "read");
+            assert_eq!(client_version, 1);
+            assert_eq!(required_min_version, 3);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "db/migrations")]
+async fn test_protocol_writer_incompatibility_fails_commit(
+    pool: sqlx::Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    use arrow::datatypes::DataType;
+    use planar::catalog::{
+        Catalog, CatalogError, ColumnSpec, FileSpec, ProtocolVersions, SchemaSpec, SqlCatalog,
+        TableIdent,
+    };
+    use planar::storage::Format;
+    use std::sync::Arc;
+
+    configure_sqlite_pool(&pool).await?;
+
+    let strict_catalog = Arc::new(SqlCatalog::new_with_protocol_versions(
+        pool.clone(),
+        ProtocolVersions {
+            reader: 2,
+            writer: 4,
+        },
+    ));
+    let ident = TableIdent::new("compat", "writer_gate");
+    strict_catalog
+        .clone()
+        .create_table(
+            ident.clone(),
+            "/tmp/compat_writer_gate".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            None,
+        )
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let legacy_catalog = Arc::new(SqlCatalog::new_with_protocol_versions(
+        pool,
+        ProtocolVersions {
+            reader: 2,
+            writer: 2,
+        },
+    ));
+    let handle = legacy_catalog
+        .clone()
+        .load_table(ident)
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?
+        .expect("table should exist");
+
+    let err = handle
+        .write(None)
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+        .append_file(FileSpec::new(
+            Format::Parquet,
+            "/tmp/compat_writer_gate/part-0.parquet",
+            1,
+            64,
+        ))
+        .commit()
+        .await
+        .expect_err("commit should fail");
+
+    match err {
+        CatalogError::ProtocolVersionIncompatible {
+            operation,
+            client_version,
+            required_min_version,
+            ..
+        } => {
+            assert_eq!(operation, "write");
+            assert_eq!(client_version, 2);
+            assert_eq!(required_min_version, 4);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 
     Ok(())
 }

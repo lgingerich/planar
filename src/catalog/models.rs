@@ -202,7 +202,6 @@ pub struct TableHandle {
     pub(super) ident: TableIdent,
 }
 
-
 impl TableIdent {
     /// Create a new table identifier
     pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
@@ -519,7 +518,11 @@ impl Mutation {
 
 impl MutationBuilder {
     /// Create a new mutation builder
-    pub(super) fn new(catalog: Arc<dyn Catalog>, ident: TableIdent, base_transaction_id: TxnId) -> Self {
+    pub(super) fn new(
+        catalog: Arc<dyn Catalog>,
+        ident: TableIdent,
+        base_transaction_id: TxnId,
+    ) -> Self {
         Self {
             catalog,
             ident,
@@ -530,13 +533,17 @@ impl MutationBuilder {
 
     /// Append multiple files to the table.
     pub fn append_files(mut self, files: Vec<FileSpec>) -> Self {
-        self.mutation.operations.push(MutationOp::AppendFiles(files));
+        self.mutation
+            .operations
+            .push(MutationOp::AppendFiles(files));
         self
     }
 
     /// Append a single file to the table.
     pub fn append_file(mut self, file: FileSpec) -> Self {
-        self.mutation.operations.push(MutationOp::AppendFiles(vec![file]));
+        self.mutation
+            .operations
+            .push(MutationOp::AppendFiles(vec![file]));
         self
     }
 
@@ -550,7 +557,9 @@ impl MutationBuilder {
 
     /// Update the table schema.
     pub fn update_schema(mut self, schema: SchemaSpec) -> Self {
-        self.mutation.operations.push(MutationOp::UpdateSchema(schema));
+        self.mutation
+            .operations
+            .push(MutationOp::UpdateSchema(schema));
         self
     }
 
