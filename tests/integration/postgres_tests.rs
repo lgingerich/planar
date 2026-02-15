@@ -1,7 +1,7 @@
 use sqlx::Postgres;
 
 /// Test that all tables are created by migrations.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/postgres")]
 async fn test_schema_tables_exist(pool: sqlx::Pool<Postgres>) -> Result<(), sqlx::Error> {
     // PostgreSQL enforces foreign keys by default, no PRAGMA needed
 
@@ -35,7 +35,7 @@ async fn test_schema_tables_exist(pool: sqlx::Pool<Postgres>) -> Result<(), sqlx
 }
 
 /// Test that all indexes are created by migrations.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/postgres")]
 async fn test_schema_indexes_exist(pool: sqlx::Pool<Postgres>) -> Result<(), sqlx::Error> {
     let indexes = vec![
         "idx_transactions_table",
@@ -65,7 +65,7 @@ async fn test_schema_indexes_exist(pool: sqlx::Pool<Postgres>) -> Result<(), sql
 }
 
 /// Test that foreign keys are enforced (PostgreSQL enforces by default).
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/postgres")]
 async fn test_foreign_key_enforcement(pool: sqlx::Pool<Postgres>) -> Result<(), sqlx::Error> {
     // PostgreSQL enforces foreign keys by default, no PRAGMA needed
 
@@ -117,7 +117,7 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Postgres>) -> Result<(), 
 /// This test uses the database schema as the source of truth - if we can successfully
 /// query each table into its corresponding Rust struct, the struct matches the database.
 /// If types or column names don't match, sqlx will fail at runtime.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/postgres")]
 async fn test_schema_structs_match_sql_tables(
     pool: sqlx::Pool<Postgres>,
 ) -> Result<(), sqlx::Error> {
@@ -311,7 +311,7 @@ async fn test_schema_structs_match_sql_tables(
     Ok(())
 }
 
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/postgres")]
 async fn test_protocol_reader_incompatibility_fails_read(
     pool: sqlx::Pool<Postgres>,
 ) -> Result<(), sqlx::Error> {
@@ -372,7 +372,7 @@ async fn test_protocol_reader_incompatibility_fails_read(
     Ok(())
 }
 
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/postgres")]
 async fn test_protocol_writer_incompatibility_fails_commit(
     pool: sqlx::Pool<Postgres>,
 ) -> Result<(), sqlx::Error> {
@@ -444,6 +444,112 @@ async fn test_protocol_writer_incompatibility_fails_commit(
         }
         other => panic!("unexpected error: {other}"),
     }
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "db/migrations/postgres")]
+async fn test_postgres_concurrent_commits_one_wins_one_conflicts(
+    pool: sqlx::Pool<Postgres>,
+) -> Result<(), sqlx::Error> {
+    use arrow::datatypes::DataType;
+    use planar::catalog::{
+        Catalog, CatalogError, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent,
+    };
+    use planar::storage::Format;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let catalog = Arc::new(SqlCatalog::new(pool));
+    let ident = TableIdent::new("concurrency", "occ_locking");
+    let table = catalog
+        .clone()
+        .create_table(
+            ident.clone(),
+            "/tmp/concurrency_occ_locking".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            None,
+        )
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let base_txn = table
+        .current_transaction_id()
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    let catalog_a = catalog.clone();
+    let ident_a = ident.clone();
+    let barrier_a = barrier.clone();
+    let commit_a = tokio::spawn(async move {
+        barrier_a.wait().await;
+        let handle = catalog_a
+            .load_table(ident_a)
+            .await?
+            .expect("table should exist");
+        handle
+            .write(Some(base_txn))
+            .await?
+            .append_file(FileSpec::new(
+                Format::Parquet,
+                "/tmp/concurrency_occ_locking/part-a.parquet",
+                1,
+                128,
+            ))
+            .commit()
+            .await
+    });
+
+    let catalog_b = catalog.clone();
+    let ident_b = ident.clone();
+    let barrier_b = barrier.clone();
+    let commit_b = tokio::spawn(async move {
+        barrier_b.wait().await;
+        let handle = catalog_b
+            .load_table(ident_b)
+            .await?
+            .expect("table should exist");
+        handle
+            .write(Some(base_txn))
+            .await?
+            .append_file(FileSpec::new(
+                Format::Parquet,
+                "/tmp/concurrency_occ_locking/part-b.parquet",
+                1,
+                128,
+            ))
+            .commit()
+            .await
+    });
+
+    let result_a = commit_a
+        .await
+        .map_err(|err| sqlx::Error::Protocol(format!("task a join error: {err}")))?;
+    let result_b = commit_b
+        .await
+        .map_err(|err| sqlx::Error::Protocol(format!("task b join error: {err}")))?;
+
+    let successes = u32::from(result_a.is_ok()) + u32::from(result_b.is_ok());
+    assert_eq!(successes, 1, "exactly one concurrent commit should succeed");
+
+    let conflicts = u32::from(matches!(result_a, Err(CatalogError::Conflict(_))))
+        + u32::from(matches!(result_b, Err(CatalogError::Conflict(_))));
+    assert_eq!(
+        conflicts, 1,
+        "exactly one concurrent commit should conflict"
+    );
+
+    let head = table
+        .read()
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+    assert_eq!(
+        head.files.len(),
+        1,
+        "only one file append should be visible after concurrent writes"
+    );
 
     Ok(())
 }

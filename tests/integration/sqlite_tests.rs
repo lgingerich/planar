@@ -8,7 +8,7 @@ async fn configure_sqlite_pool(pool: &sqlx::Pool<Sqlite>) -> Result<(), sqlx::Er
 }
 
 /// Test that all tables are created by migrations.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/sqlite")]
 async fn test_schema_tables_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs (foreign keys, etc.)
     configure_sqlite_pool(&pool).await?;
@@ -43,7 +43,7 @@ async fn test_schema_tables_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::
 }
 
 /// Test that all indexes are created by migrations.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/sqlite")]
 async fn test_schema_indexes_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs
     configure_sqlite_pool(&pool).await?;
@@ -77,7 +77,7 @@ async fn test_schema_indexes_exist(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx:
 }
 
 /// Test that foreign keys are enforced when PRAGMA foreign_keys is enabled.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/sqlite")]
 async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // Configure SQLite PRAGMAs - this is critical for foreign key enforcement
     configure_sqlite_pool(&pool).await?;
@@ -136,7 +136,7 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sq
 /// This test uses the database schema as the source of truth - if we can successfully
 /// query each table into its corresponding Rust struct, the struct matches the database.
 /// If types or column names don't match, sqlx will fail at runtime.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/sqlite")]
 async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Result<(), sqlx::Error> {
     use arrow::datatypes::DataType;
     use planar::catalog::{
@@ -331,7 +331,7 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 }
 
 /// Validate event-range projection behavior under larger file counts.
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/sqlite")]
 async fn test_transaction_event_range_projection(
     pool: sqlx::Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {
@@ -402,7 +402,7 @@ async fn test_transaction_event_range_projection(
     Ok(())
 }
 
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/sqlite")]
 async fn test_protocol_reader_incompatibility_fails_read(
     pool: sqlx::Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {
@@ -465,7 +465,7 @@ async fn test_protocol_reader_incompatibility_fails_read(
     Ok(())
 }
 
-#[sqlx::test(migrations = "db/migrations")]
+#[sqlx::test(migrations = "db/migrations/sqlite")]
 async fn test_protocol_writer_incompatibility_fails_commit(
     pool: sqlx::Pool<Sqlite>,
 ) -> Result<(), sqlx::Error> {

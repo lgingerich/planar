@@ -134,13 +134,6 @@ where
         }
     }
 
-    /// Initialize the database schema by running migrations
-    pub async fn initialize_schema(&self) -> std::result::Result<(), sqlx::Error> {
-        let migrator = sqlx::migrate!("db/migrations");
-        migrator.run(&self.pool).await?;
-        Ok(())
-    }
-
     fn reader_version(&self) -> i32 {
         self.client_protocol.reader
     }
@@ -148,9 +141,50 @@ where
     fn writer_version(&self) -> i32 {
         self.client_protocol.writer
     }
+
+    fn ensure_reader_protocol_compatible(
+        &self,
+        ident: &TableIdent,
+        required_min_version: i32,
+    ) -> Result<()> {
+        let client_version = self.reader_version();
+        if client_version < required_min_version {
+            return Err(CatalogError::ProtocolVersionIncompatible {
+                operation: "read",
+                table: ident.to_string(),
+                client_version,
+                required_min_version,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_writer_protocol_compatible(
+        &self,
+        ident: &TableIdent,
+        required_min_version: i32,
+    ) -> Result<()> {
+        let client_version = self.writer_version();
+        if client_version < required_min_version {
+            return Err(CatalogError::ProtocolVersionIncompatible {
+                operation: "write",
+                table: ident.to_string(),
+                client_version,
+                required_min_version,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl SqlCatalog<sqlx::Sqlite> {
+    /// Initialize the SQLite schema by running SQLite migrations.
+    pub async fn initialize_schema(&self) -> std::result::Result<(), sqlx::Error> {
+        let migrator = sqlx::migrate!("db/migrations/sqlite");
+        migrator.run(&self.pool).await?;
+        Ok(())
+    }
+
     /// Configure SQLite-specific database settings
     pub async fn configure_database(&self) -> std::result::Result<(), sqlx::Error> {
         database::sqlite::configure_pool(&self.pool).await
@@ -197,6 +231,13 @@ impl SqlCatalog<sqlx::Sqlite> {
 }
 
 impl SqlCatalog<sqlx::Postgres> {
+    /// Initialize the PostgreSQL schema by running PostgreSQL migrations.
+    pub async fn initialize_schema(&self) -> std::result::Result<(), sqlx::Error> {
+        let migrator = sqlx::migrate!("db/migrations/postgres");
+        migrator.run(&self.pool).await?;
+        Ok(())
+    }
+
     /// Configure PostgreSQL-specific database settings
     pub async fn configure_database(&self) -> std::result::Result<(), sqlx::Error> {
         database::postgres::configure_pool(&self.pool).await
@@ -773,14 +814,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let min_reader_version: i32 = table_row.try_get("min_reader_version")?;
         let properties = parse_table_properties(table_row.try_get("properties")?)?;
-        if self.reader_version() < min_reader_version {
-            return Err(CatalogError::ProtocolVersionIncompatible {
-                operation: "read",
-                table: ident.to_string(),
-                client_version: self.reader_version(),
-                required_min_version: min_reader_version,
-            });
-        }
+        self.ensure_reader_protocol_compatible(ident, min_reader_version)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -1025,14 +1059,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let min_writer_version: i32 = table_row.try_get("min_writer_version")?;
         let mut properties_value = parse_table_properties(table_row.try_get("properties")?)?;
-        if self.writer_version() < min_writer_version {
-            return Err(CatalogError::ProtocolVersionIncompatible {
-                operation: "write",
-                table: ident.to_string(),
-                client_version: self.writer_version(),
-                required_min_version: min_writer_version,
-            });
-        }
+        self.ensure_writer_protocol_compatible(ident, min_writer_version)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -1895,14 +1922,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let min_reader_version: i32 = table_row.try_get("min_reader_version")?;
         let properties = parse_table_properties(table_row.try_get("properties")?)?;
-        if self.reader_version() < min_reader_version {
-            return Err(CatalogError::ProtocolVersionIncompatible {
-                operation: "read",
-                table: ident.to_string(),
-                client_version: self.reader_version(),
-                required_min_version: min_reader_version,
-            });
-        }
+        self.ensure_reader_protocol_compatible(ident, min_reader_version)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
@@ -2125,7 +2145,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let table_row = sqlx::query::<sqlx::Postgres>(
             "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties,
                     min_reader_version, min_writer_version
-             FROM tables WHERE namespace = $1 AND table_name = $2",
+             FROM tables WHERE namespace = $1 AND table_name = $2
+             FOR UPDATE",
         )
         .bind(ident.namespace.as_str())
         .bind(ident.name.as_str())
@@ -2147,14 +2168,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
         let min_writer_version: i32 = table_row.try_get("min_writer_version")?;
         let mut properties_value = parse_table_properties(table_row.try_get("properties")?)?;
-        if self.writer_version() < min_writer_version {
-            return Err(CatalogError::ProtocolVersionIncompatible {
-                operation: "write",
-                table: ident.to_string(),
-                client_version: self.writer_version(),
-                required_min_version: min_writer_version,
-            });
-        }
+        self.ensure_writer_protocol_compatible(ident, min_writer_version)?;
 
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
