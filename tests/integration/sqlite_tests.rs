@@ -542,3 +542,174 @@ async fn test_protocol_writer_incompatibility_fails_commit(
 
     Ok(())
 }
+
+#[sqlx::test(migrations = "db/migrations/sqlite")]
+async fn test_sqlite_concurrent_commits_one_wins_one_conflicts(
+    pool: sqlx::Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    use arrow::datatypes::DataType;
+    use planar::catalog::{
+        Catalog, CatalogError, ColumnSpec, FileSpec, SchemaSpec, SqlCatalog, TableIdent,
+    };
+    use planar::storage::Format;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    configure_sqlite_pool(&pool).await?;
+
+    let catalog = Arc::new(SqlCatalog::new(pool));
+    let ident = TableIdent::new("concurrency", "occ_locking");
+    let table = catalog
+        .clone()
+        .create_table(
+            ident.clone(),
+            "/tmp/sqlite_occ_locking".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            None,
+        )
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let base_txn = table
+        .current_transaction_id()
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    let catalog_a = catalog.clone();
+    let ident_a = ident.clone();
+    let barrier_a = barrier.clone();
+    let commit_a = tokio::spawn(async move {
+        barrier_a.wait().await;
+        let handle = catalog_a
+            .load_table(ident_a)
+            .await?
+            .expect("table should exist");
+        handle
+            .write(Some(base_txn))
+            .await?
+            .append_file(FileSpec::new(
+                Format::Parquet,
+                "/tmp/sqlite_occ_locking/part-a.parquet",
+                1,
+                128,
+            ))
+            .commit()
+            .await
+    });
+
+    let catalog_b = catalog.clone();
+    let ident_b = ident.clone();
+    let barrier_b = barrier.clone();
+    let commit_b = tokio::spawn(async move {
+        barrier_b.wait().await;
+        let handle = catalog_b
+            .load_table(ident_b)
+            .await?
+            .expect("table should exist");
+        handle
+            .write(Some(base_txn))
+            .await?
+            .append_file(FileSpec::new(
+                Format::Parquet,
+                "/tmp/sqlite_occ_locking/part-b.parquet",
+                1,
+                128,
+            ))
+            .commit()
+            .await
+    });
+
+    let result_a = commit_a
+        .await
+        .map_err(|err| sqlx::Error::Protocol(format!("task a join error: {err}")))?;
+    let result_b = commit_b
+        .await
+        .map_err(|err| sqlx::Error::Protocol(format!("task b join error: {err}")))?;
+
+    let successes = u32::from(result_a.is_ok()) + u32::from(result_b.is_ok());
+    assert_eq!(successes, 1, "exactly one concurrent commit should succeed");
+
+    let conflicts = u32::from(matches!(result_a, Err(CatalogError::Conflict(_))))
+        + u32::from(matches!(result_b, Err(CatalogError::Conflict(_))));
+    assert_eq!(
+        conflicts, 1,
+        "exactly one concurrent commit should conflict"
+    );
+
+    let head = table
+        .read()
+        .await
+        .map_err(|err| sqlx::Error::Protocol(err.to_string()))?;
+    assert_eq!(
+        head.files.len(),
+        1,
+        "only one file append should be visible after concurrent writes"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "db/migrations/sqlite")]
+async fn test_sqlite_concurrent_create_table_one_wins_one_conflicts(
+    pool: sqlx::Pool<Sqlite>,
+) -> Result<(), sqlx::Error> {
+    use arrow::datatypes::DataType;
+    use planar::catalog::{Catalog, CatalogError, ColumnSpec, SchemaSpec, SqlCatalog, TableIdent};
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    configure_sqlite_pool(&pool).await?;
+
+    let catalog = Arc::new(SqlCatalog::new(pool));
+    let ident = TableIdent::new("concurrency", "create_table_race");
+    let barrier = Arc::new(Barrier::new(2));
+
+    let c1 = catalog.clone();
+    let i1 = ident.clone();
+    let b1 = barrier.clone();
+    let create_a = tokio::spawn(async move {
+        b1.wait().await;
+        c1.create_table(
+            i1,
+            "/tmp/sqlite_create_table_race".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            None,
+        )
+        .await
+    });
+
+    let c2 = catalog.clone();
+    let i2 = ident.clone();
+    let b2 = barrier.clone();
+    let create_b = tokio::spawn(async move {
+        b2.wait().await;
+        c2.create_table(
+            i2,
+            "/tmp/sqlite_create_table_race".to_string(),
+            SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+            None,
+        )
+        .await
+    });
+
+    let result_a = create_a
+        .await
+        .map_err(|err| sqlx::Error::Protocol(format!("task a join error: {err}")))?;
+    let result_b = create_b
+        .await
+        .map_err(|err| sqlx::Error::Protocol(format!("task b join error: {err}")))?;
+
+    let successes = u32::from(result_a.is_ok()) + u32::from(result_b.is_ok());
+    assert_eq!(successes, 1, "exactly one create_table should succeed");
+
+    let conflicts = u32::from(matches!(result_a, Err(CatalogError::Conflict(_))))
+        + u32::from(matches!(result_b, Err(CatalogError::Conflict(_))));
+    assert_eq!(
+        conflicts, 1,
+        "exactly one create_table call should return conflict"
+    );
+
+    Ok(())
+}

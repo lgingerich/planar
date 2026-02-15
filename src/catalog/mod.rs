@@ -178,6 +178,12 @@ where
 }
 
 impl SqlCatalog<sqlx::Sqlite> {
+    async fn begin_immediate(
+        &self,
+    ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await
+    }
+
     /// Initialize the SQLite schema by running SQLite migrations.
     pub async fn initialize_schema(&self) -> std::result::Result<(), sqlx::Error> {
         let migrator = sqlx::migrate!("db/migrations/sqlite");
@@ -281,7 +287,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
     ) -> Result<TableHandle> {
         schema.validate()?;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
 
         let exists = sqlx::query_scalar::<sqlx::Sqlite, i64>(
             "SELECT 1 FROM tables WHERE namespace = ?1 AND table_name = ?2 LIMIT 1",
@@ -1032,7 +1038,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         }
         mutation.validate()?;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
 
         let table_row = sqlx::query::<sqlx::Sqlite>(
             "SELECT table_uuid, current_schema_uuid, current_transaction_id, properties,
