@@ -2561,6 +2561,28 @@ mod tests {
     use crate::storage::Format;
     use arrow::datatypes::DataType;
 
+    async fn create_sqlite_catalog_with_table() -> (Arc<SqlCatalog<sqlx::Sqlite>>, TableIdent, TableView) {
+        let catalog = SqlCatalog::in_memory()
+            .await
+            .expect("in-memory catalog should initialize");
+        let ident = TableIdent::new("test_ns", "test_table");
+        catalog
+            .clone()
+            .create_table(
+                ident.clone(),
+                "memory://test".to_string(),
+                SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+                None,
+            )
+            .await
+            .expect("table creation should succeed");
+        let view = catalog
+            .read_table(&ident, None)
+            .await
+            .expect("table should be readable");
+        (catalog, ident, view)
+    }
+
     #[test]
     fn schema_spec_validate_rejects_duplicate_column_names() {
         let schema = SchemaSpec::new()
@@ -2657,5 +2679,209 @@ mod tests {
         };
         let err = mutation.validate().expect_err("mutation should be invalid");
         assert!(err.to_string().contains("at most one UpdateSchema"));
+    }
+
+    #[tokio::test]
+    async fn list_transaction_events_rejects_added_file_overflow() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+
+        let overflow_count = limits::MAX_FILES_PER_QUERY as usize + 1;
+        let mut last_transaction_id = base_transaction_id;
+        for i in 0..overflow_count {
+            let transaction_id = next_transaction_id();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(chrono::Utc::now())
+            .bind(last_transaction_id.as_bytes().as_slice())
+            .execute(&catalog.pool)
+            .await
+            .expect("transaction insert should succeed");
+
+            let file_uuid = uuid::Uuid::new_v4();
+            let file_path = format!("/tmp/overflow-added-{i}.parquet");
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO files (
+                    file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
+                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .bind(file_uuid.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind("parquet")
+            .bind(file_path)
+            .bind(1_i64)
+            .bind(1_i64)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(Option::<Vec<u8>>::None)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .execute(&catalog.pool)
+            .await
+            .expect("file insert should succeed");
+
+            last_transaction_id = transaction_id;
+        }
+
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(&catalog.pool)
+        .await
+        .expect("table head update should succeed");
+
+        let err = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: last_transaction_id,
+                },
+            )
+            .await
+            .expect_err("added-file overflow should fail");
+        assert!(matches!(err, CatalogError::LimitExceeded(_)));
+        assert!(err.to_string().contains("added file events exceed limit"));
+    }
+
+    #[tokio::test]
+    async fn list_transaction_events_rejects_removed_file_overflow() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+
+        let overflow_count = limits::MAX_FILES_PER_QUERY as usize + 1;
+        let mut last_transaction_id = base_transaction_id;
+        for i in 0..overflow_count {
+            let transaction_id = next_transaction_id();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(chrono::Utc::now())
+            .bind(last_transaction_id.as_bytes().as_slice())
+            .execute(&catalog.pool)
+            .await
+            .expect("transaction insert should succeed");
+
+            let file_uuid = uuid::Uuid::new_v4();
+            let file_path = format!("/tmp/overflow-removed-{i}.parquet");
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO files (
+                    file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
+                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .bind(file_uuid.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind("parquet")
+            .bind(file_path)
+            .bind(1_i64)
+            .bind(1_i64)
+            .bind(base_transaction_id.as_bytes().as_slice())
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .execute(&catalog.pool)
+            .await
+            .expect("file insert should succeed");
+
+            last_transaction_id = transaction_id;
+        }
+
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(&catalog.pool)
+        .await
+        .expect("table head update should succeed");
+
+        let err = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: last_transaction_id,
+                },
+            )
+            .await
+            .expect_err("removed-file overflow should fail");
+        assert!(matches!(err, CatalogError::LimitExceeded(_)));
+        assert!(err.to_string().contains("removed file events exceed limit"));
+    }
+
+    #[tokio::test]
+    async fn list_transaction_events_rejects_schema_change_overflow() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+
+        let overflow_count = limits::MAX_COLUMNS_PER_SCHEMA as usize + 1;
+        let mut last_transaction_id = base_transaction_id;
+        for i in 0..overflow_count {
+            let transaction_id = next_transaction_id();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(chrono::Utc::now())
+            .bind(last_transaction_id.as_bytes().as_slice())
+            .execute(&catalog.pool)
+            .await
+            .expect("transaction insert should succeed");
+
+            let schema_uuid = uuid::Uuid::new_v4();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO schemas (
+                    schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(schema_uuid.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind((i as i32) + 100)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(Option::<Vec<u8>>::None)
+            .bind(chrono::Utc::now())
+            .execute(&catalog.pool)
+            .await
+            .expect("schema insert should succeed");
+
+            last_transaction_id = transaction_id;
+        }
+
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(&catalog.pool)
+        .await
+        .expect("table head update should succeed");
+
+        let err = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: last_transaction_id,
+                },
+            )
+            .await
+            .expect_err("schema overflow should fail");
+        assert!(matches!(err, CatalogError::LimitExceeded(_)));
+        assert!(err.to_string().contains("schema change events exceed limit"));
     }
 }
