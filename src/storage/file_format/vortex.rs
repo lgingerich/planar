@@ -166,7 +166,7 @@ impl VortexWriter {
         let first = match source.next().await {
             Some(batch) => batch?,
             None => {
-                return Err(StorageError::Unsupported(
+                return Err(StorageError::InvalidInput(
                     "write_stream requires at least one RecordBatch".to_string(),
                 ));
             }
@@ -179,7 +179,14 @@ impl VortexWriter {
             Ok(batch) => {
                 let array = ArrayRef::from_arrow(batch, false);
                 if array.dtype() != &expected_dtype {
-                    return Err(vortex_dtype_mismatch_error(&expected_dtype, array.dtype()));
+                    return Err(VortexError::from(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "dtype mismatch in stream: expected {:?}, got {:?}",
+                            expected_dtype,
+                            array.dtype()
+                        ),
+                    )));
                 }
                 Ok(array)
             }
@@ -284,16 +291,6 @@ impl vortex::stream::ArrayStream for RecordBatchArrayStream {
     fn dtype(&self) -> &DType {
         &self.dtype
     }
-}
-
-fn vortex_dtype_mismatch_error(expected: &DType, actual: &DType) -> VortexError {
-    VortexError::from(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!(
-            "dtype mismatch in stream: expected {:?}, got {:?}",
-            expected, actual
-        ),
-    ))
 }
 
 #[cfg(test)]

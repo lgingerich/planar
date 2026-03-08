@@ -155,7 +155,7 @@ impl LanceWriter {
         let first = match stream.next().await {
             Some(batch) => batch?,
             None => {
-                return Err(StorageError::Unsupported(
+                return Err(StorageError::InvalidInput(
                     "write_stream requires at least one RecordBatch".to_string(),
                 ));
             }
@@ -169,7 +169,13 @@ impl LanceWriter {
                 let batch = match batch {
                     Ok(batch) => {
                         if batch.schema() != expected_schema {
-                            let err = schema_mismatch_error(&expected_schema, batch.schema());
+                            let err = ArrowError::ExternalError(Box::new(
+                                StorageError::InvalidInput(format!(
+                                    "Schema mismatch in stream: expected {:?}, got {:?}",
+                                    expected_schema,
+                                    batch.schema()
+                                )),
+                            ));
                             let _ = tx.send(Err(err)).await;
                             return;
                         }
@@ -338,13 +344,6 @@ impl arrow_array::RecordBatchReader for StreamRecordBatchReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-}
-
-fn schema_mismatch_error(expected: &SchemaRef, actual: SchemaRef) -> ArrowError {
-    ArrowError::SchemaError(format!(
-        "Schema mismatch in stream: expected {:?}, got {:?}",
-        expected, actual
-    ))
 }
 
 #[cfg(test)]

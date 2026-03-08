@@ -164,7 +164,7 @@ impl ParquetWriter {
         let first = match stream.next().await {
             Some(batch) => batch?,
             None => {
-                return Err(StorageError::Unsupported(
+                return Err(StorageError::InvalidInput(
                     "write_stream requires at least one RecordBatch".to_string(),
                 ));
             }

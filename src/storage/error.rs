@@ -30,6 +30,10 @@ pub enum StorageError {
     #[error("Vortex error: {0}")]
     Vortex(#[from] VortexError),
 
+    /// Invalid input
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
     /// Feature not yet implemented
     #[error("Feature not yet implemented: {0}")]
     NotYetImplemented(String),
