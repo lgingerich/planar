@@ -812,11 +812,43 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
         })?;
         let effective_transaction_id = at_transaction_id.unwrap_or(current_transaction_id);
-        // UUIDv7 is time-ordered, compare using u128 representation
-        if effective_transaction_id.as_u128() > current_transaction_id.as_u128() {
-            return Err(CatalogError::InvalidArgument(
-                "requested transaction is newer than current".to_string(),
-            ));
+        if effective_transaction_id != current_transaction_id {
+            let mut cursor_txn = current_transaction_id;
+            let mut visited = std::collections::HashSet::new();
+            let mut found = false;
+            loop {
+                if !visited.insert(cursor_txn) {
+                    return Err(CatalogError::InvalidArgument(
+                        "transaction parent chain contains a cycle".to_string(),
+                    ));
+                }
+                if cursor_txn == effective_transaction_id {
+                    found = true;
+                    break;
+                }
+                let row = sqlx::query::<sqlx::Sqlite>(
+                    "SELECT parent_transaction_id
+                     FROM transactions
+                     WHERE table_uuid = ?1 AND transaction_id = ?2",
+                )
+                .bind(table_uuid.as_bytes().as_slice())
+                .bind(cursor_txn.as_bytes().as_slice())
+                .fetch_optional(&self.pool)
+                .await?;
+                let row = row.ok_or_else(|| {
+                    CatalogError::InvalidArgument("table transaction chain is broken".to_string())
+                })?;
+                let parent_transaction_id = uuid_from_row_optional(&row, "parent_transaction_id")?;
+                match parent_transaction_id {
+                    Some(parent_id) => cursor_txn = parent_id,
+                    None => break,
+                }
+            }
+            if !found {
+                return Err(CatalogError::InvalidArgument(
+                    "requested transaction is not in table history".to_string(),
+                ));
+            }
         }
 
         let schema_row = sqlx::query::<sqlx::Sqlite>(
@@ -1920,11 +1952,43 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
         })?;
         let effective_transaction_id = at_transaction_id.unwrap_or(current_transaction_id);
-        // UUIDv7 is time-ordered, compare using u128 representation
-        if effective_transaction_id.as_u128() > current_transaction_id.as_u128() {
-            return Err(CatalogError::InvalidArgument(
-                "requested transaction is newer than current".to_string(),
-            ));
+        if effective_transaction_id != current_transaction_id {
+            let mut cursor_txn = current_transaction_id;
+            let mut visited = std::collections::HashSet::new();
+            let mut found = false;
+            loop {
+                if !visited.insert(cursor_txn) {
+                    return Err(CatalogError::InvalidArgument(
+                        "transaction parent chain contains a cycle".to_string(),
+                    ));
+                }
+                if cursor_txn == effective_transaction_id {
+                    found = true;
+                    break;
+                }
+                let row = sqlx::query::<sqlx::Postgres>(
+                    "SELECT parent_transaction_id
+                     FROM transactions
+                     WHERE table_uuid = $1 AND transaction_id = $2",
+                )
+                .bind(table_uuid.as_bytes().as_slice())
+                .bind(cursor_txn.as_bytes().as_slice())
+                .fetch_optional(&self.pool)
+                .await?;
+                let row = row.ok_or_else(|| {
+                    CatalogError::InvalidArgument("table transaction chain is broken".to_string())
+                })?;
+                let parent_transaction_id = uuid_from_row_optional(&row, "parent_transaction_id")?;
+                match parent_transaction_id {
+                    Some(parent_id) => cursor_txn = parent_id,
+                    None => break,
+                }
+            }
+            if !found {
+                return Err(CatalogError::InvalidArgument(
+                    "requested transaction is not in table history".to_string(),
+                ));
+            }
         }
 
         let schema_row = sqlx::query::<sqlx::Postgres>(
@@ -2905,6 +2969,63 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].transaction_id, tx1);
         assert_eq!(events[1].transaction_id, tx2);
+    }
+
+    #[tokio::test]
+    async fn read_table_uses_parent_chain_not_uuid_order() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+        let base_u128 = base_transaction_id.as_u128();
+        let tx1 = uuid::Uuid::from_u128(
+            base_u128
+                .checked_add(2)
+                .expect("base transaction id should allow +2 in test"),
+        );
+        let tx2 = uuid::Uuid::from_u128(
+            base_u128
+                .checked_add(1)
+                .expect("base transaction id should allow +1 in test"),
+        );
+
+        let mut tx = catalog.pool.begin().await.expect("begin transaction");
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(tx1.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .bind(chrono::Utc::now())
+        .bind(base_transaction_id.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("tx1 insert should succeed");
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(tx2.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .bind(chrono::Utc::now())
+        .bind(tx1.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("tx2 insert should succeed");
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(tx2.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("table head update should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let view = catalog
+            .read_table(&ident, Some(tx1))
+            .await
+            .expect("ancestor transaction read should succeed even with non-monotonic UUID");
+        assert_eq!(view.transaction_id, tx1);
     }
 
     #[tokio::test]
