@@ -432,22 +432,23 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
     }
 
     async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>> {
+        let list_limit = limits::MAX_TABLES_PER_LIST as i64 + 1;
         let rows = if let Some(namespace) = namespace {
             sqlx::query::<sqlx::Sqlite>(
                 "SELECT namespace, table_name FROM tables WHERE namespace = ?1 LIMIT ?2",
             )
             .bind(namespace)
-            .bind(limits::MAX_TABLES_PER_LIST as i64)
+            .bind(list_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query::<sqlx::Sqlite>("SELECT namespace, table_name FROM tables LIMIT ?1")
-                .bind(limits::MAX_TABLES_PER_LIST as i64)
+                .bind(list_limit)
                 .fetch_all(&self.pool)
                 .await?
         };
 
-        if rows.len() as u32 >= limits::MAX_TABLES_PER_LIST {
+        if rows.len() > limits::MAX_TABLES_PER_LIST as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "table count exceeds limit of {}",
                 limits::MAX_TABLES_PER_LIST
@@ -537,6 +538,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             }
         }
 
+        let txn_scan_limit = limits::MAX_TRANSACTIONS_PER_SCAN as i64 + 1;
         let txn_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Sqlite>(
                 "SELECT transaction_id
@@ -550,7 +552,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_TRANSACTIONS_PER_SCAN as i64)
+            .bind(txn_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -564,12 +566,12 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_TRANSACTIONS_PER_SCAN as i64)
+            .bind(txn_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
 
-        if txn_rows.len() as u32 >= limits::MAX_TRANSACTIONS_PER_SCAN {
+        if txn_rows.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "transaction scan exceeds limit of {}",
                 limits::MAX_TRANSACTIONS_PER_SCAN
@@ -883,11 +885,11 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
              FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
         )
         .bind(schema_uuid.as_bytes().as_slice())
-        .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+        .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
         .fetch_all(&self.pool)
         .await?;
 
-        if column_rows.len() as u32 >= limits::MAX_COLUMNS_PER_SCHEMA {
+        if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "column count exceeds limit of {}",
                 limits::MAX_COLUMNS_PER_SCHEMA
@@ -935,11 +937,11 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
         )
         .bind(table_uuid.as_bytes().as_slice())
         .bind(effective_transaction_id.as_bytes().as_slice())
-        .bind(limits::MAX_FILES_PER_QUERY as i64)
+        .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
         .fetch_all(&self.pool)
         .await?;
 
-        if file_rows.len() as u32 >= limits::MAX_FILES_PER_QUERY {
+        if file_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "file count exceeds limit of {}",
                 limits::MAX_FILES_PER_QUERY
@@ -1577,22 +1579,23 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
     }
 
     async fn list_tables(&self, namespace: Option<&str>) -> Result<Vec<TableIdent>> {
+        let list_limit = limits::MAX_TABLES_PER_LIST as i64 + 1;
         let rows = if let Some(namespace) = namespace {
             sqlx::query::<sqlx::Postgres>(
                 "SELECT namespace, table_name FROM tables WHERE namespace = $1 LIMIT $2",
             )
             .bind(namespace)
-            .bind(limits::MAX_TABLES_PER_LIST as i64)
+            .bind(list_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query::<sqlx::Postgres>("SELECT namespace, table_name FROM tables LIMIT $1")
-                .bind(limits::MAX_TABLES_PER_LIST as i64)
+                .bind(list_limit)
                 .fetch_all(&self.pool)
                 .await?
         };
 
-        if rows.len() as u32 >= limits::MAX_TABLES_PER_LIST {
+        if rows.len() > limits::MAX_TABLES_PER_LIST as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "table count exceeds limit of {}",
                 limits::MAX_TABLES_PER_LIST
@@ -1682,6 +1685,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             }
         }
 
+        let txn_scan_limit = limits::MAX_TRANSACTIONS_PER_SCAN as i64 + 1;
         let txn_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Postgres>(
                 "SELECT transaction_id
@@ -1695,7 +1699,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_TRANSACTIONS_PER_SCAN as i64)
+            .bind(txn_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -1709,12 +1713,12 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_TRANSACTIONS_PER_SCAN as i64)
+            .bind(txn_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
 
-        if txn_rows.len() as u32 >= limits::MAX_TRANSACTIONS_PER_SCAN {
+        if txn_rows.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "transaction scan exceeds limit of {}",
                 limits::MAX_TRANSACTIONS_PER_SCAN
@@ -2028,11 +2032,11 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
              FROM columns WHERE schema_uuid = $1 ORDER BY ordinal_position LIMIT $2",
         )
         .bind(schema_uuid.as_bytes().as_slice())
-        .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+        .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
         .fetch_all(&self.pool)
         .await?;
 
-        if column_rows.len() as u32 >= limits::MAX_COLUMNS_PER_SCHEMA {
+        if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "column count exceeds limit of {}",
                 limits::MAX_COLUMNS_PER_SCHEMA
@@ -2080,11 +2084,11 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
         )
         .bind(table_uuid.as_bytes().as_slice())
         .bind(effective_transaction_id.as_bytes().as_slice())
-        .bind(limits::MAX_FILES_PER_QUERY as i64)
+        .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
         .fetch_all(&self.pool)
         .await?;
 
-        if file_rows.len() as u32 >= limits::MAX_FILES_PER_QUERY {
+        if file_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "file count exceeds limit of {}",
                 limits::MAX_FILES_PER_QUERY
@@ -2950,5 +2954,129 @@ mod tests {
         assert!(matches!(err, CatalogError::InvalidArgument(_)));
         assert!(err.to_string().contains("cannot drop existing column"));
         assert!(err.to_string().contains("value"));
+    }
+
+    #[tokio::test]
+    async fn list_tables_allows_exactly_max_then_rejects_overflow() {
+        let catalog = SqlCatalog::in_memory()
+            .await
+            .expect("in-memory catalog should initialize");
+
+        for i in 0..limits::MAX_TABLES_PER_LIST {
+            let table_uuid = uuid::Uuid::new_v4();
+            let table_name = format!("table_{i}");
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO tables (
+                    table_uuid, table_name, namespace, location, current_schema_uuid,
+                    current_transaction_id, created_at, properties, min_reader_version, min_writer_version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(table_name)
+            .bind("ns")
+            .bind("memory://bulk")
+            .bind(Option::<Vec<u8>>::None)
+            .bind(Option::<Vec<u8>>::None)
+            .bind(chrono::Utc::now())
+            .bind("{}")
+            .bind(1_i32)
+            .bind(1_i32)
+            .execute(&catalog.pool)
+            .await
+            .expect("table insert should succeed");
+        }
+
+        let at_limit = catalog
+            .list_tables(Some("ns"))
+            .await
+            .expect("exactly-at-limit listing should succeed");
+        assert_eq!(at_limit.len(), limits::MAX_TABLES_PER_LIST as usize);
+
+        let overflow_uuid = uuid::Uuid::new_v4();
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO tables (
+                table_uuid, table_name, namespace, location, current_schema_uuid,
+                current_transaction_id, created_at, properties, min_reader_version, min_writer_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(overflow_uuid.as_bytes().as_slice())
+        .bind("table_overflow")
+        .bind("ns")
+        .bind("memory://bulk")
+        .bind(Option::<Vec<u8>>::None)
+        .bind(Option::<Vec<u8>>::None)
+        .bind(chrono::Utc::now())
+        .bind("{}")
+        .bind(1_i32)
+        .bind(1_i32)
+        .execute(&catalog.pool)
+        .await
+        .expect("overflow table insert should succeed");
+
+        let err = catalog
+            .list_tables(Some("ns"))
+            .await
+            .expect_err("overflow listing should fail");
+        assert!(matches!(err, CatalogError::LimitExceeded(_)));
+        assert!(err.to_string().contains("table count exceeds limit"));
+    }
+
+    #[tokio::test]
+    async fn read_table_allows_exactly_max_columns_then_rejects_overflow() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let schema_uuid = table_view.schema.schema_uuid;
+
+        sqlx::query::<sqlx::Sqlite>("DELETE FROM columns WHERE schema_uuid = ?1")
+            .bind(schema_uuid.as_bytes().as_slice())
+            .execute(&catalog.pool)
+            .await
+            .expect("clear schema columns should succeed");
+
+        let encoded_type = encode_data_type(&DataType::Int64).expect("type encoding should succeed");
+        for i in 0..limits::MAX_COLUMNS_PER_SCHEMA {
+            let column_uuid = uuid::Uuid::new_v4();
+            let column_name = format!("col_{i}");
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(column_uuid.as_bytes().as_slice())
+            .bind(schema_uuid.as_bytes().as_slice())
+            .bind(column_name)
+            .bind(encoded_type.as_slice())
+            .bind((i + 1) as i32)
+            .bind(false)
+            .execute(&catalog.pool)
+            .await
+            .expect("column insert should succeed");
+        }
+
+        let at_limit = catalog
+            .read_table(&ident, None)
+            .await
+            .expect("exactly-at-limit read should succeed");
+        assert_eq!(at_limit.schema.columns.len(), limits::MAX_COLUMNS_PER_SCHEMA as usize);
+
+        let overflow_column_uuid = uuid::Uuid::new_v4();
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(overflow_column_uuid.as_bytes().as_slice())
+        .bind(schema_uuid.as_bytes().as_slice())
+        .bind("col_overflow")
+        .bind(encoded_type.as_slice())
+        .bind((limits::MAX_COLUMNS_PER_SCHEMA + 1) as i32)
+        .bind(false)
+        .execute(&catalog.pool)
+        .await
+        .expect("overflow column insert should succeed");
+
+        let err = catalog
+            .read_table(&ident, None)
+            .await
+            .expect_err("overflow read should fail");
+        assert!(matches!(err, CatalogError::LimitExceeded(_)));
+        assert!(err.to_string().contains("column count exceeds limit"));
     }
 }
