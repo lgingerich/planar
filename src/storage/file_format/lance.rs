@@ -5,6 +5,7 @@
 //! random access, and efficient updates.
 
 use crate::storage::file_format::path_to_utf8;
+use crate::storage::utils::parse_usize;
 use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -261,13 +262,6 @@ pub fn parse_write_options(options: Option<&Value>) -> Result<WriteParams> {
     }
 
     Ok(params)
-}
-
-fn parse_usize(key: &str, value: &Value) -> Result<usize> {
-    value
-        .as_u64()
-        .map(|v| v as usize)
-        .ok_or_else(|| StorageError::Unsupported(format!("{} must be an integer", key)))
 }
 
 fn parse_write_mode(value: &str) -> Result<WriteMode> {

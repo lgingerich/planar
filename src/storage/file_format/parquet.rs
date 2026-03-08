@@ -4,6 +4,7 @@
 //! Use the trait methods for simple cases, or the `_with_options`/`_with_properties`
 //! methods for format-specific configuration like compression and encoding.
 
+use crate::storage::utils::parse_usize;
 use crate::storage::{Reader, RecordBatchStream, Result, StorageError, Writer};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
@@ -257,13 +258,6 @@ pub fn parse_write_options(options: Option<&Value>) -> Result<WriterProperties> 
     }
 
     Ok(builder.build())
-}
-
-fn parse_usize(key: &str, value: &Value) -> Result<usize> {
-    value
-        .as_u64()
-        .map(|v| v as usize)
-        .ok_or_else(|| StorageError::Unsupported(format!("{} must be an integer", key)))
 }
 
 fn parse_compression(value: &str) -> Result<Compression> {

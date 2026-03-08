@@ -4,6 +4,7 @@
 pub mod error;
 /// Format-specific readers, writers, and option parsing.
 pub mod file_format;
+pub(crate) mod utils;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
@@ -104,6 +105,12 @@ impl Format {
             Format::Lance => "lance",
             Format::Vortex => "vortex",
         }
+    }
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
