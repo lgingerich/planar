@@ -1247,6 +1247,20 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                         current_columns.insert(column_name, (column_type, is_nullable));
                     }
 
+                    let new_column_names = schema_spec
+                        .columns
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .collect::<std::collections::HashSet<_>>();
+                    for existing_column_name in current_columns.keys() {
+                        if !new_column_names.contains(existing_column_name.as_str()) {
+                            return Err(CatalogError::InvalidArgument(format!(
+                                "cannot drop existing column '{}' via UpdateSchema",
+                                existing_column_name
+                            )));
+                        }
+                    }
+
                     // Validate schema evolution for each column in new schema
                     for new_column in &schema_spec.columns {
                         if let Some((old_type, old_nullable)) =
@@ -2395,6 +2409,20 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                         current_columns.insert(column_name, (column_type, is_nullable));
                     }
 
+                    let new_column_names = schema_spec
+                        .columns
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .collect::<std::collections::HashSet<_>>();
+                    for existing_column_name in current_columns.keys() {
+                        if !new_column_names.contains(existing_column_name.as_str()) {
+                            return Err(CatalogError::InvalidArgument(format!(
+                                "cannot drop existing column '{}' via UpdateSchema",
+                                existing_column_name
+                            )));
+                        }
+                    }
+
                     // Validate schema evolution for each column in new schema
                     for new_column in &schema_spec.columns {
                         if let Some((old_type, old_nullable)) =
@@ -2883,5 +2911,44 @@ mod tests {
             .expect_err("schema overflow should fail");
         assert!(matches!(err, CatalogError::LimitExceeded(_)));
         assert!(err.to_string().contains("schema change events exceed limit"));
+    }
+
+    #[tokio::test]
+    async fn schema_update_rejects_implicit_column_drop() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let handle = TableHandle::new(catalog.clone(), ident.clone());
+
+        let base_txn = table_view.transaction_id;
+        let create_builder = handle
+            .write(Some(base_txn))
+            .await
+            .expect("builder should be created");
+        create_builder
+            .update_schema(
+                SchemaSpec::new()
+                    .with_column(ColumnSpec::new("id", DataType::Int64))
+                    .with_column(ColumnSpec::new("value", DataType::Utf8).nullable()),
+            )
+            .commit()
+            .await
+            .expect("adding a new column should succeed");
+
+        let current_txn = handle
+            .current_transaction_id()
+            .await
+            .expect("current transaction should be available");
+        let drop_builder = handle
+            .write(Some(current_txn))
+            .await
+            .expect("builder should be created");
+        let err = drop_builder
+            .update_schema(SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)))
+            .commit()
+            .await
+            .expect_err("implicit drop should fail");
+
+        assert!(matches!(err, CatalogError::InvalidArgument(_)));
+        assert!(err.to_string().contains("cannot drop existing column"));
+        assert!(err.to_string().contains("value"));
     }
 }
