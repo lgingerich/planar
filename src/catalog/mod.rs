@@ -525,121 +525,113 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                 CatalogError::InvalidArgument("table has no current transaction".to_string())
             })?;
 
-        if cursor.to_inclusive.as_u128() > current_transaction_id.as_u128() {
-            return Err(CatalogError::InvalidArgument(
-                "requested transaction is newer than current".to_string(),
-            ));
-        }
-        if let Some(from_exclusive) = cursor.from_exclusive {
-            if from_exclusive.as_u128() > cursor.to_inclusive.as_u128() {
+        if current_transaction_id != cursor.to_inclusive {
+            let exists = sqlx::query_scalar::<sqlx::Sqlite, i64>(
+                "SELECT 1 FROM transactions WHERE table_uuid = ?1 AND transaction_id = ?2 LIMIT 1",
+            )
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(cursor.to_inclusive.as_bytes().as_slice())
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            if !exists {
                 return Err(CatalogError::InvalidArgument(
-                    "from transaction must be <= to transaction".to_string(),
+                    "requested transaction does not exist for table".to_string(),
                 ));
             }
         }
 
-        let txn_scan_limit = limits::MAX_TRANSACTIONS_PER_SCAN as i64 + 1;
-        let txn_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Sqlite>(
-                "SELECT transaction_id
+        let mut visited = std::collections::HashSet::new();
+        let mut txn_ids_desc = Vec::new();
+        let mut cursor_txn = cursor.to_inclusive;
+        let mut reached_from_boundary = cursor.from_exclusive.is_none();
+        loop {
+            if !visited.insert(cursor_txn) {
+                return Err(CatalogError::InvalidArgument(
+                    "transaction parent chain contains a cycle".to_string(),
+                ));
+            }
+
+            let row = sqlx::query::<sqlx::Sqlite>(
+                "SELECT parent_transaction_id
                  FROM transactions
-                 WHERE table_uuid = ?1
-                   AND transaction_id > ?2
-                   AND transaction_id <= ?3
-                 ORDER BY transaction_id
-                 LIMIT ?4",
+                 WHERE table_uuid = ?1 AND transaction_id = ?2",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(txn_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Sqlite>(
-                "SELECT transaction_id
-                 FROM transactions
-                 WHERE table_uuid = ?1
-                   AND transaction_id <= ?2
-                 ORDER BY transaction_id
-                 LIMIT ?3",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(txn_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
+            .bind(cursor_txn.as_bytes().as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+            let row = row.ok_or_else(|| {
+                CatalogError::InvalidArgument(
+                    "requested transaction does not exist for table".to_string(),
+                )
+            })?;
 
-        if txn_rows.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "transaction scan exceeds limit of {}",
-                limits::MAX_TRANSACTIONS_PER_SCAN
-            )));
+            txn_ids_desc.push(cursor_txn);
+            if txn_ids_desc.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
+                return Err(CatalogError::LimitExceeded(format!(
+                    "transaction scan exceeds limit of {}",
+                    limits::MAX_TRANSACTIONS_PER_SCAN
+                )));
+            }
+
+            let parent_transaction_id = uuid_from_row_optional(&row, "parent_transaction_id")?;
+            match parent_transaction_id {
+                Some(parent_id) => {
+                    if Some(parent_id) == cursor.from_exclusive {
+                        reached_from_boundary = true;
+                        break;
+                    }
+                    cursor_txn = parent_id;
+                }
+                None => break,
+            }
+        }
+        if !reached_from_boundary {
+            return Err(CatalogError::InvalidArgument(
+                "from transaction is not an ancestor of to transaction".to_string(),
+            ));
         }
 
-        let mut transaction_ids = Vec::with_capacity(txn_rows.len());
-        for row in txn_rows {
-            transaction_ids.push(uuid_from_row(&row, "transaction_id")?);
-        }
-        let mut index_by_txn = std::collections::HashMap::with_capacity(transaction_ids.len());
-        let mut events = Vec::with_capacity(transaction_ids.len());
-        for (index, transaction_id) in transaction_ids.into_iter().enumerate() {
-            index_by_txn.insert(transaction_id, index);
-            events.push(TxnEvent {
+        txn_ids_desc.reverse();
+        let mut events = Vec::with_capacity(txn_ids_desc.len());
+        let mut added_file_events = 0usize;
+        let mut removed_file_events = 0usize;
+        let mut schema_change_events = 0usize;
+
+        for transaction_id in txn_ids_desc {
+            let mut event = TxnEvent {
                 transaction_id,
                 file_changes: Vec::new(),
                 schema_change: None,
-            });
-        }
+            };
 
-        // Sentinel-row pattern: fetch one extra row to detect truncation.
-        // If we get MAX+1 rows, we fail with LimitExceeded instead of silently dropping events.
-        let added_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
-        let added_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Sqlite>(
+            let added_rows = sqlx::query::<sqlx::Sqlite>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
                         added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
                  FROM files
                  WHERE table_uuid = ?1
-                   AND added_in_transaction_id > ?2
-                   AND added_in_transaction_id <= ?3
-                 LIMIT ?4",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(added_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Sqlite>(
-                "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                        added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 FROM files
-                 WHERE table_uuid = ?1
-                   AND added_in_transaction_id <= ?2
+                   AND added_in_transaction_id = ?2
                  LIMIT ?3",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(added_scan_limit)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
             .fetch_all(&self.pool)
-            .await?
-        };
-        if added_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "added file events exceed limit of {}",
-                limits::MAX_FILES_PER_QUERY
-            )));
-        }
+            .await?;
 
-        for row in added_rows {
-            let partition_values: Option<String> = row.try_get("partition_values")?;
-            let format_options: Option<String> = row.try_get("format_options")?;
-            let added_in_transaction_id = uuid_from_row(&row, "added_in_transaction_id")?;
-            if let Some(index) = index_by_txn.get(&added_in_transaction_id) {
-                events[*index].file_changes.push(TxnFileChange {
+            for row in added_rows {
+                added_file_events += 1;
+                if added_file_events > limits::MAX_FILES_PER_QUERY as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "added file events exceed limit of {}",
+                        limits::MAX_FILES_PER_QUERY
+                    )));
+                }
+                let partition_values: Option<String> = row.try_get("partition_values")?;
+                let format_options: Option<String> = row.try_get("format_options")?;
+                let added_in_transaction_id = uuid_from_row(&row, "added_in_transaction_id")?;
+                event.file_changes.push(TxnFileChange {
                     transaction_id: added_in_transaction_id,
                     kind: TxnFileChangeKind::Added,
                     file: schema::File {
@@ -659,58 +651,36 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     },
                 });
             }
-        }
 
-        let removed_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
-        let removed_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Sqlite>(
+            let removed_rows = sqlx::query::<sqlx::Sqlite>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
                         added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
                  FROM files
                  WHERE table_uuid = ?1
-                   AND removed_in_transaction_id IS NOT NULL
-                   AND removed_in_transaction_id > ?2
-                   AND removed_in_transaction_id <= ?3
-                 LIMIT ?4",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(removed_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Sqlite>(
-                "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                        added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 FROM files
-                 WHERE table_uuid = ?1
-                   AND removed_in_transaction_id IS NOT NULL
-                   AND removed_in_transaction_id <= ?2
+                   AND removed_in_transaction_id = ?2
                  LIMIT ?3",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(removed_scan_limit)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
             .fetch_all(&self.pool)
-            .await?
-        };
-        if removed_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "removed file events exceed limit of {}",
-                limits::MAX_FILES_PER_QUERY
-            )));
-        }
+            .await?;
 
-        for row in removed_rows {
-            let partition_values: Option<String> = row.try_get("partition_values")?;
-            let format_options: Option<String> = row.try_get("format_options")?;
-            let removed_in_transaction_id =
-                uuid_from_row_optional(&row, "removed_in_transaction_id")?.ok_or_else(|| {
-                    CatalogError::InvalidArgument("missing removed transaction id".to_string())
-                })?;
-            if let Some(index) = index_by_txn.get(&removed_in_transaction_id) {
-                events[*index].file_changes.push(TxnFileChange {
+            for row in removed_rows {
+                removed_file_events += 1;
+                if removed_file_events > limits::MAX_FILES_PER_QUERY as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "removed file events exceed limit of {}",
+                        limits::MAX_FILES_PER_QUERY
+                    )));
+                }
+                let partition_values: Option<String> = row.try_get("partition_values")?;
+                let format_options: Option<String> = row.try_get("format_options")?;
+                let removed_in_transaction_id =
+                    uuid_from_row_optional(&row, "removed_in_transaction_id")?.ok_or_else(|| {
+                        CatalogError::InvalidArgument("missing removed transaction id".to_string())
+                    })?;
+                event.file_changes.push(TxnFileChange {
                     transaction_id: removed_in_transaction_id,
                     kind: TxnFileChangeKind::Removed,
                     file: schema::File {
@@ -727,80 +697,63 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     },
                 });
             }
-        }
 
-        let schema_scan_limit = limits::MAX_SCHEMA_CHANGES_PER_SCAN as i64 + 1;
-        let schema_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Sqlite>(
+            let schema_rows = sqlx::query::<sqlx::Sqlite>(
                 "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
                  FROM schemas
-                 WHERE table_uuid = ?1
-                   AND valid_from_transaction_id > ?2
-                   AND valid_from_transaction_id <= ?3
-                 LIMIT ?4",
+                 WHERE table_uuid = ?1 AND valid_from_transaction_id = ?2
+                 LIMIT 2",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(schema_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Sqlite>(
-                "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
-                 FROM schemas
-                 WHERE table_uuid = ?1
-                   AND valid_from_transaction_id <= ?2
-                 LIMIT ?3",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(schema_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
-        if schema_rows.len() > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "schema change events exceed limit of {}",
-                limits::MAX_SCHEMA_CHANGES_PER_SCAN
-            )));
-        }
-
-        for schema_row in schema_rows {
-            let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
-            let valid_from_transaction_id =
-                uuid_from_row(&schema_row, "valid_from_transaction_id")?;
-            let column_rows = sqlx::query::<sqlx::Sqlite>(
-                "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
-                 FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
-            )
-            .bind(schema_uuid.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
+            .bind(transaction_id.as_bytes().as_slice())
             .fetch_all(&self.pool)
             .await?;
-            if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
-                return Err(CatalogError::LimitExceeded(format!(
-                    "schema change column count exceeds limit of {}",
-                    limits::MAX_COLUMNS_PER_SCHEMA
-                )));
+            if schema_rows.len() > 1 {
+                return Err(CatalogError::InvalidArgument(
+                    "multiple schemas found for the same transaction".to_string(),
+                ));
             }
+            if let Some(schema_row) = schema_rows.into_iter().next() {
+                schema_change_events += 1;
+                if schema_change_events > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "schema change events exceed limit of {}",
+                        limits::MAX_SCHEMA_CHANGES_PER_SCAN
+                    )));
+                }
+                let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
+                let valid_from_transaction_id =
+                    uuid_from_row(&schema_row, "valid_from_transaction_id")?;
+                let column_rows = sqlx::query::<sqlx::Sqlite>(
+                    "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
+                     FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
+                )
+                .bind(schema_uuid.as_bytes().as_slice())
+                .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
+                .fetch_all(&self.pool)
+                .await?;
+                if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "schema change column count exceeds limit of {}",
+                        limits::MAX_COLUMNS_PER_SCHEMA
+                    )));
+                }
 
-            let mut columns = Vec::with_capacity(column_rows.len());
-            for row in column_rows {
-                let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
-                let column_type = decode_data_type(&column_type_bytes)?;
-                columns.push(schema::Column {
-                    column_uuid: uuid_from_row(&row, "column_uuid")?,
-                    schema_uuid: uuid_from_row(&row, "schema_uuid")?,
-                    column_name: row.try_get("column_name")?,
-                    column_type,
-                    ordinal_position: row.try_get("ordinal_position")?,
-                    is_nullable: row.try_get("is_nullable")?,
-                });
-            }
+                let mut columns = Vec::with_capacity(column_rows.len());
+                for row in column_rows {
+                    let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
+                    let column_type = decode_data_type(&column_type_bytes)?;
+                    columns.push(schema::Column {
+                        column_uuid: uuid_from_row(&row, "column_uuid")?,
+                        schema_uuid: uuid_from_row(&row, "schema_uuid")?,
+                        column_name: row.try_get("column_name")?,
+                        column_type,
+                        ordinal_position: row.try_get("ordinal_position")?,
+                        is_nullable: row.try_get("is_nullable")?,
+                    });
+                }
 
-            if let Some(index) = index_by_txn.get(&valid_from_transaction_id) {
-                events[*index].schema_change = Some(TxnSchemaChange {
+                event.schema_change = Some(TxnSchemaChange {
                     transaction_id: valid_from_transaction_id,
                     schema: schema::Schema {
                         schema_uuid,
@@ -816,6 +769,8 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                     },
                 });
             }
+
+            events.push(event);
         }
 
         Ok(events)
@@ -1678,121 +1633,113 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                 CatalogError::InvalidArgument("table has no current transaction".to_string())
             })?;
 
-        if cursor.to_inclusive.as_u128() > current_transaction_id.as_u128() {
-            return Err(CatalogError::InvalidArgument(
-                "requested transaction is newer than current".to_string(),
-            ));
-        }
-        if let Some(from_exclusive) = cursor.from_exclusive {
-            if from_exclusive.as_u128() > cursor.to_inclusive.as_u128() {
+        if current_transaction_id != cursor.to_inclusive {
+            let exists = sqlx::query_scalar::<sqlx::Postgres, i64>(
+                "SELECT 1 FROM transactions WHERE table_uuid = $1 AND transaction_id = $2 LIMIT 1",
+            )
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(cursor.to_inclusive.as_bytes().as_slice())
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            if !exists {
                 return Err(CatalogError::InvalidArgument(
-                    "from transaction must be <= to transaction".to_string(),
+                    "requested transaction does not exist for table".to_string(),
                 ));
             }
         }
 
-        let txn_scan_limit = limits::MAX_TRANSACTIONS_PER_SCAN as i64 + 1;
-        let txn_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Postgres>(
-                "SELECT transaction_id
+        let mut visited = std::collections::HashSet::new();
+        let mut txn_ids_desc = Vec::new();
+        let mut cursor_txn = cursor.to_inclusive;
+        let mut reached_from_boundary = cursor.from_exclusive.is_none();
+        loop {
+            if !visited.insert(cursor_txn) {
+                return Err(CatalogError::InvalidArgument(
+                    "transaction parent chain contains a cycle".to_string(),
+                ));
+            }
+
+            let row = sqlx::query::<sqlx::Postgres>(
+                "SELECT parent_transaction_id
                  FROM transactions
-                 WHERE table_uuid = $1
-                   AND transaction_id > $2
-                   AND transaction_id <= $3
-                 ORDER BY transaction_id
-                 LIMIT $4",
+                 WHERE table_uuid = $1 AND transaction_id = $2",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(txn_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Postgres>(
-                "SELECT transaction_id
-                 FROM transactions
-                 WHERE table_uuid = $1
-                   AND transaction_id <= $2
-                 ORDER BY transaction_id
-                 LIMIT $3",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(txn_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
+            .bind(cursor_txn.as_bytes().as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+            let row = row.ok_or_else(|| {
+                CatalogError::InvalidArgument(
+                    "requested transaction does not exist for table".to_string(),
+                )
+            })?;
 
-        if txn_rows.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "transaction scan exceeds limit of {}",
-                limits::MAX_TRANSACTIONS_PER_SCAN
-            )));
+            txn_ids_desc.push(cursor_txn);
+            if txn_ids_desc.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
+                return Err(CatalogError::LimitExceeded(format!(
+                    "transaction scan exceeds limit of {}",
+                    limits::MAX_TRANSACTIONS_PER_SCAN
+                )));
+            }
+
+            let parent_transaction_id = uuid_from_row_optional(&row, "parent_transaction_id")?;
+            match parent_transaction_id {
+                Some(parent_id) => {
+                    if Some(parent_id) == cursor.from_exclusive {
+                        reached_from_boundary = true;
+                        break;
+                    }
+                    cursor_txn = parent_id;
+                }
+                None => break,
+            }
+        }
+        if !reached_from_boundary {
+            return Err(CatalogError::InvalidArgument(
+                "from transaction is not an ancestor of to transaction".to_string(),
+            ));
         }
 
-        let mut transaction_ids = Vec::with_capacity(txn_rows.len());
-        for row in txn_rows {
-            transaction_ids.push(uuid_from_row(&row, "transaction_id")?);
-        }
-        let mut index_by_txn = std::collections::HashMap::with_capacity(transaction_ids.len());
-        let mut events = Vec::with_capacity(transaction_ids.len());
-        for (index, transaction_id) in transaction_ids.into_iter().enumerate() {
-            index_by_txn.insert(transaction_id, index);
-            events.push(TxnEvent {
+        txn_ids_desc.reverse();
+        let mut events = Vec::with_capacity(txn_ids_desc.len());
+        let mut added_file_events = 0usize;
+        let mut removed_file_events = 0usize;
+        let mut schema_change_events = 0usize;
+
+        for transaction_id in txn_ids_desc {
+            let mut event = TxnEvent {
                 transaction_id,
                 file_changes: Vec::new(),
                 schema_change: None,
-            });
-        }
+            };
 
-        // Sentinel-row pattern: fetch one extra row to detect truncation.
-        // If we get MAX+1 rows, we fail with LimitExceeded instead of silently dropping events.
-        let added_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
-        let added_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Postgres>(
+            let added_rows = sqlx::query::<sqlx::Postgres>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
                         added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
                  FROM files
                  WHERE table_uuid = $1
-                   AND added_in_transaction_id > $2
-                   AND added_in_transaction_id <= $3
-                 LIMIT $4",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(added_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Postgres>(
-                "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                        added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 FROM files
-                 WHERE table_uuid = $1
-                   AND added_in_transaction_id <= $2
+                   AND added_in_transaction_id = $2
                  LIMIT $3",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(added_scan_limit)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
             .fetch_all(&self.pool)
-            .await?
-        };
-        if added_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "added file events exceed limit of {}",
-                limits::MAX_FILES_PER_QUERY
-            )));
-        }
+            .await?;
 
-        for row in added_rows {
-            let partition_values: Option<String> = row.try_get("partition_values")?;
-            let format_options: Option<String> = row.try_get("format_options")?;
-            let added_in_transaction_id = uuid_from_row(&row, "added_in_transaction_id")?;
-            if let Some(index) = index_by_txn.get(&added_in_transaction_id) {
-                events[*index].file_changes.push(TxnFileChange {
+            for row in added_rows {
+                added_file_events += 1;
+                if added_file_events > limits::MAX_FILES_PER_QUERY as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "added file events exceed limit of {}",
+                        limits::MAX_FILES_PER_QUERY
+                    )));
+                }
+                let partition_values: Option<String> = row.try_get("partition_values")?;
+                let format_options: Option<String> = row.try_get("format_options")?;
+                let added_in_transaction_id = uuid_from_row(&row, "added_in_transaction_id")?;
+                event.file_changes.push(TxnFileChange {
                     transaction_id: added_in_transaction_id,
                     kind: TxnFileChangeKind::Added,
                     file: schema::File {
@@ -1812,58 +1759,36 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     },
                 });
             }
-        }
 
-        let removed_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
-        let removed_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Postgres>(
+            let removed_rows = sqlx::query::<sqlx::Postgres>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
                         added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
                  FROM files
                  WHERE table_uuid = $1
-                   AND removed_in_transaction_id IS NOT NULL
-                   AND removed_in_transaction_id > $2
-                   AND removed_in_transaction_id <= $3
-                 LIMIT $4",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(removed_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Postgres>(
-                "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                        added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 FROM files
-                 WHERE table_uuid = $1
-                   AND removed_in_transaction_id IS NOT NULL
-                   AND removed_in_transaction_id <= $2
+                   AND removed_in_transaction_id = $2
                  LIMIT $3",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(removed_scan_limit)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
             .fetch_all(&self.pool)
-            .await?
-        };
-        if removed_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "removed file events exceed limit of {}",
-                limits::MAX_FILES_PER_QUERY
-            )));
-        }
+            .await?;
 
-        for row in removed_rows {
-            let partition_values: Option<String> = row.try_get("partition_values")?;
-            let format_options: Option<String> = row.try_get("format_options")?;
-            let removed_in_transaction_id =
-                uuid_from_row_optional(&row, "removed_in_transaction_id")?.ok_or_else(|| {
-                    CatalogError::InvalidArgument("missing removed transaction id".to_string())
-                })?;
-            if let Some(index) = index_by_txn.get(&removed_in_transaction_id) {
-                events[*index].file_changes.push(TxnFileChange {
+            for row in removed_rows {
+                removed_file_events += 1;
+                if removed_file_events > limits::MAX_FILES_PER_QUERY as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "removed file events exceed limit of {}",
+                        limits::MAX_FILES_PER_QUERY
+                    )));
+                }
+                let partition_values: Option<String> = row.try_get("partition_values")?;
+                let format_options: Option<String> = row.try_get("format_options")?;
+                let removed_in_transaction_id =
+                    uuid_from_row_optional(&row, "removed_in_transaction_id")?.ok_or_else(|| {
+                        CatalogError::InvalidArgument("missing removed transaction id".to_string())
+                    })?;
+                event.file_changes.push(TxnFileChange {
                     transaction_id: removed_in_transaction_id,
                     kind: TxnFileChangeKind::Removed,
                     file: schema::File {
@@ -1880,80 +1805,63 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     },
                 });
             }
-        }
 
-        let schema_scan_limit = limits::MAX_SCHEMA_CHANGES_PER_SCAN as i64 + 1;
-        let schema_rows = if let Some(from_exclusive) = cursor.from_exclusive {
-            sqlx::query::<sqlx::Postgres>(
+            let schema_rows = sqlx::query::<sqlx::Postgres>(
                 "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
                  FROM schemas
-                 WHERE table_uuid = $1
-                   AND valid_from_transaction_id > $2
-                   AND valid_from_transaction_id <= $3
-                 LIMIT $4",
+                 WHERE table_uuid = $1 AND valid_from_transaction_id = $2
+                 LIMIT 2",
             )
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(from_exclusive.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(schema_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query::<sqlx::Postgres>(
-                "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
-                 FROM schemas
-                 WHERE table_uuid = $1
-                   AND valid_from_transaction_id <= $2
-                 LIMIT $3",
-            )
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(schema_scan_limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
-        if schema_rows.len() > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
-            return Err(CatalogError::LimitExceeded(format!(
-                "schema change events exceed limit of {}",
-                limits::MAX_SCHEMA_CHANGES_PER_SCAN
-            )));
-        }
-
-        for schema_row in schema_rows {
-            let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
-            let valid_from_transaction_id =
-                uuid_from_row(&schema_row, "valid_from_transaction_id")?;
-            let column_rows = sqlx::query::<sqlx::Postgres>(
-                "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
-                 FROM columns WHERE schema_uuid = $1 ORDER BY ordinal_position LIMIT $2",
-            )
-            .bind(schema_uuid.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
+            .bind(transaction_id.as_bytes().as_slice())
             .fetch_all(&self.pool)
             .await?;
-            if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
-                return Err(CatalogError::LimitExceeded(format!(
-                    "schema change column count exceeds limit of {}",
-                    limits::MAX_COLUMNS_PER_SCHEMA
-                )));
+            if schema_rows.len() > 1 {
+                return Err(CatalogError::InvalidArgument(
+                    "multiple schemas found for the same transaction".to_string(),
+                ));
             }
+            if let Some(schema_row) = schema_rows.into_iter().next() {
+                schema_change_events += 1;
+                if schema_change_events > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "schema change events exceed limit of {}",
+                        limits::MAX_SCHEMA_CHANGES_PER_SCAN
+                    )));
+                }
+                let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
+                let valid_from_transaction_id =
+                    uuid_from_row(&schema_row, "valid_from_transaction_id")?;
+                let column_rows = sqlx::query::<sqlx::Postgres>(
+                    "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
+                     FROM columns WHERE schema_uuid = $1 ORDER BY ordinal_position LIMIT $2",
+                )
+                .bind(schema_uuid.as_bytes().as_slice())
+                .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
+                .fetch_all(&self.pool)
+                .await?;
+                if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+                    return Err(CatalogError::LimitExceeded(format!(
+                        "schema change column count exceeds limit of {}",
+                        limits::MAX_COLUMNS_PER_SCHEMA
+                    )));
+                }
 
-            let mut columns = Vec::with_capacity(column_rows.len());
-            for row in column_rows {
-                let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
-                let column_type = decode_data_type(&column_type_bytes)?;
-                columns.push(schema::Column {
-                    column_uuid: uuid_from_row(&row, "column_uuid")?,
-                    schema_uuid: uuid_from_row(&row, "schema_uuid")?,
-                    column_name: row.try_get("column_name")?,
-                    column_type,
-                    ordinal_position: row.try_get("ordinal_position")?,
-                    is_nullable: row.try_get("is_nullable")?,
-                });
-            }
+                let mut columns = Vec::with_capacity(column_rows.len());
+                for row in column_rows {
+                    let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
+                    let column_type = decode_data_type(&column_type_bytes)?;
+                    columns.push(schema::Column {
+                        column_uuid: uuid_from_row(&row, "column_uuid")?,
+                        schema_uuid: uuid_from_row(&row, "schema_uuid")?,
+                        column_name: row.try_get("column_name")?,
+                        column_type,
+                        ordinal_position: row.try_get("ordinal_position")?,
+                        is_nullable: row.try_get("is_nullable")?,
+                    });
+                }
 
-            if let Some(index) = index_by_txn.get(&valid_from_transaction_id) {
-                events[*index].schema_change = Some(TxnSchemaChange {
+                event.schema_change = Some(TxnSchemaChange {
                     transaction_id: valid_from_transaction_id,
                     schema: schema::Schema {
                         schema_uuid,
@@ -1969,6 +1877,8 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                     },
                 });
             }
+
+            events.push(event);
         }
 
         Ok(events)
@@ -2939,6 +2849,62 @@ mod tests {
             .await
             .expect("exactly-at-limit transaction scan should succeed");
         assert_eq!(events.len(), limits::MAX_TRANSACTIONS_PER_SCAN as usize);
+    }
+
+    #[tokio::test]
+    async fn list_transaction_events_uses_parent_chain_not_uuid_order() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+        let tx1 = uuid::Uuid::from_u128(2);
+        let tx2 = uuid::Uuid::from_u128(1);
+
+        let mut tx = catalog.pool.begin().await.expect("begin transaction");
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(tx1.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .bind(chrono::Utc::now())
+        .bind(base_transaction_id.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("tx1 insert should succeed");
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(tx2.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .bind(chrono::Utc::now())
+        .bind(tx1.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("tx2 insert should succeed");
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(tx2.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("table head update should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let events = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: tx2,
+                },
+            )
+            .await
+            .expect("parent-chain ordered scan should succeed");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transaction_id, tx1);
+        assert_eq!(events[1].transaction_id, tx2);
     }
 
     #[tokio::test]
