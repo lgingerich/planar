@@ -775,9 +775,15 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
                  FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
             )
             .bind(schema_uuid.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
             .fetch_all(&self.pool)
             .await?;
+            if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+                return Err(CatalogError::LimitExceeded(format!(
+                    "schema change column count exceeds limit of {}",
+                    limits::MAX_COLUMNS_PER_SCHEMA
+                )));
+            }
 
             let mut columns = Vec::with_capacity(column_rows.len());
             for row in column_rows {
@@ -1922,9 +1928,15 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
                  FROM columns WHERE schema_uuid = $1 ORDER BY ordinal_position LIMIT $2",
             )
             .bind(schema_uuid.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
             .fetch_all(&self.pool)
             .await?;
+            if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+                return Err(CatalogError::LimitExceeded(format!(
+                    "schema change column count exceeds limit of {}",
+                    limits::MAX_COLUMNS_PER_SCHEMA
+                )));
+            }
 
             let mut columns = Vec::with_capacity(column_rows.len());
             for row in column_rows {
@@ -2643,6 +2655,78 @@ mod tests {
         Some((catalog, ident, view))
     }
 
+    async fn seed_single_schema_change_with_columns_sqlite(
+        catalog: &Arc<SqlCatalog<sqlx::Sqlite>>,
+        table_view: &TableView,
+        schema_version: i32,
+        column_count: u32,
+    ) -> TxnId {
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+        let transaction_id = next_transaction_id();
+        let schema_uuid = uuid::Uuid::new_v4();
+        let mut tx = catalog.pool.begin().await.expect("begin transaction");
+
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .bind(chrono::Utc::now())
+        .bind(base_transaction_id.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("transaction insert should succeed");
+
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO schemas (
+                schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(schema_uuid.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .bind(schema_version)
+        .bind(transaction_id.as_bytes().as_slice())
+        .bind(Option::<Vec<u8>>::None)
+        .bind(chrono::Utc::now())
+        .execute(tx.as_mut())
+        .await
+        .expect("schema insert should succeed");
+
+        let encoded_type = encode_data_type(&DataType::Int64).expect("type encoding should succeed");
+        for i in 0..column_count {
+            let column_uuid = uuid::Uuid::new_v4();
+            let column_name = format!("schema_evt_col_{i}");
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO columns (column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(column_uuid.as_bytes().as_slice())
+            .bind(schema_uuid.as_bytes().as_slice())
+            .bind(column_name)
+            .bind(encoded_type.as_slice())
+            .bind((i + 1) as i32)
+            .bind(false)
+            .execute(tx.as_mut())
+            .await
+            .expect("column insert should succeed");
+        }
+
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1, current_schema_uuid = ?2 WHERE table_uuid = ?3",
+        )
+        .bind(transaction_id.as_bytes().as_slice())
+        .bind(schema_uuid.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("table head update should succeed");
+
+        tx.commit().await.expect("commit should succeed");
+        transaction_id
+    }
+
     #[test]
     fn schema_spec_validate_rejects_duplicate_column_names() {
         let schema = SchemaSpec::new()
@@ -3214,6 +3298,67 @@ mod tests {
             .filter(|event| event.schema_change.is_some())
             .count();
         assert_eq!(schema_change_count, limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize);
+    }
+
+    #[tokio::test]
+    async fn list_transaction_events_allows_exactly_max_schema_change_columns() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let base_transaction_id = table_view.transaction_id;
+        let schema_change_txn = seed_single_schema_change_with_columns_sqlite(
+            &catalog,
+            &table_view,
+            2,
+            limits::MAX_COLUMNS_PER_SCHEMA,
+        )
+        .await;
+
+        let events = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: schema_change_txn,
+                },
+            )
+            .await
+            .expect("schema event with columns at limit should succeed");
+        let schema_change = events
+            .iter()
+            .find_map(|event| event.schema_change.as_ref())
+            .expect("schema change event should be present");
+        assert_eq!(
+            schema_change.schema.columns.len(),
+            limits::MAX_COLUMNS_PER_SCHEMA as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn list_transaction_events_rejects_schema_change_column_overflow() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let base_transaction_id = table_view.transaction_id;
+        let schema_change_txn = seed_single_schema_change_with_columns_sqlite(
+            &catalog,
+            &table_view,
+            2,
+            limits::MAX_COLUMNS_PER_SCHEMA + 1,
+        )
+        .await;
+
+        let err = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: schema_change_txn,
+                },
+            )
+            .await
+            .expect_err("schema event column overflow should fail");
+        assert!(matches!(err, CatalogError::LimitExceeded(_)));
+        assert!(
+            err.to_string()
+                .contains("schema change column count exceeds limit")
+        );
     }
 
     #[tokio::test]
