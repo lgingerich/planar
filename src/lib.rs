@@ -9,14 +9,3 @@ pub mod catalog;
 
 /// Storage APIs for reading and writing supported file formats.
 pub mod storage;
-
-// Internal Python bindings used by the `_native` extension module.
-mod python;
-
-use pyo3::prelude::*;
-
-/// Python entrypoint invoked when importing the `_native` extension.
-#[pymodule]
-fn _native(py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    python::init_module(py, module)
-}
