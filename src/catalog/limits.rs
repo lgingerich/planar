@@ -124,6 +124,10 @@ mod tests {
             MAX_JSON_SIZE_BYTES <= 10_485_760,
             "JSON size limit must not exceed 10 MB"
         );
+        assert!(
+            MAX_SCHEMA_CHANGES_PER_SCAN <= MAX_TRANSACTIONS_PER_SCAN,
+            "schema change scan limit must not exceed transaction scan limit"
+        );
     }
 
     #[test]

@@ -2615,6 +2615,34 @@ mod tests {
         (catalog, ident, view)
     }
 
+    async fn create_postgres_catalog_with_table_if_configured(
+    ) -> Option<(Arc<SqlCatalog<sqlx::Postgres>>, TableIdent, TableView)> {
+        let connection_string = match std::env::var("PLANAR_TEST_POSTGRES_URL") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        let catalog = SqlCatalog::<sqlx::Postgres>::from_connection_string(&connection_string)
+            .await
+            .expect("postgres catalog should initialize");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let ident = TableIdent::new(format!("test_ns_{suffix}"), format!("test_table_{suffix}"));
+        catalog
+            .clone()
+            .create_table(
+                ident.clone(),
+                format!("postgres://{suffix}"),
+                SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)),
+                None,
+            )
+            .await
+            .expect("table creation should succeed");
+        let view = catalog
+            .read_table(&ident, None)
+            .await
+            .expect("table should be readable");
+        Some((catalog, ident, view))
+    }
+
     #[test]
     fn schema_spec_validate_rejects_duplicate_column_names() {
         let schema = SchemaSpec::new()
@@ -2784,6 +2812,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_transaction_events_allows_exactly_max_transaction_scan() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+
+        let mut tx = catalog.pool.begin().await.expect("begin transaction");
+        let mut last_transaction_id = base_transaction_id;
+        for _ in 0..limits::MAX_TRANSACTIONS_PER_SCAN {
+            let transaction_id = next_transaction_id();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(chrono::Utc::now())
+            .bind(last_transaction_id.as_bytes().as_slice())
+            .execute(tx.as_mut())
+            .await
+            .expect("transaction insert should succeed");
+            last_transaction_id = transaction_id;
+        }
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("table head update should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let events = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: last_transaction_id,
+                },
+            )
+            .await
+            .expect("exactly-at-limit transaction scan should succeed");
+        assert_eq!(events.len(), limits::MAX_TRANSACTIONS_PER_SCAN as usize);
+    }
+
+    #[tokio::test]
+    async fn list_transaction_events_allows_exactly_max_added_file_events() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+
+        let mut tx = catalog.pool.begin().await.expect("begin transaction");
+        let mut last_transaction_id = base_transaction_id;
+        for i in 0..limits::MAX_FILES_PER_QUERY {
+            let transaction_id = next_transaction_id();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(chrono::Utc::now())
+            .bind(last_transaction_id.as_bytes().as_slice())
+            .execute(tx.as_mut())
+            .await
+            .expect("transaction insert should succeed");
+
+            let file_uuid = uuid::Uuid::new_v4();
+            let file_path = format!("/tmp/at-limit-added-{i}.parquet");
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO files (
+                    file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
+                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .bind(file_uuid.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind("parquet")
+            .bind(file_path)
+            .bind(1_i64)
+            .bind(1_i64)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(Option::<Vec<u8>>::None)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .execute(tx.as_mut())
+            .await
+            .expect("file insert should succeed");
+
+            last_transaction_id = transaction_id;
+        }
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("table head update should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let events = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: last_transaction_id,
+                },
+            )
+            .await
+            .expect("exactly-at-limit added file scan should succeed");
+        let added_count: usize = events
+            .iter()
+            .map(|event| {
+                event
+                    .file_changes
+                    .iter()
+                    .filter(|change| matches!(change.kind, TxnFileChangeKind::Added))
+                    .count()
+            })
+            .sum();
+        assert_eq!(added_count, limits::MAX_FILES_PER_QUERY as usize);
+    }
+
+    #[tokio::test]
     async fn list_transaction_events_rejects_removed_file_overflow() {
         let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
         let table_uuid = table_view.table_uuid;
@@ -2854,6 +3007,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_transaction_events_allows_exactly_max_removed_file_events() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+
+        let mut tx = catalog.pool.begin().await.expect("begin transaction");
+        let mut last_transaction_id = base_transaction_id;
+        for i in 0..limits::MAX_FILES_PER_QUERY {
+            let transaction_id = next_transaction_id();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(chrono::Utc::now())
+            .bind(last_transaction_id.as_bytes().as_slice())
+            .execute(tx.as_mut())
+            .await
+            .expect("transaction insert should succeed");
+
+            let file_uuid = uuid::Uuid::new_v4();
+            let file_path = format!("/tmp/at-limit-removed-{i}.parquet");
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO files (
+                    file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
+                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .bind(file_uuid.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind("parquet")
+            .bind(file_path)
+            .bind(1_i64)
+            .bind(1_i64)
+            .bind(base_transaction_id.as_bytes().as_slice())
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .execute(tx.as_mut())
+            .await
+            .expect("file insert should succeed");
+
+            last_transaction_id = transaction_id;
+        }
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("table head update should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let events = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: last_transaction_id,
+                },
+            )
+            .await
+            .expect("exactly-at-limit removed file scan should succeed");
+        let removed_count: usize = events
+            .iter()
+            .map(|event| {
+                event
+                    .file_changes
+                    .iter()
+                    .filter(|change| matches!(change.kind, TxnFileChangeKind::Removed))
+                    .count()
+            })
+            .sum();
+        assert_eq!(removed_count, limits::MAX_FILES_PER_QUERY as usize);
+    }
+
+    #[tokio::test]
     async fn list_transaction_events_rejects_schema_change_overflow() {
         let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
         let table_uuid = table_view.table_uuid;
@@ -2918,6 +3150,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_transaction_events_allows_exactly_max_schema_change_events() {
+        let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
+        let table_uuid = table_view.table_uuid;
+        let base_transaction_id = table_view.transaction_id;
+
+        let mut tx = catalog.pool.begin().await.expect("begin transaction");
+        let mut last_transaction_id = base_transaction_id;
+        for i in 0..limits::MAX_SCHEMA_CHANGES_PER_SCAN {
+            let transaction_id = next_transaction_id();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(chrono::Utc::now())
+            .bind(last_transaction_id.as_bytes().as_slice())
+            .execute(tx.as_mut())
+            .await
+            .expect("transaction insert should succeed");
+
+            let schema_uuid = uuid::Uuid::new_v4();
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO schemas (
+                    schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(schema_uuid.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind((i as i32) + 100)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(Option::<Vec<u8>>::None)
+            .bind(chrono::Utc::now())
+            .execute(tx.as_mut())
+            .await
+            .expect("schema insert should succeed");
+
+            last_transaction_id = transaction_id;
+        }
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+        )
+        .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(table_uuid.as_bytes().as_slice())
+        .execute(tx.as_mut())
+        .await
+        .expect("table head update should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let events = catalog
+            .list_transaction_events(
+                &ident,
+                TxnRangeCursor {
+                    from_exclusive: Some(base_transaction_id),
+                    to_inclusive: last_transaction_id,
+                },
+            )
+            .await
+            .expect("exactly-at-limit schema scan should succeed");
+        let schema_change_count = events
+            .iter()
+            .filter(|event| event.schema_change.is_some())
+            .count();
+        assert_eq!(schema_change_count, limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize);
+    }
+
+    #[tokio::test]
     async fn schema_update_rejects_implicit_column_drop() {
         let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
         let handle = TableHandle::new(catalog.clone(), ident.clone());
@@ -2954,6 +3253,46 @@ mod tests {
         assert!(matches!(err, CatalogError::InvalidArgument(_)));
         assert!(err.to_string().contains("cannot drop existing column"));
         assert!(err.to_string().contains("value"));
+    }
+
+    #[tokio::test]
+    async fn postgres_schema_update_rejects_implicit_column_drop_when_configured() {
+        let Some((catalog, ident, table_view)) = create_postgres_catalog_with_table_if_configured().await else {
+            return;
+        };
+        let handle = TableHandle::new(catalog.clone(), ident.clone());
+
+        let base_txn = table_view.transaction_id;
+        let create_builder = handle
+            .write(Some(base_txn))
+            .await
+            .expect("builder should be created");
+        create_builder
+            .update_schema(
+                SchemaSpec::new()
+                    .with_column(ColumnSpec::new("id", DataType::Int64))
+                    .with_column(ColumnSpec::new("value", DataType::Utf8).nullable()),
+            )
+            .commit()
+            .await
+            .expect("adding a new column should succeed");
+
+        let current_txn = handle
+            .current_transaction_id()
+            .await
+            .expect("current transaction should be available");
+        let drop_builder = handle
+            .write(Some(current_txn))
+            .await
+            .expect("builder should be created");
+        let err = drop_builder
+            .update_schema(SchemaSpec::new().with_column(ColumnSpec::new("id", DataType::Int64)))
+            .commit()
+            .await
+            .expect_err("implicit drop should fail");
+
+        assert!(matches!(err, CatalogError::InvalidArgument(_)));
+        assert!(err.to_string().contains("cannot drop existing column"));
     }
 
     #[tokio::test]
