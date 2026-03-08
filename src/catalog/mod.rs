@@ -729,7 +729,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             }
         }
 
-        let schema_scan_limit = limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1;
+        let schema_scan_limit = limits::MAX_SCHEMA_CHANGES_PER_SCAN as i64 + 1;
         let schema_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Sqlite>(
                 "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
@@ -759,10 +759,10 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             .fetch_all(&self.pool)
             .await?
         };
-        if schema_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+        if schema_rows.len() > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "schema change events exceed limit of {}",
-                limits::MAX_COLUMNS_PER_SCHEMA
+                limits::MAX_SCHEMA_CHANGES_PER_SCAN
             )));
         }
 
@@ -1876,7 +1876,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             }
         }
 
-        let schema_scan_limit = limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1;
+        let schema_scan_limit = limits::MAX_SCHEMA_CHANGES_PER_SCAN as i64 + 1;
         let schema_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Postgres>(
                 "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
@@ -1906,10 +1906,10 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             .fetch_all(&self.pool)
             .await?
         };
-        if schema_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+        if schema_rows.len() > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
             return Err(CatalogError::LimitExceeded(format!(
                 "schema change events exceed limit of {}",
-                limits::MAX_COLUMNS_PER_SCHEMA
+                limits::MAX_SCHEMA_CHANGES_PER_SCAN
             )));
         }
 
@@ -2859,7 +2859,7 @@ mod tests {
         let table_uuid = table_view.table_uuid;
         let base_transaction_id = table_view.transaction_id;
 
-        let overflow_count = limits::MAX_COLUMNS_PER_SCHEMA as usize + 1;
+        let overflow_count = limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize + 1;
         let mut last_transaction_id = base_transaction_id;
         for i in 0..overflow_count {
             let transaction_id = next_transaction_id();

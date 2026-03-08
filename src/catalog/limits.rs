@@ -21,6 +21,10 @@ pub const MAX_TABLES_PER_LIST: u32 = 10_000;
 /// Maximum number of transactions scanned in one event-log range query.
 pub const MAX_TRANSACTIONS_PER_SCAN: u32 = 50_000;
 
+/// Maximum number of schema-change events scanned in one event-log range query.
+/// Separate from MAX_COLUMNS_PER_SCHEMA because this bounds version history depth.
+pub const MAX_SCHEMA_CHANGES_PER_SCAN: u32 = 10_000;
+
 /// Maximum number of operations per mutation.
 /// Prevents transactions from becoming too large.
 pub const MAX_OPERATIONS_PER_MUTATION: u32 = 1_000;
