@@ -591,6 +591,9 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             });
         }
 
+        // Sentinel-row pattern: fetch one extra row to detect truncation.
+        // If we get MAX+1 rows, we fail with LimitExceeded instead of silently dropping events.
+        let added_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
         let added_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Sqlite>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
@@ -604,7 +607,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(added_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -618,10 +621,16 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(added_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
+        if added_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "added file events exceed limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
 
         for row in added_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
@@ -650,6 +659,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             }
         }
 
+        let removed_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
         let removed_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Sqlite>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
@@ -664,7 +674,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(removed_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -679,10 +689,16 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(removed_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
+        if removed_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "removed file events exceed limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
 
         for row in removed_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
@@ -711,6 +727,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             }
         }
 
+        let schema_scan_limit = limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1;
         let schema_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Sqlite>(
                 "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
@@ -723,7 +740,7 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+            .bind(schema_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -736,10 +753,16 @@ impl Catalog for SqlCatalog<sqlx::Sqlite> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+            .bind(schema_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
+        if schema_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "schema change events exceed limit of {}",
+                limits::MAX_COLUMNS_PER_SCHEMA
+            )));
+        }
 
         for schema_row in schema_rows {
             let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
@@ -1699,6 +1722,9 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             });
         }
 
+        // Sentinel-row pattern: fetch one extra row to detect truncation.
+        // If we get MAX+1 rows, we fail with LimitExceeded instead of silently dropping events.
+        let added_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
         let added_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Postgres>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
@@ -1712,7 +1738,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(added_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -1726,10 +1752,16 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(added_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
+        if added_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "added file events exceed limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
 
         for row in added_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
@@ -1758,6 +1790,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             }
         }
 
+        let removed_scan_limit = limits::MAX_FILES_PER_QUERY as i64 + 1;
         let removed_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Postgres>(
                 "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
@@ -1772,7 +1805,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(removed_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -1787,10 +1820,16 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_FILES_PER_QUERY as i64)
+            .bind(removed_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
+        if removed_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "removed file events exceed limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
 
         for row in removed_rows {
             let partition_values: Option<String> = row.try_get("partition_values")?;
@@ -1819,6 +1858,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             }
         }
 
+        let schema_scan_limit = limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1;
         let schema_rows = if let Some(from_exclusive) = cursor.from_exclusive {
             sqlx::query::<sqlx::Postgres>(
                 "SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
@@ -1831,7 +1871,7 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_exclusive.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+            .bind(schema_scan_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -1844,10 +1884,16 @@ impl Catalog for SqlCatalog<sqlx::Postgres> {
             )
             .bind(table_uuid.as_bytes().as_slice())
             .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64)
+            .bind(schema_scan_limit)
             .fetch_all(&self.pool)
             .await?
         };
+        if schema_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "schema change events exceed limit of {}",
+                limits::MAX_COLUMNS_PER_SCHEMA
+            )));
+        }
 
         for schema_row in schema_rows {
             let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
