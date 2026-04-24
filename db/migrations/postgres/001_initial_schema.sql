@@ -1,6 +1,10 @@
 -- ============================================================================
 -- tables
 -- ============================================================================
+-- current_transaction_sequence is the monotonic sequence of the table's head
+-- transaction, maintained under the same write lock that protects the head
+-- id. Time-travel and schema-visibility queries compare by sequence, not by
+-- transaction UUID byte order.
 CREATE TABLE IF NOT EXISTS tables (
     table_uuid BYTEA PRIMARY KEY,
     table_name TEXT NOT NULL,
@@ -8,6 +12,7 @@ CREATE TABLE IF NOT EXISTS tables (
     location TEXT NOT NULL,
     current_schema_uuid BYTEA,
     current_transaction_id BYTEA,
+    current_transaction_sequence BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL,
     properties TEXT,
     min_reader_version INTEGER NOT NULL DEFAULT 1,
@@ -18,13 +23,18 @@ CREATE TABLE IF NOT EXISTS tables (
 -- ============================================================================
 -- transactions
 -- ============================================================================
+-- txn_sequence is a per-table monotonic counter assigned at commit time. It
+-- is the canonical ordering used for all time-travel and ancestry queries;
+-- transaction UUIDs are treated purely as opaque identifiers.
 CREATE TABLE IF NOT EXISTS transactions (
     transaction_id BYTEA PRIMARY KEY,
     table_uuid BYTEA NOT NULL,
+    txn_sequence BIGINT NOT NULL,
     transaction_timestamp TIMESTAMP NOT NULL,
     parent_transaction_id BYTEA,
     FOREIGN KEY(table_uuid) REFERENCES tables(table_uuid),
-    FOREIGN KEY(parent_transaction_id) REFERENCES transactions(transaction_id)
+    FOREIGN KEY(parent_transaction_id) REFERENCES transactions(transaction_id),
+    UNIQUE(table_uuid, txn_sequence)
 );
 
 CREATE INDEX IF NOT EXISTS idx_transactions_table
@@ -36,14 +46,21 @@ CREATE INDEX IF NOT EXISTS idx_transactions_timestamp
 -- ============================================================================
 -- schemas
 -- ============================================================================
+-- valid_from_sequence / valid_to_sequence denormalize the sequence numbers of
+-- the transactions referenced by valid_from_transaction_id / valid_to_transaction_id,
+-- so schema-visibility queries at a given sequence S can be a single predicate
+-- `valid_from_sequence <= S AND (valid_to_sequence IS NULL OR valid_to_sequence > S)`
+-- with no joins.
+--
 -- NOTE: May want to add a column for the Arrow IPC schema bytes
-
 CREATE TABLE IF NOT EXISTS schemas (
     schema_uuid BYTEA PRIMARY KEY,
     table_uuid BYTEA NOT NULL,
     schema_version INTEGER NOT NULL,
     valid_from_transaction_id BYTEA NOT NULL,
+    valid_from_sequence BIGINT NOT NULL,
     valid_to_transaction_id BYTEA,
+    valid_to_sequence BIGINT,
     created_at TIMESTAMP NOT NULL,
     FOREIGN KEY(table_uuid) REFERENCES tables(table_uuid),
     FOREIGN KEY(valid_from_transaction_id) REFERENCES transactions(transaction_id),
@@ -54,7 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_schemas_table
     ON schemas(table_uuid);
 
 CREATE INDEX IF NOT EXISTS idx_schemas_valid_range
-    ON schemas(table_uuid, valid_from_transaction_id, valid_to_transaction_id);
+    ON schemas(table_uuid, valid_from_sequence, valid_to_sequence);
 
 -- ============================================================================
 -- columns
@@ -76,6 +93,9 @@ CREATE INDEX IF NOT EXISTS idx_columns_schema
 -- ============================================================================
 -- files
 -- ============================================================================
+-- added_in_sequence / removed_in_sequence denormalize the sequences of
+-- added_in_transaction_id / removed_in_transaction_id so snapshot and
+-- event-range queries reduce to simple sequence predicates.
 CREATE TABLE IF NOT EXISTS files (
     file_uuid BYTEA PRIMARY KEY,
     table_uuid BYTEA NOT NULL,
@@ -84,7 +104,9 @@ CREATE TABLE IF NOT EXISTS files (
     record_count BIGINT NOT NULL,
     file_size_bytes BIGINT NOT NULL,
     added_in_transaction_id BYTEA NOT NULL,
+    added_in_sequence BIGINT NOT NULL,
     removed_in_transaction_id BYTEA,
+    removed_in_sequence BIGINT,
     partition_values TEXT,
     format_options TEXT,
     FOREIGN KEY(table_uuid) REFERENCES tables(table_uuid),
@@ -96,7 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_files_table
     ON files(table_uuid);
 
 CREATE INDEX IF NOT EXISTS idx_files_active
-    ON files(table_uuid, added_in_transaction_id, removed_in_transaction_id);
+    ON files(table_uuid, added_in_sequence, removed_in_sequence);
 
 -- ============================================================================
 -- table_stats

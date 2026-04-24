@@ -104,10 +104,12 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sq
     // This should succeed (valid foreign key)
     let test_transaction_id: i64 = 1;
     sqlx::query(
-        "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp) VALUES (?1, ?2, ?3)",
+        "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp)
+         VALUES (?1, ?2, ?3, ?4)",
     )
     .bind(test_transaction_id)
     .bind(&test_table_uuid_bytes[..])
+    .bind(1_i64)
     .bind(chrono::Utc::now())
     .execute(&pool)
     .await?;
@@ -115,10 +117,12 @@ async fn test_foreign_key_enforcement(pool: sqlx::Pool<Sqlite>) -> Result<(), sq
     // This should fail (invalid foreign key - non-existent table_uuid)
     let invalid_uuid_bytes = vec![1u8; 16];
     let result = sqlx::query(
-        "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp) VALUES (?1, ?2, ?3)",
+        "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp)
+         VALUES (?1, ?2, ?3, ?4)",
     )
     .bind(2_i64)
     .bind(&invalid_uuid_bytes[..])
+    .bind(2_i64)
     .bind(chrono::Utc::now())
     .execute(&pool)
     .await;
@@ -233,8 +237,9 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 
     // Test tables -> schema::Table
     let _ = sqlx::query_as::<_, schema::Table>(
-        "SELECT table_uuid, table_name, namespace, location, 
-                current_schema_uuid, current_transaction_id, created_at, properties,
+        "SELECT table_uuid, table_name, namespace, location,
+                current_schema_uuid, current_transaction_id, current_transaction_sequence,
+                created_at, properties,
                 min_reader_version, min_writer_version
          FROM tables
          WHERE table_uuid = ?1",
@@ -245,7 +250,8 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 
     // Test transactions -> schema::Transaction
     let _ = sqlx::query_as::<_, schema::Transaction>(
-        "SELECT transaction_id, table_uuid, transaction_timestamp, parent_transaction_id 
+        "SELECT transaction_id, table_uuid, txn_sequence,
+                transaction_timestamp, parent_transaction_id
          FROM transactions
          WHERE transaction_id = ?1",
     )
@@ -256,8 +262,9 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
     // Test schemas -> schema::Schema (note: columns field is Rust-only, not in DB)
     // We'll test the database columns separately, then verify Schema struct can be built
     let _ = sqlx::query(
-        "SELECT schema_uuid, table_uuid, schema_version, 
-                valid_from_transaction_id, valid_to_transaction_id, created_at 
+        "SELECT schema_uuid, table_uuid, schema_version,
+                valid_from_transaction_id, valid_from_sequence,
+                valid_to_transaction_id, valid_to_sequence, created_at
          FROM schemas
          WHERE schema_uuid = ?1",
     )
@@ -296,8 +303,10 @@ async fn test_schema_structs_match_sql_tables(pool: sqlx::Pool<Sqlite>) -> Resul
 
     // Test files -> schema::File
     let _ = sqlx::query_as::<_, schema::File>(
-        "SELECT file_uuid, table_uuid, file_format, file_path, record_count, 
-                file_size_bytes, added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
+        "SELECT file_uuid, table_uuid, file_format, file_path, record_count,
+                file_size_bytes, added_in_transaction_id, added_in_sequence,
+                removed_in_transaction_id, removed_in_sequence,
+                partition_values, format_options
          FROM files
          WHERE file_uuid = ?1",
     )

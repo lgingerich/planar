@@ -20,6 +20,11 @@ pub struct Table {
     pub current_schema_uuid: Option<Uuid>,
     /// Current transaction ID
     pub current_transaction_id: Option<Uuid>,
+    /// Monotonic sequence number of the current transaction.
+    ///
+    /// Maintained under the same write lock as `current_transaction_id` and is
+    /// the canonical ordering used for time-travel and ancestry queries.
+    pub current_transaction_sequence: i64,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Table properties
@@ -37,6 +42,12 @@ pub struct Transaction {
     pub transaction_id: Uuid,
     /// Table UUID
     pub table_uuid: Uuid,
+    /// Monotonic per-table sequence number assigned at commit time.
+    ///
+    /// Unlike `transaction_id` (a UUIDv7 that may have clock-skew-dependent
+    /// byte ordering across writers), `txn_sequence` is strictly monotonic
+    /// per table and is the canonical ordering for visibility queries.
+    pub txn_sequence: i64,
     /// Transaction timestamp
     pub transaction_timestamp: DateTime<Utc>,
     /// Parent transaction ID if this is a child transaction
@@ -54,8 +65,15 @@ pub struct Schema {
     pub schema_version: i32,
     /// Transaction ID where this schema becomes valid
     pub valid_from_transaction_id: Uuid,
+    /// Sequence number at which this schema becomes visible.
+    ///
+    /// Denormalized from `transactions.txn_sequence` so visibility queries
+    /// avoid a join.
+    pub valid_from_sequence: i64,
     /// Transaction ID where this schema becomes invalid (if superseded)
     pub valid_to_transaction_id: Option<Uuid>,
+    /// Sequence number at which this schema is superseded (if any).
+    pub valid_to_sequence: Option<i64>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Column definitions
@@ -96,8 +114,15 @@ pub struct File {
     pub file_size_bytes: i64,
     /// Transaction ID where this file was added
     pub added_in_transaction_id: Uuid,
+    /// Sequence number at which this file became visible.
+    ///
+    /// Denormalized from `transactions.txn_sequence` so snapshot and
+    /// event-range queries avoid a join.
+    pub added_in_sequence: i64,
     /// Transaction ID where this file was removed (if deleted)
     pub removed_in_transaction_id: Option<Uuid>,
+    /// Sequence number at which this file was removed (if any).
+    pub removed_in_sequence: Option<i64>,
     /// Partition values if partitioned
     pub partition_values: Option<serde_json::Value>,
     /// Format-specific options for this file

@@ -43,10 +43,10 @@ pub const MAX_PROPERTY_KEYS_TO_REMOVE: u32 = 100;
 pub const MAX_JSON_SIZE_BYTES: u32 = 1_048_576; // 1 MB
 
 /// Batch size for multi-row INSERT of files (amortizes round-trips).
-/// Must keep total bound parameters under DB limit; 9 params per row.
+/// Must keep total bound parameters under DB limit; 10 params per row.
 pub const BATCH_INSERT_FILES_CHUNK: u32 = 100;
 
-/// Batch size for UPDATE files WHERE file_uuid IN (...); 2 fixed params + N UUIDs.
+/// Batch size for UPDATE files WHERE file_uuid IN (...); 3 fixed params + N UUIDs.
 pub const BATCH_DELETE_FILES_CHUNK: u32 = 500;
 
 // PostgreSQL Bind parameter count ceiling.
@@ -58,8 +58,8 @@ const POSTGRES_MAX_BIND_PARAMS: u32 = 65_535;
 const SQLITE_MAX_BIND_PARAMS: u32 = 32_766;
 
 const COLUMN_INSERT_PARAMS_PER_ROW: u32 = 6;
-const FILE_INSERT_PARAMS_PER_ROW: u32 = 9;
-const DELETE_FILES_FIXED_PARAMS: u32 = 2;
+const FILE_INSERT_PARAMS_PER_ROW: u32 = 10;
+const DELETE_FILES_FIXED_PARAMS: u32 = 3;
 
 /// Maximum bind parameters allowed for a backend.
 pub const fn db_bind_limit(db: DbKind) -> u32 {
@@ -146,19 +146,19 @@ mod tests {
     }
 
     #[test]
-    fn file_insert_shape_is_locked_to_nine_binds() {
+    fn file_insert_shape_is_locked_to_ten_binds() {
         assert_eq!(
             file_insert_bind_count(1),
-            9,
+            10,
             "If INSERT INTO files adds/removes fields, update bind math and tests explicitly."
         );
     }
 
     #[test]
-    fn delete_files_shape_is_locked_to_two_fixed_params() {
+    fn delete_files_shape_is_locked_to_three_fixed_params() {
         assert_eq!(
             delete_files_bind_count(0),
-            2,
+            3,
             "If DELETE files query fixed params change, update bind math and tests explicitly."
         );
     }

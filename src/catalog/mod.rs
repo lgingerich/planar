@@ -29,6 +29,15 @@ pub use models::*;
 
 const INITIAL_SCHEMA_VERSION: i32 = 1;
 
+/// Monotonic per-table sequence number assigned to a table's first transaction.
+///
+/// All subsequent commits allocate `previous_sequence + 1`. Because commits
+/// serialize on the table-head row lock (SQLite `BEGIN IMMEDIATE` holds the
+/// database write lock; Postgres uses `SELECT ... FOR UPDATE`), this yields a
+/// strictly monotonic sequence per table that is independent of UUID byte
+/// ordering and therefore robust to clock skew across writers.
+const INITIAL_TRANSACTION_SEQUENCE: i64 = 1;
+
 /// Client protocol versions used for compatibility checks.
 #[derive(Clone, Copy, Debug)]
 pub struct ProtocolVersions {
@@ -255,6 +264,70 @@ impl SqlCatalog<sqlx::Postgres> {
     }
 }
 
+/// Look up the monotonic sequence number assigned to a transaction.
+///
+/// Returns `Ok(None)` if the transaction doesn't exist for this table (callers
+/// should translate that into the appropriate `NotFound` / `InvalidArgument`
+/// error for their context).
+async fn resolve_transaction_sequence<DB>(
+    pool: &sqlx::Pool<DB>,
+    table_uuid: uuid::Uuid,
+    transaction_id: uuid::Uuid,
+) -> Result<Option<i64>>
+where
+    DB: database::SqlBackend,
+    for<'p> &'p sqlx::Pool<DB>: sqlx::Executor<'p, Database = DB>,
+    i64: sqlx::Type<DB>,
+    for<'q> &'q [u8]: sqlx::Encode<'q, DB> + sqlx::Type<DB>,
+    for<'r> i64: sqlx::Decode<'r, DB>,
+    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    usize: sqlx::ColumnIndex<<DB as sqlx::Database>::Row>,
+{
+    let sql = DB::prepare_sql(
+        "SELECT txn_sequence FROM transactions
+         WHERE table_uuid = ?1 AND transaction_id = ?2",
+    );
+    let seq: Option<i64> = sqlx::query_scalar::<DB, i64>(sql.as_ref())
+        .bind(table_uuid.as_bytes().as_slice())
+        .bind(transaction_id.as_bytes().as_slice())
+        .fetch_optional(pool)
+        .await?;
+    Ok(seq)
+}
+
+/// Decode a single `files` row into the `schema::File` type.
+///
+/// Centralizes the column-by-column read so every query that projects all
+/// file columns uses the same decoding logic.
+fn file_from_row<R>(row: &R) -> Result<schema::File>
+where
+    R: sqlx::Row,
+    for<'r> Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> Option<Vec<u8>>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> Option<String>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> Option<i64>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'c> &'c str: sqlx::ColumnIndex<R>,
+{
+    let partition_values: Option<String> = row.try_get("partition_values")?;
+    let format_options: Option<String> = row.try_get("format_options")?;
+    Ok(schema::File {
+        file_uuid: uuid_from_row(row, "file_uuid")?,
+        table_uuid: uuid_from_row(row, "table_uuid")?,
+        file_format: row.try_get("file_format")?,
+        file_path: row.try_get("file_path")?,
+        record_count: row.try_get("record_count")?,
+        file_size_bytes: row.try_get("file_size_bytes")?,
+        added_in_transaction_id: uuid_from_row(row, "added_in_transaction_id")?,
+        added_in_sequence: row.try_get("added_in_sequence")?,
+        removed_in_transaction_id: uuid_from_row_optional(row, "removed_in_transaction_id")?,
+        removed_in_sequence: row.try_get("removed_in_sequence")?,
+        partition_values: parse_json_optional(partition_values)?,
+        format_options: parse_json_optional(format_options)?,
+    })
+}
+
 /// Insert column rows for a schema in chunks bounded by the backend's bind-parameter ceiling.
 ///
 /// Used by both `create_table` and `commit`'s `UpdateSchema` op so the chunking
@@ -478,55 +551,67 @@ where
         let min_reader_version = self.reader_version();
         let min_writer_version = self.writer_version();
 
-        let sql = DB::prepare_sql("INSERT INTO tables (
+        let sql = DB::prepare_sql(
+            "INSERT INTO tables (
                 table_uuid, table_name, namespace, location, created_at, properties,
-                min_reader_version, min_writer_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
+                current_transaction_sequence, min_reader_version, min_writer_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        );
         sqlx::query::<DB>(sql.as_ref())
-        .bind(table_uuid.as_bytes().as_slice())
-        .bind(ident.name.as_str())
-        .bind(ident.namespace.as_str())
-        .bind(location.as_str())
-        .bind(created_at)
-        .bind(properties_text.as_str())
-        .bind(min_reader_version)
-        .bind(min_writer_version)
-        .execute(tx.as_mut())
-        .await?;
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(ident.name.as_str())
+            .bind(ident.namespace.as_str())
+            .bind(location.as_str())
+            .bind(created_at)
+            .bind(properties_text.as_str())
+            .bind(INITIAL_TRANSACTION_SEQUENCE)
+            .bind(min_reader_version)
+            .bind(min_writer_version)
+            .execute(tx.as_mut())
+            .await?;
 
         let transaction_id = next_transaction_id();
-        let sql = DB::prepare_sql("INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp)
-             VALUES (?1, ?2, ?3)");
+        let sql = DB::prepare_sql(
+            "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp)
+             VALUES (?1, ?2, ?3, ?4)",
+        );
         sqlx::query::<DB>(sql.as_ref())
-        .bind(transaction_id.as_bytes().as_slice())
-        .bind(table_uuid.as_bytes().as_slice())
-        .bind(created_at)
-        .execute(tx.as_mut())
-        .await?;
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(INITIAL_TRANSACTION_SEQUENCE)
+            .bind(created_at)
+            .execute(tx.as_mut())
+            .await?;
 
         let schema_uuid = uuid::Uuid::new_v4();
-        let sql = DB::prepare_sql("INSERT INTO schemas (schema_uuid, table_uuid, schema_version, valid_from_transaction_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)");
+        let sql = DB::prepare_sql(
+            "INSERT INTO schemas (schema_uuid, table_uuid, schema_version,
+                                   valid_from_transaction_id, valid_from_sequence, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        );
         sqlx::query::<DB>(sql.as_ref())
-        .bind(schema_uuid.as_bytes().as_slice())
-        .bind(table_uuid.as_bytes().as_slice())
-        .bind(INITIAL_SCHEMA_VERSION)
-        .bind(transaction_id.as_bytes().as_slice())
-        .bind(created_at)
-        .execute(tx.as_mut())
-        .await?;
+            .bind(schema_uuid.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(INITIAL_SCHEMA_VERSION)
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(INITIAL_TRANSACTION_SEQUENCE)
+            .bind(created_at)
+            .execute(tx.as_mut())
+            .await?;
 
         insert_schema_columns::<DB>(&mut tx, schema_uuid, &schema.columns).await?;
 
-        let sql = DB::prepare_sql("UPDATE tables
+        let sql = DB::prepare_sql(
+            "UPDATE tables
              SET current_schema_uuid = ?1, current_transaction_id = ?2
-             WHERE table_uuid = ?3");
+             WHERE table_uuid = ?3",
+        );
         sqlx::query::<DB>(sql.as_ref())
-        .bind(schema_uuid.as_bytes().as_slice())
-        .bind(transaction_id.as_bytes().as_slice())
-        .bind(table_uuid.as_bytes().as_slice())
-        .execute(tx.as_mut())
-        .await?;
+            .bind(schema_uuid.as_bytes().as_slice())
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .execute(tx.as_mut())
+            .await?;
 
         tx.commit().await?;
 
@@ -636,261 +721,251 @@ where
         ident: &TableIdent,
         cursor: TxnRangeCursor,
     ) -> Result<Vec<TxnEvent>> {
-        let sql = DB::prepare_sql("SELECT table_uuid, current_transaction_id
-             FROM tables WHERE namespace = ?1 AND table_name = ?2");
+        let sql = DB::prepare_sql(
+            "SELECT table_uuid, current_transaction_sequence
+             FROM tables WHERE namespace = ?1 AND table_name = ?2",
+        );
         let table_row = sqlx::query::<DB>(sql.as_ref())
-        .bind(ident.namespace.as_str())
-        .bind(ident.name.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(ident.namespace.as_str())
+            .bind(ident.name.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
         let table_row = table_row
             .ok_or_else(|| CatalogError::NotFound(format!("{}.{}", ident.namespace, ident.name)))?;
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
-        let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?
-            .ok_or_else(|| {
-                CatalogError::InvalidArgument("table has no current transaction".to_string())
-            })?;
+        let current_sequence: i64 = table_row.try_get("current_transaction_sequence")?;
 
-        if current_transaction_id != cursor.to_inclusive {
-            let sql = DB::prepare_sql("SELECT 1 FROM transactions WHERE table_uuid = ?1 AND transaction_id = ?2 LIMIT 1");
-            let exists = sqlx::query_scalar::<DB, i64>(sql.as_ref())
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor.to_inclusive.as_bytes().as_slice())
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some();
-            if !exists {
-                return Err(CatalogError::InvalidArgument(
-                    "requested transaction does not exist for table".to_string(),
-                ));
-            }
-        }
-
-        let mut visited = std::collections::HashSet::new();
-        let mut txn_ids_desc = Vec::new();
-        let mut cursor_txn = cursor.to_inclusive;
-        let mut reached_from_boundary = cursor.from_exclusive.is_none();
-        loop {
-            if !visited.insert(cursor_txn) {
-                return Err(CatalogError::InvalidArgument(
-                    "transaction parent chain contains a cycle".to_string(),
-                ));
-            }
-
-            let sql = DB::prepare_sql("SELECT parent_transaction_id
-                 FROM transactions
-                 WHERE table_uuid = ?1 AND transaction_id = ?2");
-            let row = sqlx::query::<DB>(sql.as_ref())
-            .bind(table_uuid.as_bytes().as_slice())
-            .bind(cursor_txn.as_bytes().as_slice())
-            .fetch_optional(&self.pool)
-            .await?;
-            let row = row.ok_or_else(|| {
-                CatalogError::InvalidArgument(
-                    "requested transaction does not exist for table".to_string(),
-                )
-            })?;
-
-            txn_ids_desc.push(cursor_txn);
-            if txn_ids_desc.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
-                return Err(CatalogError::LimitExceeded(format!(
-                    "transaction scan exceeds limit of {}",
-                    limits::MAX_TRANSACTIONS_PER_SCAN
-                )));
-            }
-
-            let parent_transaction_id = uuid_from_row_optional(&row, "parent_transaction_id")?;
-            match parent_transaction_id {
-                Some(parent_id) => {
-                    if Some(parent_id) == cursor.from_exclusive {
-                        reached_from_boundary = true;
-                        break;
-                    }
-                    cursor_txn = parent_id;
-                }
-                None => break,
-            }
-        }
-        if !reached_from_boundary {
+        // Resolve the requested transactions to per-table sequences. Both must
+        // belong to this table and be <= current head, which with strictly
+        // linear commits implies ancestry of the head.
+        let to_sequence = resolve_transaction_sequence::<DB>(
+            &self.pool,
+            table_uuid,
+            cursor.to_inclusive,
+        )
+        .await?
+        .ok_or_else(|| {
+            CatalogError::InvalidArgument(
+                "requested transaction does not exist for table".to_string(),
+            )
+        })?;
+        if to_sequence > current_sequence {
             return Err(CatalogError::InvalidArgument(
-                "from transaction is not an ancestor of to transaction".to_string(),
+                "requested transaction is not in table history".to_string(),
             ));
         }
 
-        txn_ids_desc.reverse();
-        let mut events = Vec::with_capacity(txn_ids_desc.len());
-        let mut added_file_events = 0usize;
-        let mut removed_file_events = 0usize;
-        let mut schema_change_events = 0usize;
+        let from_sequence = if let Some(from_txn) = cursor.from_exclusive {
+            let seq = resolve_transaction_sequence::<DB>(&self.pool, table_uuid, from_txn)
+                .await?
+                .ok_or_else(|| {
+                    CatalogError::InvalidArgument(
+                        "from transaction does not exist for table".to_string(),
+                    )
+                })?;
+            if seq > to_sequence {
+                return Err(CatalogError::InvalidArgument(
+                    "from transaction is not an ancestor of to transaction".to_string(),
+                ));
+            }
+            seq
+        } else {
+            0
+        };
 
-        for transaction_id in txn_ids_desc {
-            let mut event = TxnEvent {
+        // Bulk transactions in (from_sequence, to_sequence], ordered by sequence.
+        let sql = DB::prepare_sql(
+            "SELECT transaction_id, txn_sequence FROM transactions
+             WHERE table_uuid = ?1 AND txn_sequence > ?2 AND txn_sequence <= ?3
+             ORDER BY txn_sequence
+             LIMIT ?4",
+        );
+        let txn_rows = sqlx::query::<DB>(sql.as_ref())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(from_sequence)
+            .bind(to_sequence)
+            .bind(limits::MAX_TRANSACTIONS_PER_SCAN as i64 + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        if txn_rows.len() > limits::MAX_TRANSACTIONS_PER_SCAN as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "transaction scan exceeds limit of {}",
+                limits::MAX_TRANSACTIONS_PER_SCAN
+            )));
+        }
+
+        // Build the ordered event list plus an index for bulk-merging child rows.
+        let mut events: Vec<TxnEvent> = Vec::with_capacity(txn_rows.len());
+        let mut index_by_txn: std::collections::HashMap<uuid::Uuid, usize> =
+            std::collections::HashMap::with_capacity(txn_rows.len());
+        for row in txn_rows {
+            let transaction_id = uuid_from_row(&row, "transaction_id")?;
+            index_by_txn.insert(transaction_id, events.len());
+            events.push(TxnEvent {
                 transaction_id,
                 file_changes: Vec::new(),
                 schema_change: None,
-            };
+            });
+        }
 
-            let sql = DB::prepare_sql("SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                        added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 FROM files
-                 WHERE table_uuid = ?1
-                   AND added_in_transaction_id = ?2
-                 LIMIT ?3");
-            let added_rows = sqlx::query::<DB>(sql.as_ref())
+        // Bulk added files in range.
+        let sql = DB::prepare_sql(
+            "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
+                    added_in_transaction_id, added_in_sequence,
+                    removed_in_transaction_id, removed_in_sequence,
+                    partition_values, format_options
+             FROM files
+             WHERE table_uuid = ?1 AND added_in_sequence > ?2 AND added_in_sequence <= ?3
+             ORDER BY added_in_sequence
+             LIMIT ?4",
+        );
+        let added_rows = sqlx::query::<DB>(sql.as_ref())
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(transaction_id.as_bytes().as_slice())
+            .bind(from_sequence)
+            .bind(to_sequence)
             .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
             .fetch_all(&self.pool)
             .await?;
-
-            for row in added_rows {
-                added_file_events += 1;
-                if added_file_events > limits::MAX_FILES_PER_QUERY as usize {
-                    return Err(CatalogError::LimitExceeded(format!(
-                        "added file events exceed limit of {}",
-                        limits::MAX_FILES_PER_QUERY
-                    )));
-                }
-                let partition_values: Option<String> = row.try_get("partition_values")?;
-                let format_options: Option<String> = row.try_get("format_options")?;
-                let added_in_transaction_id = uuid_from_row(&row, "added_in_transaction_id")?;
-                event.file_changes.push(TxnFileChange {
+        if added_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "added file events exceed limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
+        for row in added_rows {
+            let file = file_from_row(&row)?;
+            let added_in_transaction_id = file.added_in_transaction_id;
+            if let Some(&idx) = index_by_txn.get(&added_in_transaction_id) {
+                events[idx].file_changes.push(TxnFileChange {
                     transaction_id: added_in_transaction_id,
                     kind: TxnFileChangeKind::Added,
-                    file: schema::File {
-                        file_uuid: uuid_from_row(&row, "file_uuid")?,
-                        table_uuid: uuid_from_row(&row, "table_uuid")?,
-                        file_format: row.try_get("file_format")?,
-                        file_path: row.try_get("file_path")?,
-                        record_count: row.try_get("record_count")?,
-                        file_size_bytes: row.try_get("file_size_bytes")?,
-                        added_in_transaction_id,
-                        removed_in_transaction_id: uuid_from_row_optional(
-                            &row,
-                            "removed_in_transaction_id",
-                        )?,
-                        partition_values: parse_json_optional(partition_values)?,
-                        format_options: parse_json_optional(format_options)?,
-                    },
+                    file,
                 });
             }
+            // Rows whose added_in_transaction_id is not in the event set can
+            // only appear if data was modified outside the catalog; silently
+            // skipping keeps reads consistent with the transactions projection.
+        }
 
-            let sql = DB::prepare_sql("SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                        added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 FROM files
-                 WHERE table_uuid = ?1
-                   AND removed_in_transaction_id = ?2
-                 LIMIT ?3");
-            let removed_rows = sqlx::query::<DB>(sql.as_ref())
+        // Bulk removed files in range.
+        let sql = DB::prepare_sql(
+            "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
+                    added_in_transaction_id, added_in_sequence,
+                    removed_in_transaction_id, removed_in_sequence,
+                    partition_values, format_options
+             FROM files
+             WHERE table_uuid = ?1 AND removed_in_sequence > ?2 AND removed_in_sequence <= ?3
+             ORDER BY removed_in_sequence
+             LIMIT ?4",
+        );
+        let removed_rows = sqlx::query::<DB>(sql.as_ref())
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(transaction_id.as_bytes().as_slice())
+            .bind(from_sequence)
+            .bind(to_sequence)
             .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
             .fetch_all(&self.pool)
             .await?;
-
-            for row in removed_rows {
-                removed_file_events += 1;
-                if removed_file_events > limits::MAX_FILES_PER_QUERY as usize {
-                    return Err(CatalogError::LimitExceeded(format!(
-                        "removed file events exceed limit of {}",
-                        limits::MAX_FILES_PER_QUERY
-                    )));
-                }
-                let partition_values: Option<String> = row.try_get("partition_values")?;
-                let format_options: Option<String> = row.try_get("format_options")?;
-                let removed_in_transaction_id =
-                    uuid_from_row_optional(&row, "removed_in_transaction_id")?.ok_or_else(|| {
-                        CatalogError::InvalidArgument("missing removed transaction id".to_string())
-                    })?;
-                event.file_changes.push(TxnFileChange {
+        if removed_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "removed file events exceed limit of {}",
+                limits::MAX_FILES_PER_QUERY
+            )));
+        }
+        for row in removed_rows {
+            let file = file_from_row(&row)?;
+            let removed_in_transaction_id = file.removed_in_transaction_id.ok_or_else(|| {
+                CatalogError::InvalidArgument("missing removed transaction id".to_string())
+            })?;
+            if let Some(&idx) = index_by_txn.get(&removed_in_transaction_id) {
+                events[idx].file_changes.push(TxnFileChange {
                     transaction_id: removed_in_transaction_id,
                     kind: TxnFileChangeKind::Removed,
-                    file: schema::File {
-                        file_uuid: uuid_from_row(&row, "file_uuid")?,
-                        table_uuid: uuid_from_row(&row, "table_uuid")?,
-                        file_format: row.try_get("file_format")?,
-                        file_path: row.try_get("file_path")?,
-                        record_count: row.try_get("record_count")?,
-                        file_size_bytes: row.try_get("file_size_bytes")?,
-                        added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
-                        removed_in_transaction_id: Some(removed_in_transaction_id),
-                        partition_values: parse_json_optional(partition_values)?,
-                        format_options: parse_json_optional(format_options)?,
-                    },
+                    file,
                 });
             }
+        }
 
-            let sql = DB::prepare_sql("SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
-                 FROM schemas
-                 WHERE table_uuid = ?1 AND valid_from_transaction_id = ?2
-                 LIMIT 2");
-            let schema_rows = sqlx::query::<DB>(sql.as_ref())
+        // Bulk schema changes in range.
+        let sql = DB::prepare_sql(
+            "SELECT schema_uuid, table_uuid, schema_version,
+                    valid_from_transaction_id, valid_from_sequence,
+                    valid_to_transaction_id, valid_to_sequence, created_at
+             FROM schemas
+             WHERE table_uuid = ?1 AND valid_from_sequence > ?2 AND valid_from_sequence <= ?3
+             ORDER BY valid_from_sequence
+             LIMIT ?4",
+        );
+        let schema_rows = sqlx::query::<DB>(sql.as_ref())
             .bind(table_uuid.as_bytes().as_slice())
-            .bind(transaction_id.as_bytes().as_slice())
+            .bind(from_sequence)
+            .bind(to_sequence)
+            .bind(limits::MAX_SCHEMA_CHANGES_PER_SCAN as i64 + 1)
             .fetch_all(&self.pool)
             .await?;
-            if schema_rows.len() > 1 {
-                return Err(CatalogError::InvalidArgument(
-                    "multiple schemas found for the same transaction".to_string(),
-                ));
-            }
-            if let Some(schema_row) = schema_rows.into_iter().next() {
-                schema_change_events += 1;
-                if schema_change_events > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
-                    return Err(CatalogError::LimitExceeded(format!(
-                        "schema change events exceed limit of {}",
-                        limits::MAX_SCHEMA_CHANGES_PER_SCAN
-                    )));
-                }
-                let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
-                let valid_from_transaction_id =
-                    uuid_from_row(&schema_row, "valid_from_transaction_id")?;
-                let sql = DB::prepare_sql("SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
-                     FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2");
-                let column_rows = sqlx::query::<DB>(sql.as_ref())
+        if schema_rows.len() > limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize {
+            return Err(CatalogError::LimitExceeded(format!(
+                "schema change events exceed limit of {}",
+                limits::MAX_SCHEMA_CHANGES_PER_SCAN
+            )));
+        }
+
+        // Columns per schema (sequential; bounded by MAX_SCHEMA_CHANGES_PER_SCAN
+        // iterations, which is typically a handful).
+        for schema_row in schema_rows {
+            let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
+            let valid_from_transaction_id =
+                uuid_from_row(&schema_row, "valid_from_transaction_id")?;
+
+            let col_sql = DB::prepare_sql(
+                "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
+                 FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
+            );
+            let column_rows = sqlx::query::<DB>(col_sql.as_ref())
                 .bind(schema_uuid.as_bytes().as_slice())
                 .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
                 .fetch_all(&self.pool)
                 .await?;
-                if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
-                    return Err(CatalogError::LimitExceeded(format!(
-                        "schema change column count exceeds limit of {}",
-                        limits::MAX_COLUMNS_PER_SCHEMA
-                    )));
-                }
+            if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
+                return Err(CatalogError::LimitExceeded(format!(
+                    "schema change column count exceeds limit of {}",
+                    limits::MAX_COLUMNS_PER_SCHEMA
+                )));
+            }
 
-                let mut columns = Vec::with_capacity(column_rows.len());
-                for row in column_rows {
-                    let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
-                    let column_type = decode_data_type(&column_type_bytes)?;
-                    columns.push(schema::Column {
-                        column_uuid: uuid_from_row(&row, "column_uuid")?,
-                        schema_uuid: uuid_from_row(&row, "schema_uuid")?,
-                        column_name: row.try_get("column_name")?,
-                        column_type,
-                        ordinal_position: row.try_get("ordinal_position")?,
-                        is_nullable: row.try_get("is_nullable")?,
-                    });
-                }
-
-                event.schema_change = Some(TxnSchemaChange {
-                    transaction_id: valid_from_transaction_id,
-                    schema: schema::Schema {
-                        schema_uuid,
-                        table_uuid: uuid_from_row(&schema_row, "table_uuid")?,
-                        schema_version: schema_row.try_get("schema_version")?,
-                        valid_from_transaction_id,
-                        valid_to_transaction_id: uuid_from_row_optional(
-                            &schema_row,
-                            "valid_to_transaction_id",
-                        )?,
-                        created_at: schema_row.try_get("created_at")?,
-                        columns,
-                    },
+            let mut columns = Vec::with_capacity(column_rows.len());
+            for row in column_rows {
+                let column_type_bytes: Vec<u8> = row.try_get("column_type")?;
+                let column_type = decode_data_type(&column_type_bytes)?;
+                columns.push(schema::Column {
+                    column_uuid: uuid_from_row(&row, "column_uuid")?,
+                    schema_uuid: uuid_from_row(&row, "schema_uuid")?,
+                    column_name: row.try_get("column_name")?,
+                    column_type,
+                    ordinal_position: row.try_get("ordinal_position")?,
+                    is_nullable: row.try_get("is_nullable")?,
                 });
             }
 
-            events.push(event);
+            let schema = schema::Schema {
+                schema_uuid,
+                table_uuid: uuid_from_row(&schema_row, "table_uuid")?,
+                schema_version: schema_row.try_get("schema_version")?,
+                valid_from_transaction_id,
+                valid_from_sequence: schema_row.try_get("valid_from_sequence")?,
+                valid_to_transaction_id: uuid_from_row_optional(
+                    &schema_row,
+                    "valid_to_transaction_id",
+                )?,
+                valid_to_sequence: schema_row.try_get("valid_to_sequence")?,
+                created_at: schema_row.try_get("created_at")?,
+                columns,
+            };
+            if let Some(&idx) = index_by_txn.get(&valid_from_transaction_id) {
+                events[idx].schema_change = Some(TxnSchemaChange {
+                    transaction_id: valid_from_transaction_id,
+                    schema,
+                });
+            }
         }
 
         Ok(events)
@@ -902,8 +977,8 @@ where
         at_transaction_id: Option<TxnId>,
     ) -> Result<TableView> {
         let sql = DB::prepare_sql(
-            "SELECT table_uuid, current_transaction_id, properties,
-                    min_reader_version, min_writer_version
+            "SELECT table_uuid, current_transaction_id, current_transaction_sequence,
+                    properties, min_reader_version, min_writer_version
              FROM tables WHERE namespace = ?1 AND table_name = ?2",
         );
         let table_row = sqlx::query::<DB>(sql.as_ref())
@@ -921,6 +996,7 @@ where
 
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
+        let current_transaction_sequence: i64 = table_row.try_get("current_transaction_sequence")?;
         let min_reader_version: i32 = table_row.try_get("min_reader_version")?;
         let properties = parse_table_properties(table_row.try_get("properties")?)?;
         self.ensure_reader_protocol_compatible(ident, min_reader_version)?;
@@ -928,56 +1004,55 @@ where
         let current_transaction_id = current_transaction_id.ok_or_else(|| {
             CatalogError::InvalidArgument("table has no current transaction".to_string())
         })?;
-        let effective_transaction_id = at_transaction_id.unwrap_or(current_transaction_id);
-        if effective_transaction_id != current_transaction_id {
-            let mut cursor_txn = current_transaction_id;
-            let mut visited = std::collections::HashSet::new();
-            let mut found = false;
-            loop {
-                if !visited.insert(cursor_txn) {
+
+        // Resolve the requested transaction to a per-table sequence number.
+        // `at_transaction_id == current` skips the extra round-trip.
+        let (effective_transaction_id, effective_sequence) = match at_transaction_id {
+            None => (current_transaction_id, current_transaction_sequence),
+            Some(at) if at == current_transaction_id => {
+                (current_transaction_id, current_transaction_sequence)
+            }
+            Some(at) => {
+                let sql = DB::prepare_sql(
+                    "SELECT txn_sequence FROM transactions
+                     WHERE table_uuid = ?1 AND transaction_id = ?2",
+                );
+                let seq: Option<i64> = sqlx::query_scalar::<DB, i64>(sql.as_ref())
+                    .bind(table_uuid.as_bytes().as_slice())
+                    .bind(at.as_bytes().as_slice())
+                    .fetch_optional(&self.pool)
+                    .await?;
+                let seq = seq.ok_or_else(|| {
+                    CatalogError::InvalidArgument(
+                        "requested transaction is not in table history".to_string(),
+                    )
+                })?;
+                // Per-table commits are strictly linear and monotonic, so
+                // `seq <= current_sequence` is equivalent to "ancestor of head".
+                if seq > current_transaction_sequence {
                     return Err(CatalogError::InvalidArgument(
-                        "transaction parent chain contains a cycle".to_string(),
+                        "requested transaction is not in table history".to_string(),
                     ));
                 }
-                if cursor_txn == effective_transaction_id {
-                    found = true;
-                    break;
-                }
-                let sql = DB::prepare_sql("SELECT parent_transaction_id
-                     FROM transactions
-                     WHERE table_uuid = ?1 AND transaction_id = ?2");
-                let row = sqlx::query::<DB>(sql.as_ref())
-                .bind(table_uuid.as_bytes().as_slice())
-                .bind(cursor_txn.as_bytes().as_slice())
-                .fetch_optional(&self.pool)
-                .await?;
-                let row = row.ok_or_else(|| {
-                    CatalogError::InvalidArgument("table transaction chain is broken".to_string())
-                })?;
-                let parent_transaction_id = uuid_from_row_optional(&row, "parent_transaction_id")?;
-                match parent_transaction_id {
-                    Some(parent_id) => cursor_txn = parent_id,
-                    None => break,
-                }
+                (at, seq)
             }
-            if !found {
-                return Err(CatalogError::InvalidArgument(
-                    "requested transaction is not in table history".to_string(),
-                ));
-            }
-        }
+        };
 
-        let sql = DB::prepare_sql("SELECT schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
+        let sql = DB::prepare_sql(
+            "SELECT schema_uuid, table_uuid, schema_version,
+                    valid_from_transaction_id, valid_from_sequence,
+                    valid_to_transaction_id, valid_to_sequence, created_at
              FROM schemas
              WHERE table_uuid = ?1
-               AND valid_from_transaction_id <= ?2
-               AND (valid_to_transaction_id IS NULL OR valid_to_transaction_id > ?2)
-             LIMIT 1");
+               AND valid_from_sequence <= ?2
+               AND (valid_to_sequence IS NULL OR valid_to_sequence > ?2)
+             LIMIT 1",
+        );
         let schema_row = sqlx::query::<DB>(sql.as_ref())
-        .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(effective_sequence)
+            .fetch_optional(&self.pool)
+            .await?;
 
         let schema_row = schema_row.ok_or_else(|| {
             CatalogError::NotFound(format!(
@@ -988,13 +1063,15 @@ where
 
         let schema_uuid = uuid_from_row(&schema_row, "schema_uuid")?;
 
-        let sql = DB::prepare_sql("SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
-             FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2");
+        let sql = DB::prepare_sql(
+            "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
+             FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
+        );
         let column_rows = sqlx::query::<DB>(sql.as_ref())
-        .bind(schema_uuid.as_bytes().as_slice())
-        .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(schema_uuid.as_bytes().as_slice())
+            .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
+            .fetch_all(&self.pool)
+            .await?;
 
         if column_rows.len() > limits::MAX_COLUMNS_PER_SCHEMA as usize {
             return Err(CatalogError::LimitExceeded(format!(
@@ -1025,27 +1102,33 @@ where
             table_uuid: uuid_from_row(&schema_row, "table_uuid")?,
             schema_version: schema_row.try_get("schema_version")?,
             valid_from_transaction_id: uuid_from_row(&schema_row, "valid_from_transaction_id")?,
+            valid_from_sequence: schema_row.try_get("valid_from_sequence")?,
             valid_to_transaction_id: uuid_from_row_optional(
                 &schema_row,
                 "valid_to_transaction_id",
             )?,
+            valid_to_sequence: schema_row.try_get("valid_to_sequence")?,
             created_at: schema_row.try_get("created_at")?,
             columns,
         };
 
-        let sql = DB::prepare_sql("SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
+        let sql = DB::prepare_sql(
+            "SELECT file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
+                    added_in_transaction_id, added_in_sequence,
+                    removed_in_transaction_id, removed_in_sequence,
+                    partition_values, format_options
              FROM files
              WHERE table_uuid = ?1
-               AND added_in_transaction_id <= ?2
-               AND (removed_in_transaction_id IS NULL OR removed_in_transaction_id > ?2)
-             LIMIT ?3");
+               AND added_in_sequence <= ?2
+               AND (removed_in_sequence IS NULL OR removed_in_sequence > ?2)
+             LIMIT ?3",
+        );
         let file_rows = sqlx::query::<DB>(sql.as_ref())
-        .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id.as_bytes().as_slice())
-        .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(effective_sequence)
+            .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
+            .fetch_all(&self.pool)
+            .await?;
 
         if file_rows.len() > limits::MAX_FILES_PER_QUERY as usize {
             return Err(CatalogError::LimitExceeded(format!(
@@ -1057,33 +1140,18 @@ where
         let capacity = std::cmp::min(file_rows.len(), limits::MAX_FILES_PER_QUERY as usize);
         let mut files = Vec::with_capacity(capacity);
         for row in file_rows {
-            let partition_values: Option<String> = row.try_get("partition_values")?;
-            let format_options: Option<String> = row.try_get("format_options")?;
-            let file = schema::File {
-                file_uuid: uuid_from_row(&row, "file_uuid")?,
-                table_uuid: uuid_from_row(&row, "table_uuid")?,
-                file_format: row.try_get("file_format")?,
-                file_path: row.try_get("file_path")?,
-                record_count: row.try_get("record_count")?,
-                file_size_bytes: row.try_get("file_size_bytes")?,
-                added_in_transaction_id: uuid_from_row(&row, "added_in_transaction_id")?,
-                removed_in_transaction_id: uuid_from_row_optional(
-                    &row,
-                    "removed_in_transaction_id",
-                )?,
-                partition_values: parse_json_optional(partition_values)?,
-                format_options: parse_json_optional(format_options)?,
-            };
-            files.push(file);
+            files.push(file_from_row(&row)?);
         }
 
-        let sql = DB::prepare_sql("SELECT table_uuid, transaction_id, record_count, file_size_bytes, file_count, last_updated
-             FROM table_stats WHERE table_uuid = ?1 AND transaction_id = ?2");
+        let sql = DB::prepare_sql(
+            "SELECT table_uuid, transaction_id, record_count, file_size_bytes, file_count, last_updated
+             FROM table_stats WHERE table_uuid = ?1 AND transaction_id = ?2",
+        );
         let stats_row = sqlx::query::<DB>(sql.as_ref())
-        .bind(table_uuid.as_bytes().as_slice())
-        .bind(effective_transaction_id.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(effective_transaction_id.as_bytes().as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
 
         let stats = if let Some(row) = stats_row {
             Some(schema::TableStats {
@@ -1170,28 +1238,35 @@ where
 
         let mut tx = DB::begin_write(&self.pool).await?;
 
-        let sql = DB::prepare_sql("SELECT table_uuid, current_schema_uuid, current_transaction_id, properties,
+        // Lock the table-head row for update so the sequence increment is
+        // serialized against concurrent commits. SQLite already holds the
+        // database write lock via BEGIN IMMEDIATE (lock_clause is ""), so
+        // this only adds FOR UPDATE on Postgres.
+        let raw_sql = format!(
+            "SELECT table_uuid, current_schema_uuid, current_transaction_id,
+                    current_transaction_sequence, properties,
                     min_reader_version, min_writer_version
-             FROM tables WHERE namespace = ?1 AND table_name = ?2");
+             FROM tables WHERE namespace = ?1 AND table_name = ?2{}",
+            DB::lock_clause()
+        );
+        let sql = DB::prepare_sql(&raw_sql);
         let table_row = sqlx::query::<DB>(sql.as_ref())
-        .bind(ident.namespace.as_str())
-        .bind(ident.name.as_str())
-        .fetch_optional(tx.as_mut())
-        .await?;
+            .bind(ident.namespace.as_str())
+            .bind(ident.name.as_str())
+            .fetch_optional(tx.as_mut())
+            .await?;
 
-        let table_row = match table_row {
-            Some(row) => row,
-            None => {
-                return Err(CatalogError::NotFound(format!(
-                    "{}.{}",
-                    ident.namespace, ident.name
-                )));
-            }
+        let Some(table_row) = table_row else {
+            return Err(CatalogError::NotFound(format!(
+                "{}.{}",
+                ident.namespace, ident.name
+            )));
         };
 
         let table_uuid = uuid_from_row(&table_row, "table_uuid")?;
         let current_schema_uuid = uuid_from_row_optional(&table_row, "current_schema_uuid")?;
         let current_transaction_id = uuid_from_row_optional(&table_row, "current_transaction_id")?;
+        let current_transaction_sequence: i64 = table_row.try_get("current_transaction_sequence")?;
         let min_writer_version: i32 = table_row.try_get("min_writer_version")?;
         let mut properties_value = parse_table_properties(table_row.try_get("properties")?)?;
         self.ensure_writer_protocol_compatible(ident, min_writer_version)?;
@@ -1209,16 +1284,28 @@ where
 
         let transaction_id = next_transaction_id();
         let transaction_timestamp = chrono::Utc::now();
+        let new_sequence = current_transaction_sequence
+            .checked_add(1)
+            .ok_or_else(|| {
+                CatalogError::InvalidArgument(
+                    "transaction sequence overflow; table has reached i64::MAX commits"
+                        .to_string(),
+                )
+            })?;
 
-        let sql = DB::prepare_sql("INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-             VALUES (?1, ?2, ?3, ?4)");
+        let sql = DB::prepare_sql(
+            "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence,
+                                       transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        );
         sqlx::query::<DB>(sql.as_ref())
-        .bind(transaction_id.as_bytes().as_slice())
-        .bind(table_uuid.as_bytes().as_slice())
-        .bind(transaction_timestamp)
-        .bind(current_transaction_id.as_bytes().as_slice())
-        .execute(tx.as_mut())
-        .await?;
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(table_uuid.as_bytes().as_slice())
+            .bind(new_sequence)
+            .bind(transaction_timestamp)
+            .bind(current_transaction_id.as_bytes().as_slice())
+            .execute(tx.as_mut())
+            .await?;
 
         let mut new_schema_uuid = current_schema_uuid;
 
@@ -1262,7 +1349,7 @@ where
                         let row_placeholders: String = (0..row_data.len())
                             .map(|_| {
                                 let s = format!(
-                                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
                                     param,
                                     param + 1,
                                     param + 2,
@@ -1271,16 +1358,18 @@ where
                                     param + 5,
                                     param + 6,
                                     param + 7,
-                                    param + 8
+                                    param + 8,
+                                    param + 9,
                                 );
-                                param += 9;
+                                param += 10;
                                 s
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
                         let raw_sql = format!(
                             "INSERT INTO files (file_uuid, table_uuid, file_format, file_path, record_count,
-                                                 file_size_bytes, added_in_transaction_id, partition_values, format_options)
+                                                 file_size_bytes, added_in_transaction_id, added_in_sequence,
+                                                 partition_values, format_options)
                              VALUES {}",
                             row_placeholders
                         );
@@ -1295,6 +1384,7 @@ where
                                 .bind(*rc)
                                 .bind(*size)
                                 .bind(transaction_id.as_bytes().as_slice())
+                                .bind(new_sequence)
                                 .bind(part.as_deref())
                                 .bind(format_opts.as_deref());
                         }
@@ -1318,17 +1408,19 @@ where
                     );
                     for chunk in file_uuids.chunks(chunk_size as usize) {
                         let in_placeholders: String = (0..chunk.len())
-                            .map(|i| format!("?{}", i + 3))
+                            .map(|i| format!("?{}", i + 4))
                             .collect::<Vec<_>>()
                             .join(", ");
                         let raw_sql = format!(
-                            "UPDATE files SET removed_in_transaction_id = ?1
-                             WHERE table_uuid = ?2 AND removed_in_transaction_id IS NULL AND file_uuid IN ({})",
+                            "UPDATE files
+                             SET removed_in_transaction_id = ?1, removed_in_sequence = ?2
+                             WHERE table_uuid = ?3 AND removed_in_transaction_id IS NULL AND file_uuid IN ({})",
                             in_placeholders
                         );
                         let sql = DB::prepare_sql(&raw_sql);
                         let mut query = sqlx::query::<DB>(sql.as_ref())
                             .bind(transaction_id.as_bytes().as_slice())
+                            .bind(new_sequence)
                             .bind(table_uuid.as_bytes().as_slice());
                         for file_uuid in chunk {
                             query = query.bind(file_uuid.as_bytes().as_slice());
@@ -1412,23 +1504,32 @@ where
                     let schema_uuid = uuid::Uuid::new_v4();
                     let schema_version = current_schema_version + 1;
 
-                    let sql = DB::prepare_sql("INSERT INTO schemas (schema_uuid, table_uuid, schema_version, valid_from_transaction_id, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5)");
+                    let sql = DB::prepare_sql(
+                        "INSERT INTO schemas (schema_uuid, table_uuid, schema_version,
+                                               valid_from_transaction_id, valid_from_sequence, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    );
                     sqlx::query::<DB>(sql.as_ref())
-                    .bind(schema_uuid.as_bytes().as_slice())
-                    .bind(table_uuid.as_bytes().as_slice())
-                    .bind(schema_version)
-                    .bind(transaction_id.as_bytes().as_slice())
-                    .bind(transaction_timestamp)
-                    .execute(tx.as_mut())
-                    .await?;
+                        .bind(schema_uuid.as_bytes().as_slice())
+                        .bind(table_uuid.as_bytes().as_slice())
+                        .bind(schema_version)
+                        .bind(transaction_id.as_bytes().as_slice())
+                        .bind(new_sequence)
+                        .bind(transaction_timestamp)
+                        .execute(tx.as_mut())
+                        .await?;
 
-                    let sql = DB::prepare_sql("UPDATE schemas SET valid_to_transaction_id = ?1 WHERE schema_uuid = ?2");
+                    let sql = DB::prepare_sql(
+                        "UPDATE schemas
+                         SET valid_to_transaction_id = ?1, valid_to_sequence = ?2
+                         WHERE schema_uuid = ?3",
+                    );
                     sqlx::query::<DB>(sql.as_ref())
-                    .bind(transaction_id.as_bytes().as_slice())
-                    .bind(current_schema_uuid.as_bytes().as_slice())
-                    .execute(tx.as_mut())
-                    .await?;
+                        .bind(transaction_id.as_bytes().as_slice())
+                        .bind(new_sequence)
+                        .bind(current_schema_uuid.as_bytes().as_slice())
+                        .execute(tx.as_mut())
+                        .await?;
 
                     insert_schema_columns::<DB>(&mut tx, schema_uuid, &schema_spec.columns)
                         .await?;
@@ -1462,16 +1563,22 @@ where
         let schema_uuid_to_set = new_schema_uuid;
         let properties_text = serialize_json(&properties_value.to_json())?;
 
-        let sql = DB::prepare_sql("UPDATE tables
-             SET current_transaction_id = ?1, current_schema_uuid = ?2, properties = ?3
-             WHERE table_uuid = ?4");
+        let sql = DB::prepare_sql(
+            "UPDATE tables
+             SET current_transaction_id = ?1,
+                 current_transaction_sequence = ?2,
+                 current_schema_uuid = ?3,
+                 properties = ?4
+             WHERE table_uuid = ?5",
+        );
         sqlx::query::<DB>(sql.as_ref())
-        .bind(transaction_id.as_bytes().as_slice())
-        .bind(schema_uuid_to_set.map(|uuid| uuid.as_bytes().to_vec()))
-        .bind(properties_text.as_str())
-        .bind(table_uuid.as_bytes().as_slice())
-        .execute(tx.as_mut())
-        .await?;
+            .bind(transaction_id.as_bytes().as_slice())
+            .bind(new_sequence)
+            .bind(schema_uuid_to_set.map(|uuid| uuid.as_bytes().to_vec()))
+            .bind(properties_text.as_str())
+            .bind(table_uuid.as_bytes().as_slice())
+            .execute(tx.as_mut())
+            .await?;
 
         tx.commit().await?;
 
@@ -1548,14 +1655,16 @@ mod tests {
         let base_transaction_id = table_view.transaction_id;
         let transaction_id = next_transaction_id();
         let schema_uuid = uuid::Uuid::new_v4();
+        let new_sequence = INITIAL_TRANSACTION_SEQUENCE + 1;
         let mut tx = catalog.pool.begin().await.expect("begin transaction");
 
         sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(transaction_id.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
+        .bind(new_sequence)
         .bind(chrono::Utc::now())
         .bind(base_transaction_id.as_bytes().as_slice())
         .execute(tx.as_mut())
@@ -1564,14 +1673,18 @@ mod tests {
 
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO schemas (
-                schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                schema_uuid, table_uuid, schema_version,
+                valid_from_transaction_id, valid_from_sequence,
+                valid_to_transaction_id, valid_to_sequence, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(schema_uuid.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
         .bind(schema_version)
         .bind(transaction_id.as_bytes().as_slice())
+        .bind(new_sequence)
         .bind(Option::<Vec<u8>>::None)
+        .bind(Option::<i64>::None)
         .bind(chrono::Utc::now())
         .execute(tx.as_mut())
         .await
@@ -1597,10 +1710,13 @@ mod tests {
         }
 
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1, current_schema_uuid = ?2 WHERE table_uuid = ?3",
+            "UPDATE tables
+             SET current_transaction_id = ?1, current_schema_uuid = ?2, current_transaction_sequence = ?3
+             WHERE table_uuid = ?4",
         )
         .bind(transaction_id.as_bytes().as_slice())
         .bind(schema_uuid.as_bytes().as_slice())
+        .bind(new_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
@@ -1716,14 +1832,17 @@ mod tests {
 
         let overflow_count = limits::MAX_FILES_PER_QUERY as usize + 1;
         let mut last_transaction_id = base_transaction_id;
+        let mut last_sequence: i64 = INITIAL_TRANSACTION_SEQUENCE;
         for i in 0..overflow_count {
             let transaction_id = next_transaction_id();
+            last_sequence += 1;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(chrono::Utc::now())
             .bind(last_transaction_id.as_bytes().as_slice())
             .execute(&catalog.pool)
@@ -1735,8 +1854,10 @@ mod tests {
             sqlx::query::<sqlx::Sqlite>(
                 "INSERT INTO files (
                     file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    added_in_transaction_id, added_in_sequence,
+                    removed_in_transaction_id, removed_in_sequence,
+                    partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .bind(file_uuid.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
@@ -1745,7 +1866,9 @@ mod tests {
             .bind(1_i64)
             .bind(1_i64)
             .bind(transaction_id.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(Option::<Vec<u8>>::None)
+            .bind(Option::<i64>::None)
             .bind(Option::<String>::None)
             .bind(Option::<String>::None)
             .execute(&catalog.pool)
@@ -1756,9 +1879,10 @@ mod tests {
         }
 
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(last_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(&catalog.pool)
         .await
@@ -1786,14 +1910,17 @@ mod tests {
 
         let mut tx = catalog.pool.begin().await.expect("begin transaction");
         let mut last_transaction_id = base_transaction_id;
+        let mut last_sequence: i64 = INITIAL_TRANSACTION_SEQUENCE;
         for _ in 0..limits::MAX_TRANSACTIONS_PER_SCAN {
             let transaction_id = next_transaction_id();
+            last_sequence += 1;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(chrono::Utc::now())
             .bind(last_transaction_id.as_bytes().as_slice())
             .execute(tx.as_mut())
@@ -1802,9 +1929,10 @@ mod tests {
             last_transaction_id = transaction_id;
         }
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(last_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
@@ -1829,36 +1957,44 @@ mod tests {
         let (catalog, ident, table_view) = create_sqlite_catalog_with_table().await;
         let table_uuid = table_view.table_uuid;
         let base_transaction_id = table_view.transaction_id;
+        // UUIDs chosen so byte-order disagrees with insertion order: tx1 has a
+        // larger UUID than tx2, but tx2 is committed after tx1. With the
+        // sequence-based ordering the result is insertion-order regardless.
         let tx1 = uuid::Uuid::from_u128(2);
         let tx2 = uuid::Uuid::from_u128(1);
+        let tx1_seq = INITIAL_TRANSACTION_SEQUENCE + 1;
+        let tx2_seq = INITIAL_TRANSACTION_SEQUENCE + 2;
 
         let mut tx = catalog.pool.begin().await.expect("begin transaction");
         sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(tx1.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
+        .bind(tx1_seq)
         .bind(chrono::Utc::now())
         .bind(base_transaction_id.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
         .expect("tx1 insert should succeed");
         sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(tx2.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
+        .bind(tx2_seq)
         .bind(chrono::Utc::now())
         .bind(tx1.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
         .expect("tx2 insert should succeed");
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(tx2.as_bytes().as_slice())
+        .bind(tx2_seq)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
@@ -1874,7 +2010,7 @@ mod tests {
                 },
             )
             .await
-            .expect("parent-chain ordered scan should succeed");
+            .expect("sequence-ordered scan should succeed with non-monotonic UUIDs");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].transaction_id, tx1);
         assert_eq!(events[1].transaction_id, tx2);
@@ -1896,34 +2032,39 @@ mod tests {
                 .checked_add(1)
                 .expect("base transaction id should allow +1 in test"),
         );
+        let tx1_seq = INITIAL_TRANSACTION_SEQUENCE + 1;
+        let tx2_seq = INITIAL_TRANSACTION_SEQUENCE + 2;
 
         let mut tx = catalog.pool.begin().await.expect("begin transaction");
         sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(tx1.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
+        .bind(tx1_seq)
         .bind(chrono::Utc::now())
         .bind(base_transaction_id.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
         .expect("tx1 insert should succeed");
         sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(tx2.as_bytes().as_slice())
         .bind(table_uuid.as_bytes().as_slice())
+        .bind(tx2_seq)
         .bind(chrono::Utc::now())
         .bind(tx1.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
         .expect("tx2 insert should succeed");
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(tx2.as_bytes().as_slice())
+        .bind(tx2_seq)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
@@ -1945,14 +2086,17 @@ mod tests {
 
         let mut tx = catalog.pool.begin().await.expect("begin transaction");
         let mut last_transaction_id = base_transaction_id;
+        let mut last_sequence: i64 = INITIAL_TRANSACTION_SEQUENCE;
         for i in 0..limits::MAX_FILES_PER_QUERY {
             let transaction_id = next_transaction_id();
+            last_sequence += 1;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(chrono::Utc::now())
             .bind(last_transaction_id.as_bytes().as_slice())
             .execute(tx.as_mut())
@@ -1964,8 +2108,10 @@ mod tests {
             sqlx::query::<sqlx::Sqlite>(
                 "INSERT INTO files (
                     file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    added_in_transaction_id, added_in_sequence,
+                    removed_in_transaction_id, removed_in_sequence,
+                    partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .bind(file_uuid.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
@@ -1974,7 +2120,9 @@ mod tests {
             .bind(1_i64)
             .bind(1_i64)
             .bind(transaction_id.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(Option::<Vec<u8>>::None)
+            .bind(Option::<i64>::None)
             .bind(Option::<String>::None)
             .bind(Option::<String>::None)
             .execute(tx.as_mut())
@@ -1984,9 +2132,10 @@ mod tests {
             last_transaction_id = transaction_id;
         }
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(last_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
@@ -2024,14 +2173,17 @@ mod tests {
 
         let overflow_count = limits::MAX_FILES_PER_QUERY as usize + 1;
         let mut last_transaction_id = base_transaction_id;
+        let mut last_sequence: i64 = INITIAL_TRANSACTION_SEQUENCE;
         for i in 0..overflow_count {
             let transaction_id = next_transaction_id();
+            last_sequence += 1;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(chrono::Utc::now())
             .bind(last_transaction_id.as_bytes().as_slice())
             .execute(&catalog.pool)
@@ -2043,8 +2195,10 @@ mod tests {
             sqlx::query::<sqlx::Sqlite>(
                 "INSERT INTO files (
                     file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    added_in_transaction_id, added_in_sequence,
+                    removed_in_transaction_id, removed_in_sequence,
+                    partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .bind(file_uuid.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
@@ -2053,7 +2207,9 @@ mod tests {
             .bind(1_i64)
             .bind(1_i64)
             .bind(base_transaction_id.as_bytes().as_slice())
+            .bind(INITIAL_TRANSACTION_SEQUENCE)
             .bind(transaction_id.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(Option::<String>::None)
             .bind(Option::<String>::None)
             .execute(&catalog.pool)
@@ -2064,9 +2220,10 @@ mod tests {
         }
 
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(last_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(&catalog.pool)
         .await
@@ -2094,14 +2251,17 @@ mod tests {
 
         let mut tx = catalog.pool.begin().await.expect("begin transaction");
         let mut last_transaction_id = base_transaction_id;
+        let mut last_sequence: i64 = INITIAL_TRANSACTION_SEQUENCE;
         for i in 0..limits::MAX_FILES_PER_QUERY {
             let transaction_id = next_transaction_id();
+            last_sequence += 1;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(chrono::Utc::now())
             .bind(last_transaction_id.as_bytes().as_slice())
             .execute(tx.as_mut())
@@ -2113,8 +2273,10 @@ mod tests {
             sqlx::query::<sqlx::Sqlite>(
                 "INSERT INTO files (
                     file_uuid, table_uuid, file_format, file_path, record_count, file_size_bytes,
-                    added_in_transaction_id, removed_in_transaction_id, partition_values, format_options
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    added_in_transaction_id, added_in_sequence,
+                    removed_in_transaction_id, removed_in_sequence,
+                    partition_values, format_options
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .bind(file_uuid.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
@@ -2123,7 +2285,9 @@ mod tests {
             .bind(1_i64)
             .bind(1_i64)
             .bind(base_transaction_id.as_bytes().as_slice())
+            .bind(INITIAL_TRANSACTION_SEQUENCE)
             .bind(transaction_id.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(Option::<String>::None)
             .bind(Option::<String>::None)
             .execute(tx.as_mut())
@@ -2133,9 +2297,10 @@ mod tests {
             last_transaction_id = transaction_id;
         }
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(last_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
@@ -2173,14 +2338,17 @@ mod tests {
 
         let overflow_count = limits::MAX_SCHEMA_CHANGES_PER_SCAN as usize + 1;
         let mut last_transaction_id = base_transaction_id;
+        let mut last_sequence: i64 = INITIAL_TRANSACTION_SEQUENCE;
         for i in 0..overflow_count {
             let transaction_id = next_transaction_id();
+            last_sequence += 1;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(chrono::Utc::now())
             .bind(last_transaction_id.as_bytes().as_slice())
             .execute(&catalog.pool)
@@ -2190,14 +2358,18 @@ mod tests {
             let schema_uuid = uuid::Uuid::new_v4();
             sqlx::query::<sqlx::Sqlite>(
                 "INSERT INTO schemas (
-                    schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    schema_uuid, table_uuid, schema_version,
+                    valid_from_transaction_id, valid_from_sequence,
+                    valid_to_transaction_id, valid_to_sequence, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .bind(schema_uuid.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
             .bind((i as i32) + 100)
             .bind(transaction_id.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(Option::<Vec<u8>>::None)
+            .bind(Option::<i64>::None)
             .bind(chrono::Utc::now())
             .execute(&catalog.pool)
             .await
@@ -2207,9 +2379,10 @@ mod tests {
         }
 
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(last_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(&catalog.pool)
         .await
@@ -2237,14 +2410,17 @@ mod tests {
 
         let mut tx = catalog.pool.begin().await.expect("begin transaction");
         let mut last_transaction_id = base_transaction_id;
+        let mut last_sequence: i64 = INITIAL_TRANSACTION_SEQUENCE;
         for i in 0..limits::MAX_SCHEMA_CHANGES_PER_SCAN {
             let transaction_id = next_transaction_id();
+            last_sequence += 1;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO transactions (transaction_id, table_uuid, transaction_timestamp, parent_transaction_id)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp, parent_transaction_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(chrono::Utc::now())
             .bind(last_transaction_id.as_bytes().as_slice())
             .execute(tx.as_mut())
@@ -2254,14 +2430,18 @@ mod tests {
             let schema_uuid = uuid::Uuid::new_v4();
             sqlx::query::<sqlx::Sqlite>(
                 "INSERT INTO schemas (
-                    schema_uuid, table_uuid, schema_version, valid_from_transaction_id, valid_to_transaction_id, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    schema_uuid, table_uuid, schema_version,
+                    valid_from_transaction_id, valid_from_sequence,
+                    valid_to_transaction_id, valid_to_sequence, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .bind(schema_uuid.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
             .bind((i as i32) + 100)
             .bind(transaction_id.as_bytes().as_slice())
+            .bind(last_sequence)
             .bind(Option::<Vec<u8>>::None)
+            .bind(Option::<i64>::None)
             .bind(chrono::Utc::now())
             .execute(tx.as_mut())
             .await
@@ -2270,9 +2450,10 @@ mod tests {
             last_transaction_id = transaction_id;
         }
         sqlx::query::<sqlx::Sqlite>(
-            "UPDATE tables SET current_transaction_id = ?1 WHERE table_uuid = ?2",
+            "UPDATE tables SET current_transaction_id = ?1, current_transaction_sequence = ?2 WHERE table_uuid = ?3",
         )
         .bind(last_transaction_id.as_bytes().as_slice())
+        .bind(last_sequence)
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await
