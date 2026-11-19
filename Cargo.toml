@@ -17,7 +17,7 @@ sqlite = []
 postgres = []
 
 [dependencies]
-arrow = "56.2.0"
+arrow = "60.1.0"
 arrow-array = "56.2.0"
 arrow-ipc = "56.2.0"
 async-trait = "0.1.89"
