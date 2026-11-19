@@ -33,3 +33,9 @@ Planar is a transaction-based open table format: a database-backed catalog (cont
 - No unbounded catalog queries (see `limits.rs`).
 - No lossy `Path` to string conversions; no JSON in core option APIs.
 - Do not use `unwrap()` / `expect()` in library code or production paths (they are linted); `unwrap()` is acceptable only in tests and unreachable-by-construction internal code, with a short comment.
+
+## Agent Workflow
+- Optional features: `sqlite` (default) and `postgres`. Repo-specific API, ownership, and format-parity conventions are under Core Invariants above.
+- `--all-features` in the verification commands enables `postgres`; the `#[sqlx::test]` Postgres tests in `tests/integration/postgres_tests.rs` need a reachable Postgres server (sqlx reads `DATABASE_URL`). Without one, run the checks with default features and say so.
+- Idiomatic Rust > simplicity/clarity > performance, in that order. Optimize only obvious hotspots (needless allocations, clones, `format!` in tight loops, accidental O(n^2)); prefer `with_capacity` when size is known, `write!` into a preallocated `String` over `format!` in loops, and `bytes()` over `chars()` for ASCII/byte-level work.
+- Prefer simple synchronous code unless async is required; in async code avoid blocking calls and keep critical sections small.
