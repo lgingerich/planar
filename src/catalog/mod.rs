@@ -280,14 +280,14 @@ where
     i64: sqlx::Type<DB>,
     for<'q> &'q [u8]: sqlx::Encode<'q, DB> + sqlx::Type<DB>,
     for<'r> i64: sqlx::Decode<'r, DB>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
     usize: sqlx::ColumnIndex<<DB as sqlx::Database>::Row>,
 {
     let sql = DB::prepare_sql(
         "SELECT txn_sequence FROM transactions
          WHERE table_uuid = ?1 AND transaction_id = ?2",
     );
-    let seq: Option<i64> = sqlx::query_scalar::<DB, i64>(sql.as_ref())
+    let seq: Option<i64> = sqlx::query_scalar::<DB, i64>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .bind(transaction_id.as_bytes().as_slice())
         .fetch_optional(pool)
@@ -347,7 +347,7 @@ where
     for<'q> &'q [u8]: sqlx::Encode<'q, DB> + sqlx::Type<DB>,
     for<'q> i32: sqlx::Encode<'q, DB>,
     for<'q> bool: sqlx::Encode<'q, DB>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
 {
     let chunk_size = limits::batch_insert_columns_chunk(DB::KIND);
     debug_assert!(
@@ -391,7 +391,7 @@ where
             row_placeholders
         );
         let prepared = DB::prepare_sql(&raw_sql);
-        let mut query = sqlx::query::<DB>(prepared.as_ref());
+        let mut query = sqlx::query::<DB>(sqlx::AssertSqlSafe(prepared.as_ref()));
         for (column_uuid, name, encoded_type, ordinal_position, is_nullable) in &row_data {
             query = query
                 .bind(column_uuid.as_bytes().as_slice())
@@ -420,26 +420,26 @@ where
     DB: database::SqlBackend,
     for<'c> &'c mut <DB as sqlx::Database>::Connection: sqlx::Executor<'c, Database = DB>,
     for<'q> &'q [u8]: sqlx::Encode<'q, DB> + sqlx::Type<DB>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
 {
     // file_column_stats -> files
     let sql = DB::prepare_sql(
         "DELETE FROM file_column_stats
          WHERE file_uuid IN (SELECT file_uuid FROM files WHERE table_uuid = ?1)",
     );
-    sqlx::query::<DB>(sql.as_ref())
+    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
 
     let sql = DB::prepare_sql("DELETE FROM table_stats WHERE table_uuid = ?1");
-    sqlx::query::<DB>(sql.as_ref())
+    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
 
     let sql = DB::prepare_sql("DELETE FROM files WHERE table_uuid = ?1");
-    sqlx::query::<DB>(sql.as_ref())
+    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
@@ -449,13 +449,13 @@ where
         "DELETE FROM columns
          WHERE schema_uuid IN (SELECT schema_uuid FROM schemas WHERE table_uuid = ?1)",
     );
-    sqlx::query::<DB>(sql.as_ref())
+    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
 
     let sql = DB::prepare_sql("DELETE FROM schemas WHERE table_uuid = ?1");
-    sqlx::query::<DB>(sql.as_ref())
+    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
@@ -464,13 +464,13 @@ where
     // them all in a single statement is safe because FK checks happen at
     // end-of-statement.
     let sql = DB::prepare_sql("DELETE FROM transactions WHERE table_uuid = ?1");
-    sqlx::query::<DB>(sql.as_ref())
+    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
 
     let sql = DB::prepare_sql("DELETE FROM tables WHERE table_uuid = ?1");
-    sqlx::query::<DB>(sql.as_ref())
+    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(table_uuid.as_bytes().as_slice())
         .execute(tx.as_mut())
         .await?;
@@ -516,7 +516,7 @@ where
     for<'r> chrono::DateTime<chrono::Utc>: sqlx::Decode<'r, DB>,
     for<'a> &'a str: sqlx::ColumnIndex<<DB as sqlx::Database>::Row>,
     usize: sqlx::ColumnIndex<<DB as sqlx::Database>::Row>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
 {
     async fn create_table(
         self: Arc<Self>,
@@ -530,7 +530,7 @@ where
         let mut tx = DB::begin_write(&self.pool).await?;
 
         let sql = DB::prepare_sql("SELECT 1 FROM tables WHERE namespace = ?1 AND table_name = ?2 LIMIT 1");
-        let exists = sqlx::query_scalar::<DB, i64>(sql.as_ref())
+        let exists = sqlx::query_scalar::<DB, i64>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(ident.namespace.as_str())
         .bind(ident.name.as_str())
         .fetch_optional(tx.as_mut())
@@ -557,7 +557,7 @@ where
                 current_transaction_sequence, min_reader_version, min_writer_version
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         );
-        sqlx::query::<DB>(sql.as_ref())
+        sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(ident.name.as_str())
             .bind(ident.namespace.as_str())
@@ -575,7 +575,7 @@ where
             "INSERT INTO transactions (transaction_id, table_uuid, txn_sequence, transaction_timestamp)
              VALUES (?1, ?2, ?3, ?4)",
         );
-        sqlx::query::<DB>(sql.as_ref())
+        sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
             .bind(INITIAL_TRANSACTION_SEQUENCE)
@@ -589,7 +589,7 @@ where
                                    valid_from_transaction_id, valid_from_sequence, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         );
-        sqlx::query::<DB>(sql.as_ref())
+        sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(schema_uuid.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
             .bind(INITIAL_SCHEMA_VERSION)
@@ -606,7 +606,7 @@ where
              SET current_schema_uuid = ?1, current_transaction_id = ?2
              WHERE table_uuid = ?3",
         );
-        sqlx::query::<DB>(sql.as_ref())
+        sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(schema_uuid.as_bytes().as_slice())
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
@@ -621,7 +621,7 @@ where
 
     async fn load_table(self: Arc<Self>, ident: TableIdent) -> Result<Option<TableHandle>> {
         let sql = DB::prepare_sql("SELECT 1 FROM tables WHERE namespace = ?1 AND table_name = ?2 LIMIT 1");
-        let exists = sqlx::query_scalar::<DB, i64>(sql.as_ref())
+        let exists = sqlx::query_scalar::<DB, i64>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(ident.namespace.as_str())
         .bind(ident.name.as_str())
         .fetch_optional(&self.pool)
@@ -640,14 +640,14 @@ where
         let list_limit = limits::MAX_TABLES_PER_LIST as i64 + 1;
         let rows = if let Some(namespace) = namespace {
             let sql = DB::prepare_sql("SELECT namespace, table_name FROM tables WHERE namespace = ?1 LIMIT ?2");
-            sqlx::query::<DB>(sql.as_ref())
+            sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(namespace)
             .bind(list_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
             let sql = DB::prepare_sql("SELECT namespace, table_name FROM tables LIMIT ?1");
-            sqlx::query::<DB>(sql.as_ref())
+            sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
                 .bind(list_limit)
                 .fetch_all(&self.pool)
                 .await?
@@ -680,7 +680,7 @@ where
         let sql = DB::prepare_sql(
             "SELECT table_uuid FROM tables WHERE namespace = ?1 AND table_name = ?2",
         );
-        let table_row = sqlx::query::<DB>(sql.as_ref())
+        let table_row = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(ident.namespace.as_str())
             .bind(ident.name.as_str())
             .fetch_optional(tx.as_mut())
@@ -702,7 +702,7 @@ where
     async fn current_transaction_id(&self, ident: &TableIdent) -> Result<TxnId> {
         let sql = DB::prepare_sql("SELECT current_transaction_id
              FROM tables WHERE namespace = ?1 AND table_name = ?2");
-        let table_row = sqlx::query::<DB>(sql.as_ref())
+        let table_row = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
         .bind(ident.namespace.as_str())
         .bind(ident.name.as_str())
         .fetch_optional(&self.pool)
@@ -725,7 +725,7 @@ where
             "SELECT table_uuid, current_transaction_sequence
              FROM tables WHERE namespace = ?1 AND table_name = ?2",
         );
-        let table_row = sqlx::query::<DB>(sql.as_ref())
+        let table_row = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(ident.namespace.as_str())
             .bind(ident.name.as_str())
             .fetch_optional(&self.pool)
@@ -780,7 +780,7 @@ where
              ORDER BY txn_sequence
              LIMIT ?4",
         );
-        let txn_rows = sqlx::query::<DB>(sql.as_ref())
+        let txn_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_sequence)
             .bind(to_sequence)
@@ -819,7 +819,7 @@ where
              ORDER BY added_in_sequence
              LIMIT ?4",
         );
-        let added_rows = sqlx::query::<DB>(sql.as_ref())
+        let added_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_sequence)
             .bind(to_sequence)
@@ -858,7 +858,7 @@ where
              ORDER BY removed_in_sequence
              LIMIT ?4",
         );
-        let removed_rows = sqlx::query::<DB>(sql.as_ref())
+        let removed_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_sequence)
             .bind(to_sequence)
@@ -895,7 +895,7 @@ where
              ORDER BY valid_from_sequence
              LIMIT ?4",
         );
-        let schema_rows = sqlx::query::<DB>(sql.as_ref())
+        let schema_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(from_sequence)
             .bind(to_sequence)
@@ -920,7 +920,7 @@ where
                 "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
                  FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
             );
-            let column_rows = sqlx::query::<DB>(col_sql.as_ref())
+            let column_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(col_sql.as_ref()))
                 .bind(schema_uuid.as_bytes().as_slice())
                 .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
                 .fetch_all(&self.pool)
@@ -981,7 +981,7 @@ where
                     properties, min_reader_version, min_writer_version
              FROM tables WHERE namespace = ?1 AND table_name = ?2",
         );
-        let table_row = sqlx::query::<DB>(sql.as_ref())
+        let table_row = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(ident.namespace.as_str())
             .bind(ident.name.as_str())
             .fetch_optional(&self.pool)
@@ -1017,11 +1017,12 @@ where
                     "SELECT txn_sequence FROM transactions
                      WHERE table_uuid = ?1 AND transaction_id = ?2",
                 );
-                let seq: Option<i64> = sqlx::query_scalar::<DB, i64>(sql.as_ref())
-                    .bind(table_uuid.as_bytes().as_slice())
-                    .bind(at.as_bytes().as_slice())
-                    .fetch_optional(&self.pool)
-                    .await?;
+                let seq: Option<i64> =
+                    sqlx::query_scalar::<DB, i64>(sqlx::AssertSqlSafe(sql.as_ref()))
+                        .bind(table_uuid.as_bytes().as_slice())
+                        .bind(at.as_bytes().as_slice())
+                        .fetch_optional(&self.pool)
+                        .await?;
                 let seq = seq.ok_or_else(|| {
                     CatalogError::InvalidArgument(
                         "requested transaction is not in table history".to_string(),
@@ -1048,7 +1049,7 @@ where
                AND (valid_to_sequence IS NULL OR valid_to_sequence > ?2)
              LIMIT 1",
         );
-        let schema_row = sqlx::query::<DB>(sql.as_ref())
+        let schema_row = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(effective_sequence)
             .fetch_optional(&self.pool)
@@ -1067,7 +1068,7 @@ where
             "SELECT column_uuid, schema_uuid, column_name, column_type, ordinal_position, is_nullable
              FROM columns WHERE schema_uuid = ?1 ORDER BY ordinal_position LIMIT ?2",
         );
-        let column_rows = sqlx::query::<DB>(sql.as_ref())
+        let column_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(schema_uuid.as_bytes().as_slice())
             .bind(limits::MAX_COLUMNS_PER_SCHEMA as i64 + 1)
             .fetch_all(&self.pool)
@@ -1123,7 +1124,7 @@ where
                AND (removed_in_sequence IS NULL OR removed_in_sequence > ?2)
              LIMIT ?3",
         );
-        let file_rows = sqlx::query::<DB>(sql.as_ref())
+        let file_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(effective_sequence)
             .bind(limits::MAX_FILES_PER_QUERY as i64 + 1)
@@ -1147,7 +1148,7 @@ where
             "SELECT table_uuid, transaction_id, record_count, file_size_bytes, file_count, last_updated
              FROM table_stats WHERE table_uuid = ?1 AND transaction_id = ?2",
         );
-        let stats_row = sqlx::query::<DB>(sql.as_ref())
+        let stats_row = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(table_uuid.as_bytes().as_slice())
             .bind(effective_transaction_id.as_bytes().as_slice())
             .fetch_optional(&self.pool)
@@ -1250,7 +1251,7 @@ where
             DB::lock_clause()
         );
         let sql = DB::prepare_sql(&raw_sql);
-        let table_row = sqlx::query::<DB>(sql.as_ref())
+        let table_row = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(ident.namespace.as_str())
             .bind(ident.name.as_str())
             .fetch_optional(tx.as_mut())
@@ -1298,7 +1299,7 @@ where
                                        transaction_timestamp, parent_transaction_id)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         );
-        sqlx::query::<DB>(sql.as_ref())
+        sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(transaction_id.as_bytes().as_slice())
             .bind(table_uuid.as_bytes().as_slice())
             .bind(new_sequence)
@@ -1374,7 +1375,7 @@ where
                             row_placeholders
                         );
                         let sql = DB::prepare_sql(&raw_sql);
-                        let mut query = sqlx::query::<DB>(sql.as_ref());
+                        let mut query = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()));
                         for (file_uuid, format, path, rc, size, part, format_opts) in &row_data {
                             query = query
                                 .bind(file_uuid.as_bytes().as_slice())
@@ -1418,7 +1419,7 @@ where
                             in_placeholders
                         );
                         let sql = DB::prepare_sql(&raw_sql);
-                        let mut query = sqlx::query::<DB>(sql.as_ref())
+                        let mut query = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
                             .bind(transaction_id.as_bytes().as_slice())
                             .bind(new_sequence)
                             .bind(table_uuid.as_bytes().as_slice());
@@ -1438,14 +1439,14 @@ where
                     })?;
 
                     let sql = DB::prepare_sql("SELECT schema_version FROM schemas WHERE schema_uuid = ?1");
-                    let current_schema_version: i32 = sqlx::query_scalar::<DB, i32>(sql.as_ref())
+                    let current_schema_version: i32 = sqlx::query_scalar::<DB, i32>(sqlx::AssertSqlSafe(sql.as_ref()))
                     .bind(current_schema_uuid.as_bytes().as_slice())
                     .fetch_one(tx.as_mut())
                     .await?;
 
                     // Fetch current schema columns for validation
                     let sql = DB::prepare_sql("SELECT column_name, column_type, is_nullable FROM columns WHERE schema_uuid = ?1");
-                    let current_column_rows = sqlx::query::<DB>(sql.as_ref())
+                    let current_column_rows = sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
                     .bind(current_schema_uuid.as_bytes().as_slice())
                     .fetch_all(tx.as_mut())
                     .await?;
@@ -1509,7 +1510,7 @@ where
                                                valid_from_transaction_id, valid_from_sequence, created_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     );
-                    sqlx::query::<DB>(sql.as_ref())
+                    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
                         .bind(schema_uuid.as_bytes().as_slice())
                         .bind(table_uuid.as_bytes().as_slice())
                         .bind(schema_version)
@@ -1524,7 +1525,7 @@ where
                          SET valid_to_transaction_id = ?1, valid_to_sequence = ?2
                          WHERE schema_uuid = ?3",
                     );
-                    sqlx::query::<DB>(sql.as_ref())
+                    sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
                         .bind(transaction_id.as_bytes().as_slice())
                         .bind(new_sequence)
                         .bind(current_schema_uuid.as_bytes().as_slice())
@@ -1571,7 +1572,7 @@ where
                  properties = ?4
              WHERE table_uuid = ?5",
         );
-        sqlx::query::<DB>(sql.as_ref())
+        sqlx::query::<DB>(sqlx::AssertSqlSafe(sql.as_ref()))
             .bind(transaction_id.as_bytes().as_slice())
             .bind(new_sequence)
             .bind(schema_uuid_to_set.map(|uuid| uuid.as_bytes().to_vec()))
@@ -2800,7 +2801,7 @@ mod tests {
             ("files", "table_uuid"),
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1");
-            let count: i64 = sqlx::query_scalar::<sqlx::Sqlite, i64>(&sql)
+            let count: i64 = sqlx::query_scalar::<sqlx::Sqlite, i64>(sqlx::AssertSqlSafe(sql))
                 .bind(table_uuid_bytes.as_slice())
                 .fetch_one(&catalog.pool)
                 .await
